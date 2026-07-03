@@ -1,0 +1,90 @@
+# Substrate Service — 服务化访问层方案（总览）
+
+> 状态：PLANNED（2026-07-03，设计已收敛，未动工）
+> 分两步：**[01-个人版（我的）](01-personal-alpha.md)** → **[02-长期产品化](02-productization.md)**
+> 本文件夹只放方案；代码将来放**新仓库**（暂名 `substrate-service`），与引擎仓库 `substrate` 分离。
+> 本方案不改动引擎仓库，也不改动个人实例（redacted-instance）——动工前它们保持现状运转。
+
+## 一句话
+
+把「每台机器持有完整副本、靠 git 同步、靠 skill 分发行为规则」的多机共维模式，升级为：
+**一个云端服务持有实例并唯一维护（MCP server + keeper 守门 agent + 捕获入口），所有 AI agent 用自带的 MCP 客户端能力直连**。
+存储层（markdown + git + governance）一字不变；变的是访问层和执行层。
+
+## 为什么（三个真实痛点）
+
+1. **同步税**：每机 clone、`sync --check` 自愈、`--refresh` 不碰 governance、wire-context 接线、网关重启、撞车协议——全是"副本架构"自带的税，机器越多越重（2026-07 初的实操整整花了数轮才把 fleet 对齐）。
+2. **捕获断层**：手机上刷到的东西（小红书/微博/Twitter）要"复制链接 → 找 agent → 说一句话"才能入库，四步劝退，而捕获漏斗是个人知识库的生死线。
+3. **分发门槛**：GitHub + 命令行的上手方式"太不用户产品"，普通人用不了；而知识库本身的价值值得做成产品。
+
+> 前史：引擎仓库曾有一份 MCP adapter 提案，经对抗式评审后 DEFERRED（触发条件未到、三块地基未浇：服务端 Forbidden 强制、zone 访问控制强制、adapter 契约定稿）。本方案的触发条件已成立（拥有者本人的真实需求），且中心化架构恰好把前两块地基作为自带层浇上。本方案取代该提案。
+
+## 终态架构（一张图）
+
+```text
+ 手机小 APP（分享扩展）──── HTTPS + token ────┐
+ Claude Code ─────────── 原生 MCP 客户端 ────┤
+ Codex ───────────────── 原生 MCP 客户端 ────┤      ┌──────────────────────────────┐
+ Hermes ×N ───────────── 原生 MCP 客户端 ────┼────► │  https://kb.<域名>（公网服务）  │
+ （未来任意支持 MCP 的 AI）──────────────────┘      │  ├─ MCP server（读写工具）      │
+                                                   │  ├─ /capture（App 投递端点）   │
+        无 VPN、无隧道、设备零依赖                    │  ├─ inbox/ 隔离区（一切写先进） │
+        故障面 = 服务本身是否在线                     │  ├─ keeper（守门维护 agent）    │
+                                                   │  └─ 实例（markdown + git）     │
+                                                   └───────────┬──────────────────┘
+                                                               └─ push → GitHub 私库
+                                                                  （备份 + 全历史 + 逃生门）
+```
+
+**关键转变**：
+
+| 现在 | 之后 |
+|---|---|
+| 每台机器完整 clone + sync 对齐 | 只有服务端持有实例；其它机器零本地状态 |
+| 宪法靠每个 agent 自觉遵守 | 一切写入过 keeper，**服务端强制** |
+| 行为规则靠逐台 wire-context 注入 | server instructions **连接即下发** |
+| git 同步是用户要懂的事 | git 是服务背后的备份实现细节 |
+| 撞车协议 | 单写者，基本不再触发（留作后备） |
+
+## 仓库划分（本方案的边界决策）
+
+| 仓库 | 内容 | 可见性 | 变化 |
+|---|---|---|---|
+| `substrate`（现有） | 引擎：格式、governance、schemas、参考 skill、迁移 | 公开 | **不动**。继续作为 open-core 的"core"：格式与治理规则的事实源、自托管入口、信任背书 |
+| `substrate-service`（新建） | MCP server、keeper、capture 端点、（后续）手机 App、（产品期）账号/多租户 | 先私有 | 本方案的全部代码落这里 |
+| `redacted-instance`（现有） | 个人实例（数据） | 私有 | **不动**。将来被服务端 clone 为工作副本 |
+
+**依赖方向**：service 操作"实例"，而实例是自包含的（vendored 了 curate/collections/doctor 等零依赖脚本）——所以 **keeper 的执行器直接用实例内的脚本**，service 运行时不需要引擎在场；引擎只在版本升级（--refresh / migrate）时出现，与今天的模式一致。service 对引擎只有一个弱依赖：契约（schemas、zones 格式）按引擎版本号 pin。
+
+## 两步的关系
+
+**个人版不是原型，是产品的租户 #1。** 公网暴露、token 认证、inbox 隔离、keeper 判断/执行分离、审计日志——个人版按产品姿态写，产品化阶段做的是加法（账号、OAuth、多租户、计费、App 上架），没有一步需要推翻前面。
+
+## 已定的关键决策（含理由，供回看）
+
+1. **公网 HTTPS + token，不用 VPN/隧道**——可靠性与"设备零依赖"优先；安全靠 token 分级 + 架构自带的两道界（写入只进隔离区、敏感 zone 按客户端 ACL）。库本体反正已整库存在 GitHub 私库，云端副本没有跨越新的信任边界。
+2. **keeper 自研，不复用任何现有 agent 框架**——它是系统的信任根和未来产品的核心资产，必须可控、可测、可换模型。
+3. **keeper 架构 = LLM 只判断，代码才执行**——LLM 产出结构化决定（JSON），写入永远走确定性脚本；判断可用 golden 判例集回归。
+4. **keeper 归属：逻辑上每个实例一个，物理上无状态工人池**——个性化（规则、判例、反馈）全存在该实例仓库里（可带走）；计算按任务池化（轻、便宜、可横向扩）。keeper 属于"库"不属于"人"（共享库有自己的 keeper 上下文）。
+5. **一切写入先进 inbox 隔离区，写路径无 LLM**——捕获永远秒回；token 泄露最坏是收件箱进垃圾，碰不到库本体。
+6. **行为契约（该存/该提示存/该读库/查无不编）经 MCP server instructions 下发**——从"逐台接线"变"连接即得"；不支持 instructions 的客户端保留 digest 注入兜底。
+
+## 动工前的现状快照（2026-07-03，给接手的 session）
+
+- **引擎仓库**：`~/Downloads/personalwiki-v2-design/substrate`（公开，github.com/wheam/substrate）。153 测试全绿，已推送（HEAD `b4021f0`），CI 绿。**本方案不改它**。
+- **实例仓库**：`~/redacted-instance`（私有，github.com/wheam/redacted-instance）。已补齐实例 CI / .gitattributes / 撞车协议，vendored skill 为引擎 `b4021f0` 版。**本方案动工前不改它**；M1 起服务端从 GitHub clone 它作工作副本。
+- **现有 fleet**（MBP + Mac mini/OpenWrt/Railway 的 Hermes）：照常运转，**不再投入**（不追加同步/接线工作），等 M2 后按 01 的切换表逐台迁移。
+- **本机 CC/Codex 里的 substrate skill 停在 6-27 版是有意冻结**——不要"好心补齐同步"；切 MCP 后它们会被整体卸载。
+
+## 实现时的硬约束（拥有者明确要求，勿回退）
+
+1. 服务代码放**新仓库 `substrate-service`**，不进引擎仓库；方案文档随建仓迁入其 `docs/`。
+2. **不往真实 `~/.claude/` 和 `~/.codex/` 安装任何东西**（拥有者红线，权限系统也会拦；测试用沙盒目录/环境变量覆盖）。
+3. 用户设备上**零常驻依赖**：不引入 VPN/隧道/守护进程；手机 App 一跳直达服务，不接受中继。
+4. keeper 的体验底线：拒收必须给可读理由；低置信不猜、转人问。
+5. 每个里程碑（M0–M3）完成后**停下来给拥有者看结果**，通过再进下一步；决策与实测数据追加到 `01-personal-alpha.md` 末尾的「决策记录」。
+
+## 文档索引
+
+- **[01-personal-alpha.md](01-personal-alpha.md)** —— 我的个人版：部署选择、M0–M3 里程碑与验收、keeper v0 规格、App v0 规格、现有 fleet 的切换与退役、安全清单、成本与回退。
+- **[02-productization.md](02-productization.md)** —— 长期产品化：产品定义与体验、多租户架构、keeper 规模化、安全与信任、多人共享、open-core 立场、难点与非目标。
