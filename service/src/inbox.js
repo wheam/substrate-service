@@ -31,11 +31,16 @@ export function createInbox({ instanceDir, writer }) {
 
     const id = `${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;
     const receivedAt = new Date().toISOString();
-    const filename = `${receivedAt.slice(0, 10)}-${id}.md`;
+    // `_` 前缀 = doctor 的结构页豁免（流水条目不做孤儿/互链/索引检查）
+    const filename = `_${receivedAt.slice(0, 10)}-${id}.md`;
     const relPath = `inbox/${filename}`;
 
     const fm = [
       '---',
+      `title: 收件 ${id}`,
+      `created: ${receivedAt.slice(0, 10)}`,
+      `updated: ${receivedAt.slice(0, 10)}`,
+      'type: inbox',
       `id: ${id}`,
       `received_at: ${receivedAt}`,
       `client: ${oneline(client)}`,

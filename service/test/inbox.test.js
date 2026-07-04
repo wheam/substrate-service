@@ -32,10 +32,14 @@ before(() => {
 test('addEntry：秒回受理回执，文件落 inbox/ 且带完整 frontmatter', async () => {
   const receipt = inbox.addEntry({ kind: 'save', content: '今天决定用 DeepSeek 起步', hint: '决定', client: 'cc-test' });
   assert.ok(receipt.id);
-  assert.match(receipt.path, /^inbox\//);
+  assert.match(receipt.path, /^inbox\/_/, '文件名 _ 前缀（doctor 结构页豁免）');
   assert.equal(receipt.status, 'pending');
   const raw = readFileSync(path.join(work, receipt.path), 'utf8');
   assert.match(raw, /^---\n/);
+  assert.match(raw, /title: 收件 /);
+  assert.match(raw, /created: \d{4}-\d{2}-\d{2}/);
+  assert.match(raw, /updated: \d{4}-\d{2}-\d{2}/);
+  assert.match(raw, /type: inbox/);
   assert.match(raw, new RegExp(`id: ${receipt.id}`));
   assert.match(raw, /kind: save/);
   assert.match(raw, /client: cc-test/);

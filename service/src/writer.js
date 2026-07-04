@@ -38,6 +38,7 @@ export function createWriter({ instanceDir }) {
 
   return {
     commitAndPush: (opts) => enqueue(() => doCommitPush(opts)),
-    enqueue, // keeper 归档等复合写操作也要进同一条队列
+    // 复合写操作（改文件 + 提交须原子）：整段进队列，fn 拿到裸 commit 用
+    transact: (fn) => enqueue(() => fn(doCommitPush)),
   };
 }

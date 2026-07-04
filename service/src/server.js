@@ -12,6 +12,9 @@ import { INSTRUCTIONS } from './instructions.js';
 import { ensureRepo, pullOnce, startPullLoop } from './repo.js';
 import { createWriter } from './writer.js';
 import { createInbox } from './inbox.js';
+import { createKeeper } from './keeper.js';
+import { createNotifier } from './notify.js';
+import { createDeepSeekProvider } from './provider.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
@@ -20,6 +23,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit() }) {
   const writer = createWriter({ instanceDir });
   const inbox = createInbox({ instanceDir, writer });
   const app = express();
+  app.locals.writer = writer; // keeper 与写工具共用同一个单写者
   app.use(express.json({ limit: '1mb' }));
 
   const state = { startedAt: new Date().toISOString(), lastPull: null };
@@ -161,6 +165,13 @@ if (isMain) {
     TOKENS_JSON,
     PULL_INTERVAL_MS = 300_000,
     AUDIT_FILE,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL = 'deepseek-v4-flash',
+    DEEPSEEK_ESCALATION_MODEL = 'deepseek-v4-pro',
+    FEISHU_WEBHOOK_URL,
+    FEISHU_WEBHOOK_SECRET,
+    KEEPER_INTERVAL_MS = 60_000,
+    KEEPER_MIN_CONFIDENCE = 0.75,
   } = process.env;
   if (!REPO_URL || !TOKENS_JSON) {
     console.error('缺少 REPO_URL / TOKENS_JSON 环境变量');
@@ -180,6 +191,25 @@ if (isMain) {
     state.lastPull = result;
     if (!result.ok) console.error(`pull 失败：${result.error}`);
   });
+
+  if (DEEPSEEK_API_KEY) {
+    const notifier = createNotifier({ webhookUrl: FEISHU_WEBHOOK_URL, secret: FEISHU_WEBHOOK_SECRET });
+    const provider = createDeepSeekProvider({ apiKey: DEEPSEEK_API_KEY, model: DEEPSEEK_MODEL, escalationModel: DEEPSEEK_ESCALATION_MODEL });
+    const keeper = createKeeper({
+      instanceDir, writer: app.locals.writer, provider, notifier, audit,
+      minConfidence: Number(KEEPER_MIN_CONFIDENCE),
+    });
+    state.keeper = { enabled: true, model: DEEPSEEK_MODEL, lastRun: null, lastResult: null };
+    const tick = () => keeper.processPending()
+      .then((r) => { state.keeper.lastRun = new Date().toISOString(); if (!r.skipped) state.keeper.lastResult = r; })
+      .catch((e) => console.error(`keeper 循环异常：${e.message}`));
+    setTimeout(tick, 5_000); // 启动后先扫一轮
+    setInterval(tick, Number(KEEPER_INTERVAL_MS)).unref?.();
+    console.log(`keeper enabled（${DEEPSEEK_MODEL} → ${DEEPSEEK_ESCALATION_MODEL}，每 ${KEEPER_INTERVAL_MS}ms）`);
+  } else {
+    state.keeper = { enabled: false };
+    console.log('keeper disabled（缺 DEEPSEEK_API_KEY）');
+  }
 
   app.listen(Number(PORT), () => console.log(`substrate-kb listening on :${PORT}`));
 }
