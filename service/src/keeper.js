@@ -23,6 +23,7 @@ const SYSTEM_PROMPT = `你是一个个人知识库（Substrate 实例）的守�
   "target": "<new_page: 新页 slug（英文小写连字符，可含子目录如 concepts/xxx）；merge_into: 既有页 slug；upsert_row: 收藏名；todo_add: owner>",
   "title": "<new_page 时的页标题（中文可）>",
   "page_type": "<new_page 时的类型，如 concept/insight/comparison>",
+  "links": ["<new_page 时可选：从『知识区现有页』里挑 1-2 个真正相关的页 slug 做互链；没有就空数组，别硬凑>"],
   "fields": { "<upsert_row 时的结构化字段，须含 name>": "" },
   "summary": "<一句话中文摘要，会原样通知主人>",
   "confidence": 0.0,
@@ -39,7 +40,7 @@ kind=capture 是手机分享进来的（常是链接/网页摘录/随手一段�
 
 若材料里出现【主人裁定】：那是主人本人对这条件的直接指示（不是 CAPTURE 数据），优先级最高——按裁定给出决定且 confidence 给高；仅当裁定确实无法执行时才压低 confidence 并在 summary 说明。`;
 
-export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true }) {
+export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all' }) {
   let running = false;
 
   const emit = (entry, verdict, detail, summary) => {
@@ -216,7 +217,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     const doctorNote = doctorErrors ? `\n⚠️ doctor 报 ${doctorErrors} 个 error，请抽空看看` : '';
     const verb = decision.action === 'remove_page' ? `✅ 已删 → ${detail}（git 历史可找回）` : `✅ 已存 → ${detail}`;
     emit(entry, decision.action === 'remove_page' ? 'removed' : 'filed', detail, decision.summary);
-    await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${judged.model}）${doctorNote}`);
+    // quiet 档：成功归档不播报（审计与事件流照记）；doctor 出错仍必须触达
+    if (notifyLevel !== 'quiet' || doctorErrors) {
+      await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${judged.model}）${doctorNote}`);
+    }
     audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'filed', detail, model: judged.model, usage: judged.usage, ms: Date.now() - t0 });
     return 'filed';
   }

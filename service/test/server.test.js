@@ -96,3 +96,11 @@ test('低信任 token：get_context 连注册都没有、search 不见 sensitive
   assert.match(s.content[0].text, /没有命中|\"results\": \[\]|results": \[\]/);
   await client.close();
 });
+
+test('GET /digest：高信任返回常驻小抄纯文本；低信任/capture 403；无 token 401', async () => {
+  const ok = await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-high' } });
+  assert.equal(ok.status, 200);
+  assert.match(await ok.text(), /Alex/);
+  assert.equal((await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-low' } })).status, 403);
+  assert.equal((await fetch(`${baseUrl}/digest`)).status, 401);
+});

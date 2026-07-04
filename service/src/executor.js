@@ -1,5 +1,5 @@
 // keeper 的确定性执行器：LLM 只出决定，落盘永远走这里（直改文件或调实例 vendored 脚本）。
-import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { parseZones } from './acl.js';
@@ -156,7 +156,12 @@ async function newPage(instanceDir, entry, decision, zone) {
     '---',
     '',
   ].join('\n');
-  writeFileSync(abs, fm + entry.body.trim() + '\n');
+  // 相关页互链（LLM 提名、代码验真：不存在的页不硬凑）
+  const validLinks = (Array.isArray(decision.links) ? decision.links : [])
+    .filter((l) => typeof l === 'string' && /^[\w-]+$/.test(l))
+    .filter((l) => findPageByStem(instanceDir, zone.path, l));
+  const linksSection = validLinks.length ? `\n\n相关：${validLinks.map((l) => `[[${l}]]`).join('、')}\n` : '\n';
+  writeFileSync(abs, fm + entry.body.trim() + linksSection);
   // 登记索引（reindex 会给新页入链，免成孤儿）
   const zoneDir = zone.path.replace(/\/$/, '');
   await py(instanceDir, path.join(instanceDir, 'skills', 'substrate-curator', 'curate.py'),
@@ -174,6 +179,21 @@ function mergeInto(instanceDir, entry, decision, zone) {
   text += `\n\n---\n\n**${today()} keeper 归档**（inbox ${entry.id}，来自 ${entry.client}）：\n\n${entry.body.trim()}\n`;
   writeFileSync(abs, text);
   return { changedPaths: [rel], detail: rel };
+}
+
+function findPageByStem(instanceDir, zonePath, stem) {
+  const dir = path.join(instanceDir, zonePath);
+  if (!existsSync(dir)) return false;
+  const stack = [dir];
+  while (stack.length) {
+    const d = stack.pop();
+    for (const name of readdirSync(d)) {
+      const p = path.join(d, name);
+      if (statSync(p).isDirectory()) stack.push(p);
+      else if (name === `${stem}.md`) return true;
+    }
+  }
+  return false;
 }
 
 function slugify(s) {

@@ -57,6 +57,20 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     await transport.handleRequest(req, res, req.body);
   });
 
+  // ==== /digest：常驻小抄纯文本（.hermes.md 等 digest 注入的保鲜源）====
+  app.get('/digest', async (req, res) => {
+    const identity = identify(req);
+    if (!identity) return res.status(401).json({ error: 'unauthorized' });
+    if (identity.trust !== 'high') return res.status(403).json({ error: '常驻小抄含敏感记忆，仅高信任客户端可取' });
+    try {
+      const { content } = await tools.getContext({ trust: identity.trust });
+      audit({ client: identity.client, tool: 'digest', ok: true });
+      res.type('text/plain; charset=utf-8').send(content);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ==== /capture：手机 App 投递端点（写路径无 LLM，秒回；一切先进 inbox）====
   app.post('/capture', (req, res) => {
     const identity = identify(req);
@@ -244,6 +258,7 @@ if (isMain) {
     FEISHU_WEBHOOK_SECRET,
     KEEPER_INTERVAL_MS = 60_000,
     KEEPER_MIN_CONFIDENCE = 0.75,
+    KEEPER_NOTIFY_LEVEL = 'all',
   } = process.env;
   if (!REPO_URL || !TOKENS_JSON) {
     console.error('缺少 REPO_URL / TOKENS_JSON 环境变量');
@@ -272,6 +287,7 @@ if (isMain) {
       instanceDir, writer: app.locals.writer, provider, notifier, audit,
       onEvent: (e) => eventStore.push(e),
       minConfidence: Number(KEEPER_MIN_CONFIDENCE),
+      notifyLevel: KEEPER_NOTIFY_LEVEL,
     });
     state.keeper = { enabled: true, model: DEEPSEEK_MODEL, lastRun: null, lastResult: null };
     const tick = () => keeper.processPending()

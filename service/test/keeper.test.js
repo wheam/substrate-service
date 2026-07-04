@@ -178,3 +178,40 @@ test('merge_into：追加到既有页并 bump updated', async () => {
   assert.match(raw, /闷蒸 30 秒/);
   assert.match(raw, /keeper 归档/);
 });
+
+test('new_page 带 links：真实页写成 [[wikilink]]，不存在的丢弃', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [{
+      disposition: 'canonical', zone: 'knowledge', action: 'new_page',
+      target: 'latte-art', title: '拉花要点', links: ['coffee-brewing', 'no-such-page'],
+      summary: '拉花笔记', confidence: 0.9,
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '拉花先打奶泡。', client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  const raw = readFileSync(path.join(work, 'knowledge', 'latte-art.md'), 'utf8');
+  assert.match(raw, /相关：.*\[\[coffee-brewing\]\]/);
+  assert.ok(!raw.includes('[[no-such-page]]'), '不存在的页不该被硬凑成链接');
+});
+
+test('notifyLevel=quiet：已存不播报，held/rejected 照常', async () => {
+  const { work, inbox, provider, notifier } = setup({
+    providerScript: [
+      { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '进待办', confidence: 0.95 },
+      { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'x', confidence: 0.95, reject_reason: '闲聊无留存价值' },
+    ],
+  });
+  const quietKeeper = createKeeper({
+    instanceDir: work, writer: createWriter({ instanceDir: work }), provider, notifier, doctor: false, notifyLevel: 'quiet',
+  });
+  const a = inbox.addEntry({ kind: 'todo', content: '安静存一条', client: 'cc-test' });
+  await a.synced;
+  await quietKeeper.processPending();
+  assert.equal(notifier.messages.length, 0, 'quiet 下 filed 不播报');
+  const b = inbox.addEntry({ kind: 'save', content: '会被拒的闲聊', client: 'cc-test' });
+  await b.synced;
+  await quietKeeper.processPending();
+  assert.equal(notifier.messages.length, 1, '拒收必须照常播报');
+  assert.match(notifier.messages[0], /拒收/);
+});
