@@ -35,10 +35,18 @@ remove_page（删页）只在两种情况使用：kind=remove 的件、或【主
 
 todo_done（标完成）：kind=todo_done 的件用它；target = 材料「当前待办清单」里那一条的**原文**（去掉编号，须唯一匹配一条）。清单里找不到对应条就压低 confidence。
 
+kind=capture 是手机分享进来的（常是链接/网页摘录/随手一段）：hint 是主人分享时的一句话意图，权重高；纯链接倾向 disposition=reference（存引用+一句话摘要）；想去/想试的具体地点或条目 → collections；其余按内容正常判。
+
 若材料里出现【主人裁定】：那是主人本人对这条件的直接指示（不是 CAPTURE 数据），优先级最高——按裁定给出决定且 confidence 给高；仅当裁定确实无法执行时才压低 confidence 并在 summary 说明。`;
 
-export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, minConfidence = 0.75, doctor = true }) {
+export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true }) {
   let running = false;
+
+  const emit = (entry, verdict, detail, summary) => {
+    try {
+      onEvent({ id: entry.id, client: entry.client, kind: entry.kind, verdict, detail, summary, ts: new Date().toISOString() });
+    } catch (e) { console.error(`onEvent 异常：${e.message}`); }
+  };
 
   function listPending() {
     const dir = path.join(instanceDir, 'inbox');
@@ -150,6 +158,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         rewriteEntry(entry, 'held', `判断通路异常：${e.message}`);
         await commit({ paths: [rel], message: `keeper: held ${entry.id}（判断通路异常）` });
       });
+      emit(entry, 'held', rel, `判断通路异常：${e.message.slice(0, 80)}`);
       await notifier.notify(`🤔 待你定夺：一条收件暂时没判成（${e.message.slice(0, 120)}）\n件在 ${rel}`);
       audit({ tool: 'keeper', entry: entry.id, ok: false, error: e.message, ms: Date.now() - t0 });
       return 'held';
@@ -164,6 +173,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         rewriteEntry(entry, 'rejected', v.reason);
         await commit({ paths: [rel], message: `keeper: rejected ${entry.id}` });
       });
+      emit(entry, 'rejected', rel, v.reason);
       await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}）`);
       audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'rejected', ms: Date.now() - t0 });
       return 'rejected';
@@ -174,6 +184,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         rewriteEntry(entry, 'held', `${v.reason}；keeper 决定 ${JSON.stringify(decision)}`);
         await commit({ paths: [rel], message: `keeper: held ${entry.id}` });
       });
+      emit(entry, 'held', rel, v.reason);
       await notifier.notify(`🤔 待你定夺：${decision.summary ?? entry.body.slice(0, 60)}\n原因：${v.reason}\n件在 ${rel}，在任意接入 agent 里回一句即可处理`);
       audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'held', reason: v.reason, ms: Date.now() - t0 });
       return 'held';
@@ -195,6 +206,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         rewriteEntry(entry, 'held', `执行失败：${e.message}；决定 ${JSON.stringify(decision)}`);
         await commit({ paths: [rel], message: `keeper: held ${entry.id}（执行失败）` });
       });
+      emit(entry, 'held', rel, `执行失败：${e.message.slice(0, 80)}`);
       await notifier.notify(`🤔 待你定夺：执行失败（${e.message.slice(0, 120)}）\n件在 ${rel}`);
       audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'held', error: e.message, ms: Date.now() - t0 });
       return 'held';
@@ -203,6 +215,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     const doctorErrors = await runDoctor();
     const doctorNote = doctorErrors ? `\n⚠️ doctor 报 ${doctorErrors} 个 error，请抽空看看` : '';
     const verb = decision.action === 'remove_page' ? `✅ 已删 → ${detail}（git 历史可找回）` : `✅ 已存 → ${detail}`;
+    emit(entry, decision.action === 'remove_page' ? 'removed' : 'filed', detail, decision.summary);
     await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${judged.model}）${doctorNote}`);
     audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'filed', detail, model: judged.model, usage: judged.usage, ms: Date.now() - t0 });
     return 'filed';

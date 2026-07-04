@@ -15,15 +15,22 @@ import { createInbox } from './inbox.js';
 import { createKeeper } from './keeper.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
+import { createEventStore } from './events.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
-export function createApp({ instanceDir, tokens, audit = createAudit() }) {
+export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null }) {
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
   const inbox = createInbox({ instanceDir, writer });
   const app = express();
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
+
+  const identify = (req) => {
+    const auth = req.headers.authorization ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    return (token && tokens[token]) || null;
+  };
   app.use(express.json({ limit: '1mb' }));
 
   const state = { startedAt: new Date().toISOString(), lastPull: null };
@@ -32,12 +39,14 @@ export function createApp({ instanceDir, tokens, audit = createAudit() }) {
   app.get('/healthz', (_req, res) => res.json({ ok: true, ...state }));
 
   app.all('/mcp', async (req, res) => {
-    const auth = req.headers.authorization ?? '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-    const identity = token && tokens[token];
+    const identity = identify(req);
     if (!identity) {
       audit({ client: null, event: 'auth_rejected', ip: req.headers['x-forwarded-for'] ?? req.ip });
       return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (identity.trust === 'capture') {
+      audit({ client: identity.client, event: 'mcp_forbidden_for_capture_token' });
+      return res.status(403).json({ error: 'capture token 只能投递 /capture' });
     }
     if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
 
@@ -46,6 +55,38 @@ export function createApp({ instanceDir, tokens, audit = createAudit() }) {
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
+  });
+
+  // ==== /capture：手机 App 投递端点（写路径无 LLM，秒回；一切先进 inbox）====
+  app.post('/capture', (req, res) => {
+    const identity = identify(req);
+    if (!identity) {
+      audit({ client: null, event: 'auth_rejected', path: '/capture', ip: req.headers['x-forwarded-for'] ?? req.ip });
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    const { url, text, note } = req.body ?? {};
+    if (!url?.trim() && !text?.trim()) {
+      return res.status(400).json({ ok: false, error: 'url 与 text 至少要有一个' });
+    }
+    const content = [url?.trim(), text?.trim()].filter(Boolean).join('\n\n').slice(0, 20_000);
+    try {
+      const receipt = inbox.addEntry({ kind: 'capture', content, hint: note?.slice(0, 500), client: identity.client });
+      audit({ client: identity.client, tool: 'capture', args: { url, note }, ok: true });
+      return res.json({ ok: true, id: receipt.id, path: receipt.path });
+    } catch (e) {
+      audit({ client: identity.client, tool: 'capture', ok: false, error: e.message });
+      return res.status(400).json({ ok: false, error: e.message });
+    }
+  });
+
+  // App 状态页：自己的待处理件 + keeper 裁决事件（高信任 token 可见全部）
+  app.get('/capture/status', (req, res) => {
+    const identity = identify(req);
+    if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    const mineOnly = identity.trust !== 'high';
+    const pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
+    const events = (eventStore?.list() ?? []).filter((e) => !mineOnly || e.client === identity.client).slice(-100).reverse();
+    return res.json({ ok: true, pending, events });
   });
 
   return app;
@@ -212,7 +253,8 @@ if (isMain) {
   const { cloned } = await ensureRepo({ repoUrl: REPO_URL, dir: instanceDir });
   console.log(cloned ? `instance cloned → ${instanceDir}` : `instance already present → ${instanceDir}`);
 
-  const app = createApp({ instanceDir, tokens, audit });
+  const eventStore = createEventStore({ file: path.join(DATA_DIR, 'events.jsonl') });
+  const app = createApp({ instanceDir, tokens, audit, eventStore });
   const state = app.locals.state;
   state.lastPull = await pullOnce(instanceDir);
   startPullLoop(instanceDir, Number(PULL_INTERVAL_MS), (result) => {
@@ -225,6 +267,7 @@ if (isMain) {
     const provider = createDeepSeekProvider({ apiKey: DEEPSEEK_API_KEY, model: DEEPSEEK_MODEL, escalationModel: DEEPSEEK_ESCALATION_MODEL });
     const keeper = createKeeper({
       instanceDir, writer: app.locals.writer, provider, notifier, audit,
+      onEvent: (e) => eventStore.push(e),
       minConfidence: Number(KEEPER_MIN_CONFIDENCE),
     });
     state.keeper = { enabled: true, model: DEEPSEEK_MODEL, lastRun: null, lastResult: null };

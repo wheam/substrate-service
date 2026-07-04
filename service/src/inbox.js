@@ -4,7 +4,7 @@ import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from 
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done']);
+const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture']);
 
 // 与引擎 doctor 的凭据扫描同族的模式集（服务侧写路径前置一道）
 const CREDENTIAL_PATTERNS = [
