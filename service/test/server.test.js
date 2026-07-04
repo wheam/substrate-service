@@ -60,12 +60,20 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   await client.close();
 });
 
-test('tools/list 暴露 5 个读工具', async () => {
+test('tools/list：高信任 = 5 读 + 4 写；低信任只有读且无 sensitive 通路', async () => {
   const client = await mcpClient('test-token-high');
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['collections_search', 'get_context', 'read_page', 'search', 'todo_list']);
+  assert.deepEqual(names, [
+    'collections_search', 'collections_upsert', 'get_context', 'read_page',
+    'remember', 'save', 'search', 'todo_add', 'todo_list',
+  ]);
   await client.close();
+
+  const low = await mcpClient('test-token-low');
+  const lowNames = (await low.listTools()).tools.map((t) => t.name).sort();
+  assert.deepEqual(lowNames, ['collections_search', 'read_page', 'search', 'todo_list']);
+  await low.close();
 });
 
 test('高信任 token 全通路：search / todo_list / get_context', async () => {
@@ -79,11 +87,11 @@ test('高信任 token 全通路：search / todo_list / get_context', async () =>
   await client.close();
 });
 
-test('低信任 token：get_context 拒绝、search 不见 sensitive', async () => {
+test('低信任 token：get_context 连注册都没有、search 不见 sensitive', async () => {
   const client = await mcpClient('test-token-low');
   const c = await client.callTool({ name: 'get_context', arguments: {} });
   assert.equal(c.isError, true);
-  assert.match(c.content[0].text, /敏感|sensitive/);
+  assert.match(c.content[0].text, /not found/); // 未注册，而不是注册后拒绝
   const s = await client.callTool({ name: 'search', arguments: { query: '橡皮鸭' } });
   assert.match(s.content[0].text, /没有命中|\"results\": \[\]|results": \[\]/);
   await client.close();

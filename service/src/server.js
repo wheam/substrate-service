@@ -10,11 +10,15 @@ import { createTools } from './tools.js';
 import { createAudit } from './audit.js';
 import { INSTRUCTIONS } from './instructions.js';
 import { ensureRepo, pullOnce, startPullLoop } from './repo.js';
+import { createWriter } from './writer.js';
+import { createInbox } from './inbox.js';
 
-const SERVER_INFO = { name: 'substrate-kb', version: '0.1.0' };
+const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
 export function createApp({ instanceDir, tokens, audit = createAudit() }) {
   const tools = createTools({ instanceDir });
+  const writer = createWriter({ instanceDir });
+  const inbox = createInbox({ instanceDir, writer });
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -33,7 +37,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit() }) {
     }
     if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
 
-    const server = buildMcpServer({ tools, identity, audit });
+    const server = buildMcpServer({ tools, inbox, identity, audit });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -43,7 +47,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit() }) {
   return app;
 }
 
-function buildMcpServer({ tools, identity, audit }) {
+function buildMcpServer({ tools, inbox, identity, audit }) {
   const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
   const { client, trust } = identity;
 
@@ -51,10 +55,10 @@ function buildMcpServer({ tools, identity, audit }) {
     const t0 = Date.now();
     try {
       const result = await fn({ ...args, trust });
-      audit({ client, trust, tool: name, args, ok: true, ms: Date.now() - t0 });
+      audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ms: Date.now() - t0 });
       return { content: [{ type: 'text', text: render(result) }] };
     } catch (e) {
-      audit({ client, trust, tool: name, args, ok: false, error: e.message, ms: Date.now() - t0 });
+      audit({ client, trust, tool: name, args: auditArgs(args), ok: false, error: e.message, ms: Date.now() - t0 });
       return { content: [{ type: 'text', text: e.message }], isError: true };
     }
   };
@@ -77,11 +81,13 @@ function buildMcpServer({ tools, identity, audit }) {
     inputSchema: { path: z.string().describe('实例内相对路径') },
   }, wrap('read_page', tools.readPage, (r) => r.content));
 
-  server.registerTool('get_context', {
-    title: '主人的常驻小抄',
-    description: '获取关于主人的常驻上下文：核心事实与偏好、记忆目录、各分区速览与路由。凡问题涉及主人本人（称呼/偏好/背景/环境），先调这个。',
-    inputSchema: {},
-  }, wrap('get_context', tools.getContext, (r) => r.content));
+  if (trust === 'high') {
+    server.registerTool('get_context', {
+      title: '主人的常驻小抄',
+      description: '获取关于主人的常驻上下文：核心事实与偏好、记忆目录、各分区速览与路由。凡问题涉及主人本人（称呼/偏好/背景/环境），先调这个。',
+      inputSchema: {},
+    }, wrap('get_context', tools.getContext, (r) => r.content));
+  }
 
   server.registerTool('todo_list', {
     title: '主人的待办',
@@ -98,7 +104,51 @@ function buildMcpServer({ tools, identity, audit }) {
     },
   }, wrap('collections_search', tools.collectionsSearch, asJson));
 
+  // ==== 写工具（高信任客户端）：全部只落 inbox 隔离区，keeper 审核后才入库 ====
+  if (trust === 'high') {
+    const receiptText = (r) => `✅ 已受理 → ${r.path}（状态 pending，keeper 审核后归档并通知主人）`;
+
+    server.registerTool('save', {
+      title: '存入知识库（经收件箱）',
+      description: '把一段内容存进主人的知识库。当主人说「记一下/存一下/收藏这段」，或你提议保存且主人同意时用。内容落 inbox 隔离区，由 keeper 判断归入哪个分区。hint 可携带你或主人对去向的提示（如「决定」「餐厅」）。',
+      inputSchema: {
+        content: z.string().describe('要保存的内容原文'),
+        hint: z.string().optional().describe('去向提示（可选），如：决定/事实/餐厅/想试'),
+      },
+    }, wrap('save', async ({ content, hint }) => inbox.addEntry({ kind: 'save', content, hint, client }), receiptText));
+
+    server.registerTool('todo_add', {
+      title: '加待办（经收件箱）',
+      description: '给主人加一条待办。主人说「记得提醒我/要做 X/加个待办」时用。',
+      inputSchema: { item: z.string().describe('待办事项，一句话') },
+    }, wrap('todo_add', async ({ item }) => inbox.addEntry({ kind: 'todo', content: item, client }), receiptText));
+
+    server.registerTool('collections_upsert', {
+      title: '加收藏条目（经收件箱）',
+      description: '往主人的结构化收藏（如 restaurants）加/更新一行。主人说「收藏这家店/加到我的清单」时用。row 的字段尽量对齐该收藏主表的列。',
+      inputSchema: {
+        name: z.string().describe('收藏名（collections/ 下的目录名）'),
+        row: z.record(z.string(), z.any()).describe('结构化字段，如 {name, city, cuisine, notes}'),
+      },
+    }, wrap('collections_upsert', async ({ name, row }) => inbox.addEntry({ kind: 'collection', payload: { name, row }, client }), receiptText));
+
+    server.registerTool('remember', {
+      title: '记住关于主人的事实（经收件箱）',
+      description: '记录关于主人的稳定事实/偏好（跨 agent 共享记忆）。主人说「记住我…/我的偏好是…」时用。临时性、一次性的信息不要用这个。',
+      inputSchema: { fact: z.string().describe('稳定事实或偏好，一句话') },
+    }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText));
+  }
+
   return server;
+}
+
+// 审计里长内容截断（日志可读性；全文反正已在 inbox/git 里）
+function auditArgs(args) {
+  const out = {};
+  for (const [k, v] of Object.entries(args ?? {})) {
+    out[k] = typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + `…(${v.length})` : v;
+  }
+  return out;
 }
 
 // ==== 进程入口（直接运行时）====
