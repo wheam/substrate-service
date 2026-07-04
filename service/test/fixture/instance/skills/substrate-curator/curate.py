@@ -9,7 +9,19 @@ r = sub.add_parser("reindex")
 r.add_argument("--instance", required=True)
 r.add_argument("--dir", required=True)
 r.add_argument("--apply", action="store_true")
+rm = sub.add_parser("rm")
+rm.add_argument("--instance", required=True)
+rm.add_argument("--page", required=True)
+rm.add_argument("--apply", action="store_true")
 a = p.parse_args()
+
+if a.cmd == "rm":
+    target = pathlib.Path(a.instance) / a.page
+    assert target.is_file(), f"not a file: {a.page}"
+    if a.apply:
+        target.unlink()
+    print("removed " + a.page)
+    raise SystemExit(0)
 
 d = pathlib.Path(a.instance) / a.dir
 readme = d / "README.md"

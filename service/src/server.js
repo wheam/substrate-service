@@ -142,6 +142,12 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
       inputSchema: { fact: z.string().describe('稳定事实或偏好，一句话') },
     }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText));
 
+    server.registerTool('remove', {
+      title: '删除库中内容（经收件箱）',
+      description: '删除知识库中的某一页。仅当主人明确要求删除时使用（例：「把 X 那页删了」）——不要因为内容过时/你认为没用就主动删。keeper 会校验目标并执行；git 历史永远可找回；骨架区（governance/skills）禁删。',
+      inputSchema: { what: z.string().describe('主人要删什么，原话或页路径（如 knowledge/xxx）') },
+    }, wrap('remove', async ({ what }) => inbox.addEntry({ kind: 'remove', content: what, client }), receiptText));
+
     server.registerTool('inbox_list', {
       title: '查收件箱',
       description: '列出 inbox 收件（含待定夺 held / 被拒收 rejected / 待处理 pending 的件）。主人问「有什么待定夺的/我的收件箱」或要处置某条时先用它拿 id。',

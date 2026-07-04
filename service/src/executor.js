@@ -5,7 +5,9 @@ import path from 'node:path';
 import { parseZones } from './acl.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
-const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add']);
+const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page']);
+// 骨架/流水区永久禁删（keeper 对 inbox 的清理走内部通路，不经 remove_page）
+const NO_DELETE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -37,6 +39,15 @@ export function validateDecision({ instanceDir, decision }) {
 
   if (d.action === 'todo_add') {
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_add 只能进 todo 区' };
+  } else if (d.action === 'remove_page') {
+    if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
+    if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
+    const slug = d.target.replace(/\.md$/, '');
+    const rel = slug.startsWith(zone.path) ? `${slug}.md` : path.posix.join(zone.path, `${slug}.md`);
+    if (path.basename(rel) === 'README.md' || path.basename(rel).startsWith('_')) {
+      return { ok: false, reason: `不允许删结构页：${rel}` };
+    }
+    if (!existsSync(path.join(instanceDir, rel))) return { ok: false, reason: `目标页不存在：${rel}（不误删，需主人确认）` };
   } else if (d.action === 'upsert_row') {
     if (badTarget(d.target) || d.target.includes('/')) return { ok: false, reason: `收藏名不合法：${d.target}` };
     if (!existsSync(path.join(instanceDir, 'collections', d.target, 'data.csv'))) {
@@ -55,8 +66,18 @@ export async function applyDecision({ instanceDir, entry, decision, zone }) {
     case 'upsert_row': return upsertRow(instanceDir, decision);
     case 'new_page': return newPage(instanceDir, entry, decision, zone);
     case 'merge_into': return mergeInto(instanceDir, entry, decision, zone);
+    case 'remove_page': return removePage(instanceDir, decision, zone);
     default: throw new Error(`未知 action：${decision.action}`);
   }
+}
+
+async function removePage(instanceDir, decision, zone) {
+  const slug = decision.target.replace(/\.md$/, '');
+  const rel = slug.startsWith(zone.path) ? `${slug}.md` : path.posix.join(zone.path, `${slug}.md`);
+  await py(instanceDir, path.join(instanceDir, 'skills', 'substrate-curator', 'curate.py'),
+    ['rm', '--instance', '.', '--page', rel, '--apply']);
+  // rm 会清全库反向链接 + 重建索引，改动面不可预知 → 整树提交（写者串行，窗口内无并发写）
+  return { changedPaths: ['.'], detail: rel };
 }
 
 function todoAdd(instanceDir, entry) {
