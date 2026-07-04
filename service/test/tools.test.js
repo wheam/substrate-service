@@ -66,10 +66,20 @@ test('get_context：跑实例 vendored 的 render-context.py；低信任拒绝',
   await assert.rejects(() => tools.getContext({ trust: 'low' }), /sensitive|敏感/);
 });
 
-test('todo_list：返回 owner.md 内容', async () => {
-  const { content } = await tools.todoList();
-  assert.match(content, /柠檬树/);
-  assert.match(content, /自行车/);
+test('todo_list：默认返回 owner.md，并告知还有哪些清单', async () => {
+  const r = await tools.todoList();
+  assert.match(r.content, /柠檬树/);
+  assert.match(r.content, /自行车/);
+  assert.equal(r.list, 'owner');
+  assert.deepEqual(r.other_lists, ['curio-todo']);
+});
+
+test('todo_list：list 参数读其他清单（容忍简称）；未知清单报可读错误', async () => {
+  const exact = await tools.todoList({ list: 'curio-todo' });
+  assert.match(exact.content, /X 平台集成/);
+  const fuzzy = await tools.todoList({ list: 'curio' });
+  assert.equal(fuzzy.list, 'curio-todo');
+  await assert.rejects(() => tools.todoList({ list: 'nope' }), /owner|curio/);
 });
 
 test('collections_search：关键词过滤行，带引号逗号字段解析正确', async () => {

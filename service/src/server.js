@@ -135,10 +135,13 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
   }
 
   server.registerTool('todo_list', {
-    title: '主人的待办',
-    description: '读主人的待办清单（todo/owner.md）。主人问「我还有什么没做/我的待办」时用。',
-    inputSchema: {},
-  }, wrap('todo_list', tools.todoList, (r) => r.content));
+    title: '待办清单',
+    description: '读待办清单。不传参数=主人本人的清单（owner）；库里还有各 agent 的清单（如 curio），主人问「curio 的 todo / 某项目的待办」时传 list 参数。',
+    inputSchema: {
+      list: z.string().optional().describe('清单名（如 curio），不传=owner'),
+    },
+  }, wrap('todo_list', tools.todoList, (r) =>
+    r.content + (r.other_lists?.length ? `\n\n---\n📋 另有清单：${r.other_lists.join('、')}（todo_list 传 list 参数可读）` : '')));
 
   server.registerTool('collections_search', {
     title: '查收藏',

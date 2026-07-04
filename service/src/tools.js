@@ -83,8 +83,25 @@ export function createTools({ instanceDir }) {
     return { content };
   }
 
-  async function todoList() {
-    return { content: readFileSync(path.join(instanceDir, 'todo', 'owner.md'), 'utf8') };
+  async function todoList({ list } = {}) {
+    const dir = path.join(instanceDir, 'todo');
+    const available = readdirSync(dir)
+      .filter((f) => f.endsWith('.md') && f !== 'README.md' && !f.startsWith('_'))
+      .map((f) => f.replace(/\.md$/, ''));
+    const wanted = list?.trim();
+    const stem = !wanted
+      ? 'owner'
+      : available.find((a) => a === wanted)
+        ?? available.find((a) => a === `${wanted}-todo`)
+        ?? available.find((a) => a.startsWith(wanted));
+    if (!stem || !available.includes(stem)) {
+      throw new Error(`没有叫 ${wanted} 的待办清单，可用：${available.join('、')}`);
+    }
+    return {
+      list: stem,
+      content: readFileSync(path.join(dir, `${stem}.md`), 'utf8'),
+      other_lists: available.filter((a) => a !== stem),
+    };
   }
 
   async function collectionsSearch({ name, query }) {
