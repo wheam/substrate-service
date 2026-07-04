@@ -58,6 +58,18 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   });
 
   // ==== /digest：常驻小抄纯文本（.hermes.md 等 digest 注入的保鲜源）====
+  // 尾注房规 = MCP instructions 的 digest 版：给不消费 instructions 的宿主（如 Hermes）下发行为契约
+  const DIGEST_RULES = `
+
+---
+
+## 接入房规（服务下发，随 digest 更新）
+
+- 本知识库已服务化：**读写一律走 substrate-kb 的 MCP 工具**（读：search / read_page / get_context / todo_list / collections_search / inbox_list；写：save / todo_add / todo_done / collections_upsert / remember / remove / inbox_resolve）。
+- **不要直接修改本地的知识库克隆、不要对它跑 git 命令**——写入必须经 inbox 隔离区由 keeper 审核归档；直接改文件会绕过治理、并让工具视图与文件短暂不一致。
+- 服务端副本按分钟级跟随 GitHub：若工具结果与你预期不一致，多半是同步窗口，直说即可，不要自行绕过工具去改文件。
+- 查无不编：工具返回空就明说「库里没存过」。写入成功的回执 ≠ 已入库，说「已受理，keeper 会通知主人」。`;
+
   app.get('/digest', async (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ error: 'unauthorized' });
@@ -65,7 +77,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     try {
       const { content } = await tools.getContext({ trust: identity.trust });
       audit({ client: identity.client, tool: 'digest', ok: true });
-      res.type('text/plain; charset=utf-8').send(content);
+      res.type('text/plain; charset=utf-8').send(content + DIGEST_RULES);
     } catch (e) {
       res.status(500).json({ error: e.message });
     }

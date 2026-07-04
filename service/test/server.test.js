@@ -100,7 +100,10 @@ test('低信任 token：get_context 连注册都没有、search 不见 sensitive
 test('GET /digest：高信任返回常驻小抄纯文本；低信任/capture 403；无 token 401', async () => {
   const ok = await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-high' } });
   assert.equal(ok.status, 200);
-  assert.match(await ok.text(), /Alex/);
+  const text = await ok.text();
+  assert.match(text, /Alex/);
+  assert.match(text, /接入房规/, 'digest 应携带服务下发的接入房规');
+  assert.match(text, /不要直接修改本地/, '房规应禁止直改本地 clone');
   assert.equal((await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-low' } })).status, 403);
   assert.equal((await fetch(`${baseUrl}/digest`)).status, 401);
 });
