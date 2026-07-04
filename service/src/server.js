@@ -141,6 +141,22 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
       description: '记录关于主人的稳定事实/偏好（跨 agent 共享记忆）。主人说「记住我…/我的偏好是…」时用。临时性、一次性的信息不要用这个。',
       inputSchema: { fact: z.string().describe('稳定事实或偏好，一句话') },
     }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText));
+
+    server.registerTool('inbox_list', {
+      title: '查收件箱',
+      description: '列出 inbox 收件（含待定夺 held / 被拒收 rejected / 待处理 pending 的件）。主人问「有什么待定夺的/我的收件箱」或要处置某条时先用它拿 id。',
+      inputSchema: {},
+    }, wrap('inbox_list', async () => inbox.listEntries(), asJson));
+
+    server.registerTool('inbox_resolve', {
+      title: '主人裁定收件',
+      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。仅在主人明确表态后使用，id 用 inbox_list 查。',
+      inputSchema: {
+        id: z.string().describe('收件 id（inbox_list 可查）'),
+        ruling: z.string().describe('主人的裁定原话，一句话'),
+      },
+    }, wrap('inbox_resolve', async ({ id, ruling }) => inbox.resolveEntry({ id, ruling }),
+      (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`));
   }
 
   return server;

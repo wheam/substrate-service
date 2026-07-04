@@ -1,6 +1,6 @@
 // inbox 隔离区：一切写入先落这里（写路径无 LLM，秒回受理回执），keeper 审核后才进正式区。
 // 凭据红线在落盘之前扫——命中即拒收，密钥永不进 git。
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -64,7 +64,46 @@ export function createInbox({ instanceDir, writer }) {
     return receipt;
   }
 
-  return { addEntry };
+  function listEntries() {
+    const dir = path.join(instanceDir, 'inbox');
+    if (!existsSync(dir)) return { entries: [] };
+    const entries = readdirSync(dir)
+      .filter((f) => f.startsWith('_') && f.endsWith('.md'))
+      .map((f) => {
+        const raw = readFileSync(path.join(dir, f), 'utf8');
+        const get = (k) => raw.match(new RegExp(`^${k}: (.*)$`, 'm'))?.[1] ?? '';
+        const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '').trim();
+        return {
+          id: get('id'), path: `inbox/${f}`, kind: get('kind'), status: get('status'),
+          received_at: get('received_at'), hint: get('hint') || undefined,
+          excerpt: body.slice(0, 120),
+        };
+      });
+    return { entries };
+  }
+
+  // 主人裁定：把件复位为 pending 并携带 owner_ruling，keeper 下一轮按裁定执行并自动立判例
+  function resolveEntry({ id, ruling }) {
+    const { entries } = listEntries();
+    const hit = entries.find((e) => e.id === id);
+    if (!hit) {
+      throw new Error(`找不到收件 ${id}。当前 inbox 里有：${entries.map((e) => `${e.id}(${e.status})`).join('、') || '（空）'}`);
+    }
+    if (!ruling?.trim()) throw new Error('ruling 不能为空');
+    const abs = path.join(instanceDir, hit.path);
+    let raw = readFileSync(abs, 'utf8');
+    raw = raw
+      .replace(/^status: .*$/m, 'status: pending')
+      .replace(/^updated: .*$/m, `updated: ${new Date().toISOString().slice(0, 10)}`)
+      .replace(/^owner_ruling: .*\n/m, '');
+    raw = raw.replace(/^status: pending$/m, `owner_ruling: ${oneline(ruling)}\nstatus: pending`);
+    writeFileSync(abs, raw);
+    const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling) };
+    receipt.synced = writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` });
+    return receipt;
+  }
+
+  return { addEntry, listEntries, resolveEntry };
 }
 
 function oneline(v) {
