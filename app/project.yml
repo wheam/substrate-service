@@ -1,0 +1,55 @@
+name: Cortex
+options:
+  bundleIdPrefix: com.wheam
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Cortex:
+    type: application
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wheam.cortex
+    sources: [CortexApp, Shared]
+    dependencies:
+      - target: ShareExtension
+        embed: true
+    info:
+      path: CortexApp/Info.plist
+      properties:
+        CFBundleDisplayName: Cortex
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+    entitlements:
+      path: CortexApp/Cortex.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.wheam.cortex]
+  ShareExtension:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wheam.cortex.share
+    sources: [ShareExtension, Shared]
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: 存进 Cortex
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    entitlements:
+      path: ShareExtension/ShareExtension.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.wheam.cortex]

@@ -1,0 +1,5 @@
+# Xcode 工程由 xcodegen 从 project.yml 生成，不入库
+Cortex.xcodeproj/
+build/
+DerivedData/
+*.xcuserstate
