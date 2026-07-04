@@ -142,6 +142,12 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
       inputSchema: { fact: z.string().describe('稳定事实或偏好，一句话') },
     }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText));
 
+    server.registerTool('todo_done', {
+      title: '标待办完成（经收件箱）',
+      description: '把主人的某条待办标为已完成（挪进「已完成」小节）。主人说「X 做完了/完成了/搞定了」时用。item 写主人指的那条（原话即可，keeper 会对着清单精确匹配）。',
+      inputSchema: { item: z.string().describe('主人说的哪条待办，原话') },
+    }, wrap('todo_done', async ({ item }) => inbox.addEntry({ kind: 'todo_done', content: item, client }), receiptText));
+
     server.registerTool('remove', {
       title: '删除库中内容（经收件箱）',
       description: '删除知识库中的某一页。仅当主人明确要求删除时使用（例：「把 X 那页删了」）——不要因为内容过时/你认为没用就主动删。keeper 会校验目标并执行；git 历史永远可找回；骨架区（governance/skills）禁删。',

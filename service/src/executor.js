@@ -5,7 +5,7 @@ import path from 'node:path';
 import { parseZones } from './acl.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
-const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page']);
+const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page', 'todo_done']);
 // 骨架/流水区永久禁删（keeper 对 inbox 的清理走内部通路，不经 remove_page）
 const NO_DELETE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
 
@@ -39,6 +39,9 @@ export function validateDecision({ instanceDir, decision }) {
 
   if (d.action === 'todo_add') {
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_add 只能进 todo 区' };
+  } else if (d.action === 'todo_done') {
+    if (d.zone !== 'todo') return { ok: false, reason: 'todo_done 只能作用于 todo 区' };
+    if (!d.target?.trim()) return { ok: false, reason: 'todo_done 缺 target（待办条目原文）' };
   } else if (d.action === 'remove_page') {
     if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
@@ -63,6 +66,7 @@ export function validateDecision({ instanceDir, decision }) {
 export async function applyDecision({ instanceDir, entry, decision, zone }) {
   switch (decision.action) {
     case 'todo_add': return todoAdd(instanceDir, entry);
+    case 'todo_done': return todoDone(instanceDir, decision);
     case 'upsert_row': return upsertRow(instanceDir, decision);
     case 'new_page': return newPage(instanceDir, entry, decision, zone);
     case 'merge_into': return mergeInto(instanceDir, entry, decision, zone);
@@ -94,6 +98,35 @@ function todoAdd(instanceDir, entry) {
   const glue = m[0].endsWith('\n\n') ? '' : '\n';
   writeFileSync(abs, text.slice(0, insertAt) + (m[0].endsWith('\n') ? '' : '\n') + line + glue + text.slice(insertAt));
   return { changedPaths: [rel], detail: `todo/owner.md 第 ${next} 条` };
+}
+
+// 有界改动：把「进行中/待办」里唯一匹配的一条挪进「已完成」（- 原文 ✅ 日期，实例既有格式）
+function todoDone(instanceDir, decision) {
+  const rel = 'todo/owner.md';
+  const abs = path.join(instanceDir, rel);
+  const text = readFileSync(abs, 'utf8');
+  const needle = decision.target.trim();
+  const lines = text.split('\n');
+  const matches = [];
+  let inSection = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^## (进行中|待办)/.test(lines[i])) { inSection = true; continue; }
+    if (/^## /.test(lines[i])) { inSection = false; continue; }
+    if (!inSection) continue;
+    const itemText = lines[i].replace(/^(\d+\.|-)\s+/, '').trim();
+    if (itemText && (itemText === needle || itemText.includes(needle))) matches.push({ i, itemText });
+  }
+  if (matches.length !== 1) {
+    throw new Error(`todo_done 目标须唯一匹配，「${needle}」命中 ${matches.length} 条——请主人指明是哪条`);
+  }
+  const { i, itemText } = matches[0];
+  lines.splice(i, 1);
+  let out = lines.join('\n');
+  if (!/^## 已完成/m.test(out)) out = out.replace(/\n*$/, '\n\n## 已完成\n');
+  out = out.replace(/^## 已完成\n/m, `## 已完成\n\n- ${itemText} ✅ ${today()}\n`)
+    .replace(/\n{4,}/g, '\n\n\n');
+  writeFileSync(abs, out.replace(/^updated: .*$/m, `updated: ${today()}`));
+  return { changedPaths: [rel], detail: `todo 完成：${itemText.slice(0, 40)}` };
 }
 
 async function upsertRow(instanceDir, decision) {

@@ -66,7 +66,7 @@ test('tools/list：高信任 = 5 读 + 4 写；低信任只有读且无 sensitiv
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
     'collections_search', 'collections_upsert', 'get_context', 'inbox_list', 'inbox_resolve',
-    'read_page', 'remember', 'remove', 'save', 'search', 'todo_add', 'todo_list',
+    'read_page', 'remember', 'remove', 'save', 'search', 'todo_add', 'todo_done', 'todo_list',
   ]);
   await client.close();
 
