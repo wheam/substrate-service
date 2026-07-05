@@ -63,7 +63,8 @@ test('resolveEntry：写入主人裁定并复位 pending；未知 id 报可读�
 test('keeper：主人裁定进 prompt、按裁定执行、判例自动落 _cases.md', async () => {
   const { origin, work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表（resolveEntry 记账、keeper 核验）
+  const inbox = createInbox({ instanceDir: work, writer, approvals });
   const calls = [];
   const provider = {
     judge: async (req) => {
@@ -76,7 +77,7 @@ test('keeper：主人裁定进 prompt、按裁定执行、判例自动落 _cases
   };
   const messages = [];
   const keeper = createKeeper({
-    instanceDir: work, writer, provider,
+    instanceDir: work, writer, provider, approvals,
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,
   });
@@ -98,10 +99,12 @@ test('capture 通道的裁定无权触发删页：remove_page 校验直接不过
   const { work } = makeInstance();
   const { validateDecision } = await import('../src/executor.js');
   const decision = { disposition: 'canonical', zone: 'knowledge', action: 'remove_page', target: 'coffee-brewing', summary: 's', confidence: 0.99 };
-  const viaApp = validateDecision({ instanceDir: work, decision, entry: { ruling_via_trust: 'capture' } });
+  // F1：认证与通道都来自 keeper 查批准登记表后置的机器字段（__ruling_authentic / __ruling_trust=registry 里的
+  // viaTrust），executor 不再信文件里裸的 owner_ruling/ruling_via_trust——伪造件改写这些 frontmatter 无效。
+  const viaApp = validateDecision({ instanceDir: work, decision, entry: { __ruling_authentic: true, __ruling_trust: 'capture' } });
   assert.equal(viaApp.ok, false);
   assert.match(viaApp.reason, /无权删除|capture/);
-  const viaHigh = validateDecision({ instanceDir: work, decision, entry: { ruling_via_trust: 'high' } });
+  const viaHigh = validateDecision({ instanceDir: work, decision, entry: { __ruling_authentic: true, __ruling_trust: 'high' } });
   assert.equal(viaHigh.ok, true, '高信任通道的裁定可删');
 });
 
@@ -140,7 +143,8 @@ test('listEntries：正文干净（不含 keeper 注记）、解析 held 人话�
 test('keeper：预批决定直接执行不再重判；held 时自动生成候选方案块并在通知里列出', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表
+  const inbox = createInbox({ instanceDir: work, writer, approvals });
   const calls = [];
   const provider = {
     judge: async (req) => {
@@ -156,7 +160,7 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
   };
   const messages = [];
   const keeper = createKeeper({
-    instanceDir: work, writer, provider,
+    instanceDir: work, writer, provider, approvals,
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,
   });
@@ -182,12 +186,13 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
 test('主人裁定的拒收：件直接清场（git 留痕）+ 记判例；keeper 主动拒收仍保留待复核', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表
+  const inbox = createInbox({ instanceDir: work, writer, approvals });
   const provider = { judge: async (req) => req.mode === 'options'
     ? { json: { options: [] }, model: 'pro', usage: {} }
     : { json: { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 's', confidence: 0.9, reject_reason: '主人选择不保存' }, model: 'flash', usage: {} } };
   const keeper = createKeeper({
-    instanceDir: work, writer, provider,
+    instanceDir: work, writer, provider, approvals,
     notifier: { notify: async () => ({ ok: true }) }, doctor: false,
   });
   const r = inbox.addEntry({ kind: 'save', content: '要被扔掉的内容', client: 'cc-test' });
