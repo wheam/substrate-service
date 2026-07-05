@@ -12,11 +12,15 @@ import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, realpathSyn
 import path from 'node:path';
 import { parseZones, canRead, canReadZone, zoneFor } from './acl.js';
 import { readContentId } from './content-id.js';
+import { readTier, normalizeInclude, isQuarantineRejected } from './tier.js';
 
 const SEARCH_EXTS = new Set(['.md', '.csv', '.txt']);
 const MAX_RESULTS = 50;
 const MAX_SNIPPET = 200;
 const MAX_RAW = 500;
+// 隔离-rejected 件（tier: rejected，住 inbox 未注册区）在索引里的 zone 哨兵值——registered zone id
+// 永不叫 inbox（inbox 是保留的隔离目录，非内容区），故不会撞车。仅供 SQL 预过滤圈定与 JS 收口。
+const INBOX_SENTINEL = 'inbox';
 
 // CJK（含日文假名、韩文谚文）。bigram 预切分索引侧/查询侧共用，保证一致。
 const CJK_RE = /[\p{Script=Han}぀-ヿ가-힯]/u;
@@ -125,10 +129,22 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
   }
 
   // 一个文件 → 逐行行（跳过空行/纯符号行）：raw 存原行供 snippet，body 存 bigram 预处理供 FTS。
+  // 可索引性也在此判定（返回 [] = 不入索引）：
+  //   - 注册 zone 的文件 → 入，zone=该 zone id，tier 从 frontmatter 读（缺省 canonical）。
+  //   - inbox/ 下【且】status:rejected + tier:rejected 双条件的隔离件 → 入，zone=哨兵 inbox（缺陷1/2a 的窄特例；
+  //     pending/held 无此标记、手写 status:pending + tier:rejected 残留亦不满足 → 不入）。
+  //   - 其余未注册路径（governance/skills/keeper-feedback/inbox 的 pending·held）→ 返回 []，永不入索引。
   function rowsForFile(rel, zones) {
     const text = readFileSync(path.join(instanceDir, rel), 'utf8');
-    const contentId = rel.endsWith('.md') ? readContentId(text) : null;
-    const zone = zoneFor(zones, rel)?.id ?? null;
+    const isMd = rel.endsWith('.md');
+    const tier = isMd ? readTier(text) : 'canonical'; // 无 frontmatter / 非 md（.csv/.txt 收藏）→ canonical
+    const regZone = zoneFor(zones, rel);
+    let zone;
+    if (regZone) zone = regZone.id;
+    // 缺陷2a：入索引特例改为 status:rejected + tier:rejected 双条件（与 tools.search 共用 isQuarantineRejected）。
+    else if (rel.startsWith('inbox/') && isQuarantineRejected(text)) zone = INBOX_SENTINEL; // 隔离-rejected 特例
+    else return []; // 未注册且非 inbox-rejected → 隔离/系统区永不入索引
+    const contentId = isMd ? readContentId(text) : null;
     const rows = [];
     const lines = text.split('\n');
     for (let i = 0; i < lines.length; i++) {
@@ -136,7 +152,7 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
       if (!raw) continue;
       const body = preprocess(raw);
       if (!body) continue;
-      rows.push([rel, contentId, zone, i + 1, raw.slice(0, MAX_RAW), body]);
+      rows.push([rel, contentId, zone, tier, i + 1, raw.slice(0, MAX_RAW), body]);
     }
     return rows;
   }
@@ -144,12 +160,12 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
   function createSchema(d) {
     d.exec(`DROP TABLE IF EXISTS docs;`);
     d.exec(`CREATE VIRTUAL TABLE docs USING fts5(
-      path UNINDEXED, content_id UNINDEXED, zone UNINDEXED, lineno UNINDEXED, raw UNINDEXED, body,
+      path UNINDEXED, content_id UNINDEXED, zone UNINDEXED, tier UNINDEXED, lineno UNINDEXED, raw UNINDEXED, body,
       tokenize='unicode61'
     );`);
   }
 
-  const INSERT = `INSERT INTO docs(path, content_id, zone, lineno, raw, body) VALUES (?,?,?,?,?,?)`;
+  const INSERT = `INSERT INTO docs(path, content_id, zone, tier, lineno, raw, body) VALUES (?,?,?,?,?,?,?)`;
 
   // 全量重建：幂等（DROP+CREATE 后从文件全灌）。fixture 规模秒级。只灌注册 zone 的文件（缺陷1）。
   function rebuild() {
@@ -160,7 +176,9 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
     d.exec('BEGIN');
     try {
       for (const rel of walkFiles()) {
-        if (!inRegisteredZone(zones, rel)) continue; // 隔离/系统区永不入索引
+        // 免读优化：未注册且不在 inbox/ → 直接跳过（governance/skills/keeper-feedback）。
+        // 其余（注册 zone + inbox 件）交给 rowsForFile 按 tier 最终裁定可索引性（inbox 只收 rejected）。
+        if (!inRegisteredZone(zones, rel) && !rel.startsWith('inbox/')) continue;
         for (const r of rowsForFile(rel, zones)) ins.run(...r);
       }
       d.exec('COMMIT');
@@ -170,16 +188,17 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
   }
 
   // 增量：单页更新（keeper 单写口每次归档后 / 直接编辑后调）。无索引先全建。
+  // 可索引性完全交给 rowsForFile（未注册且非 inbox-rejected → 返回 []，即只 DELETE 不再插入）——
+  // 隔离件（inbox pending/held）即便被直接调用也不会漏进索引（缺陷1）。
   function updatePage(rel) {
     if (!SEARCH_EXTS.has(path.extname(rel))) return;
     if (!hasIndex()) return void rebuild();
     const d = connect();
     const zones = parseZones(instanceDir);
-    const indexable = inRegisteredZone(zones, rel); // 未注册 zone 的路径不入索引（缺陷1）
     d.exec('BEGIN');
     try {
       d.prepare('DELETE FROM docs WHERE path = ?').run(rel);
-      if (indexable && existsSync(path.join(instanceDir, rel))) {
+      if (existsSync(path.join(instanceDir, rel))) {
         const ins = d.prepare(INSERT);
         for (const r of rowsForFile(rel, zones)) ins.run(...r);
       }
@@ -194,8 +213,10 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
     generation++;
   }
 
-  // 查询：query（+可选 zone / trust）。过与现有 search 相同的 canRead ACL。返回 path/content_id/snippet/score(bm25)。
-  function query({ query: q, zone, trust = 'low', limit = MAX_RESULTS } = {}) {
+  // 查询：query（+可选 zone / trust / include）。过与现有 search 相同的 canRead ACL + tier-aware 分层过滤。
+  // include：附加返回的分层（'candidate' / 'rejected'，数组或逗号串），默认只返 canonical（spec §6.3）。
+  // 返回 path/content_id/zone/tier/snippet/score(bm25)。
+  function query({ query: q, zone, trust = 'low', include, limit = MAX_RESULTS } = {}) {
     if (!q?.trim()) return { results: [] };
     ensureBuilt();
     const d = connect();
@@ -204,41 +225,53 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
     if (zone && !zoneDef) {
       throw new Error(`没有叫 ${zone} 的分区，可用：${zones.map((z) => z.id).join('、')}`);
     }
+    // 分层过滤（§6.3）：canonical 恒含；candidate/rejected 需 include 显式开启。
+    const extraTiers = normalizeInclude(include);
+    const tiers = ['canonical', ...extraTiers];
+
     // 缺陷8：把「按 trust 可读的 zone 集合」预过滤进 SQL（zone IN (...)），令 ACL 在 LIMIT 之前生效——
     // 否则敏感命中多时，over 行全被敏感占满、JS 事后过滤把可读结果挤掉，低信任假落空。
-    // 索引里只有注册 zone 的行（缺陷1），故按 zone id 精确圈定即可。
     let allowedZones = zones.filter((z) => canReadZone(z, trust)).map((z) => z.id);
     if (zoneDef) allowedZones = allowedZones.filter((id) => id === zoneDef.id);
+    // 隔离-rejected 特例：只有 include 含 rejected、高信任、且未限定其它 zone 时，才放行 inbox 哨兵区——
+    // 与 tools.js「未注册 zone 收紧为仅 high 可读」两面一致；低信任/默认档一律看不到隔离件。
+    if (extraTiers.includes('rejected') && trust === 'high' && !zoneDef) allowedZones.push(INBOX_SENTINEL);
     if (allowedZones.length === 0) return { results: [] };
     const zoneIn = `zone IN (${allowedZones.map(() => '?').join(',')})`;
+    const tierIn = `tier IN (${tiers.map(() => '?').join(',')})`;
 
     const toks = cjkTokens(q);
     // bigram 索引里没有单字 CJK token → 从 MATCH 里剔除；若全是单字 CJK，整体降级子串扫描。
     const usable = toks.filter((t) => !(t.length === 1 && CJK_RE.test(t)));
-    const over = Math.max(limit * 4, limit); // 多取些，留给去重/截断（ACL 已在 SQL 里生效）
+    const over = Math.max(limit * 4, limit); // 多取些，留给去重/截断（ACL/tier 已在 SQL 里生效）
     let rows;
     if (usable.length === 0) {
       const singles = toks.filter(Boolean);
       if (!singles.length) return { results: [] };
       const where = singles.map(() => 'raw LIKE ?').join(' AND ');
-      rows = d.prepare(`SELECT path, content_id, zone, lineno, raw, 0 AS score FROM docs WHERE ${zoneIn} AND ${where} LIMIT ?`)
-        .all(...allowedZones, ...singles.map((s) => `%${s}%`), over);
+      rows = d.prepare(`SELECT path, content_id, zone, tier, lineno, raw, 0 AS score FROM docs WHERE ${zoneIn} AND ${tierIn} AND ${where} LIMIT ?`)
+        .all(...allowedZones, ...tiers, ...singles.map((s) => `%${s}%`), over);
     } else {
       const match = usable.map((t) => `"${t.replace(/"/g, '""')}"`).join(' '); // 引号护体 + 空格=AND
       try {
         rows = d.prepare(
-          `SELECT path, content_id, zone, lineno, raw, bm25(docs) AS score FROM docs WHERE docs MATCH ? AND ${zoneIn} ORDER BY score LIMIT ?`
-        ).all(match, ...allowedZones, over);
+          `SELECT path, content_id, zone, tier, lineno, raw, bm25(docs) AS score FROM docs WHERE docs MATCH ? AND ${zoneIn} AND ${tierIn} ORDER BY score LIMIT ?`
+        ).all(match, ...allowedZones, ...tiers, over);
       } catch { rows = []; } // 畸形 MATCH 不崩，返回空
     }
     const results = [];
     for (const r of rows) {
-      if (zoneDef && !r.path.startsWith(zoneDef.path)) continue;
-      if (!canRead(zones, r.path, trust)) continue; // 纵深防御：SQL 已圈定，这里双保险
+      if (r.zone === INBOX_SENTINEL) {
+        if (trust !== 'high') continue; // 纵深防御：隔离件仅高信任可见（SQL 已圈定，这里双保险）
+      } else {
+        if (zoneDef && !r.path.startsWith(zoneDef.path)) continue;
+        if (!canRead(zones, r.path, trust)) continue; // 纵深防御：SQL 已圈定，这里双保险
+      }
       results.push({
         path: r.path,
         content_id: r.content_id ?? null,
-        zone: r.zone ?? null,
+        zone: r.zone === INBOX_SENTINEL ? null : (r.zone ?? null),
+        tier: r.tier ?? 'canonical',
         line: r.lineno,
         snippet: r.raw.slice(0, MAX_SNIPPET),
         score: r.score,

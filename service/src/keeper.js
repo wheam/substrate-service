@@ -19,6 +19,7 @@ const SYSTEM_PROMPT = `你是一个个人知识库（Substrate 实例）的守�
 输出（只输出一个 JSON 对象，无其它文字）：
 {
   "disposition": "canonical|reference|local-only|forbidden",
+  "tier": "canonical|candidate",
   "zone": "<必须取材料 zones 列表里的 id>",
   "action": "new_page|merge_into|upsert_row|todo_add|remove_page|todo_done",
   "target": "<new_page: 新页 slug（英文小写连字符，可含子目录如 concepts/xxx）；merge_into: 既有页 slug；upsert_row: 收藏名；todo_add: owner>",
@@ -31,7 +32,13 @@ const SYSTEM_PROMPT = `你是一个个人知识库（Substrate 实例）的守�
   "reject_reason": "<forbidden 时的可读理由>"
 }
 
-merge_into 的 target **必须是材料里实际列出的页**（知识区索引或记忆区页列表）——没有合适的就 new_page 或压低 confidence，绝不虚构页名。
+分层（tier）——决定这条进库后是否默认可检索（永不真丢的前提下把库分层）：
+- **canonical**：高置信、事实性强、留存价值明确（稳定事实/偏好/决定/成型知识）——进主检索、默认可见。拿不准归哪儿但内容本身可信，仍可 canonical。
+- **candidate**：内容合法、值得留个底，但价值可疑/跑题/待验证/低置信可入库——存下来但默认检索不含它（低权重旁置，日后可晋升）。**当你本想压低 confidence 求稳、内容却明显无害可留时，优先 tier=candidate 落库而不是 held 麻烦主人。**
+- 缺省不填即按 canonical 处理（向后兼容）。**tier 只在 disposition 为 canonical/reference（会入库）时有意义；forbidden（拒收）无需给 tier——被 keeper 判 forbidden 的低价值合法件会自动落「隔离可查」层，不必你操心。**
+- **candidate 只对 new_page / merge_into 有效**（能把 tier 写进页 frontmatter）。upsert_row / todo_add / todo_done / remove_page 无 tier 落点，给 candidate 也会被归一为 canonical——这类内容要么值得存（canonical）、要么压低 confidence 交主人，别指望用 candidate 半留。
+
+merge_into 的 target **必须是材料里实际列出的页**（知识区索引或记忆区页列表）——没有合适的就 new_page 或压低 confidence，绝不虚构页名。合并进已有页时，tier 只会取「目标页现档」与「本次档」的较高者，绝不拉低已有页。
 
 路由常识：稳定的个人事实/偏好 → zone=memory 且 action=merge_into 对应分类页；要做的事 → todo/todo_add；结构化收藏条目（餐厅/书/工具）→ collections/upsert_row；有留存价值的知识/决定 → knowledge（先想想能否 merge_into 既有页，开新页要慎重）。
 
@@ -140,11 +147,18 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     return result;
   }
 
-  function rewriteEntry(entry, status, extra) {
+  function rewriteEntry(entry, status, extra, { tier } = {}) {
     const now = new Date().toISOString();
     let updated = entry.raw
       .replace(/^status: pending$/m, `status: ${status}`)
       .replace(/^updated: .*$/m, `updated: ${now.slice(0, 10)}`);
+    if (tier) {
+      // 隔离-rejected 件在 frontmatter 打旗标 tier: rejected（§6.2）——索引据此把它并入「仅 rejected」
+      // 检索特例（pending/held 无此标记 → 永不入索引）。多次覆盖取最后一次。
+      updated = /^tier: .*$/m.test(updated)
+        ? updated.replace(/^tier: .*$/m, `tier: ${tier}`)
+        : updated.replace(new RegExp(`^status: ${status}$`, 'm'), `tier: ${tier}\nstatus: ${status}`);
+    }
     if (status === 'held') {
       // held 时把时间戳落进 frontmatter 的机器可辨标记 keeper_held_at（resolveEntry 只信这里，正文伪造无效）；
       // 多次 held 覆盖该字段（取最后一次）。人话注记仍另行追加进正文供主人阅读。
@@ -265,14 +279,17 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
           const paths = [rel, appendCase(entry, decision, 'rejected（主人裁定）')];
           await commit({ paths, message: `keeper: rejected ${entry.id}（主人裁定）` });
         } else {
-          // keeper 主动拒收：件保留待主人复核
-          rewriteEntry(entry, 'rejected', v.reason);
-          await commit({ paths: [rel], message: `keeper: rejected ${entry.id}` });
+          // keeper 主动拒收：件不再丢——标 tier: rejected「隔离可查」（spec §3.1 / §6.2），留 inbox 待主人复核。
+          // 密钥红线件走 inbox.addEntry 真拒、从没到这里（§7），不受影响。
+          rewriteEntry(entry, 'rejected', v.reason, { tier: 'rejected' });
+          await commit({ paths: [rel], message: `keeper: rejected ${entry.id}（tier: rejected 隔离可查）` });
         }
       });
       emit(entry, 'rejected', rel, v.reason);
-      await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}${entry.owner_ruling ? '，按你的裁定已清场' : '，件保留在收件箱可复核'}）`);
-      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'rejected', disposition: 'rejected', ms: Date.now() - t0 });
+      // 隔离-rejected 件并进派生索引（默认检索仍排除它，include=rejected 可查）。主人裁定的拒收已清场、不入索引。
+      if (!entry.owner_ruling) refreshIndex('reject', [rel]);
+      await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}${entry.owner_ruling ? '，按你的裁定已清场' : '，件留在收件箱、隔离可查（默认检索不含）'}）`);
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'rejected', disposition: 'rejected', tier: 'rejected', ms: Date.now() - t0 });
       return 'rejected';
     }
 
@@ -299,7 +316,9 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       return 'held';
     }
     // 归档已落定 → 刷新派生索引（受影响页；删页则全量重建）。仅到此处代表 filed 成功。
-    refreshIndex(decision.action, changedPaths);
+    // 一并带上被移除的收件 rel：清掉它可能残留的「隔离-rejected」索引行（如先前被拒、经主人裁定又 filed 别处）；
+    // 普通件从没被索引过 → updatePage 只做一次无害 DELETE。
+    refreshIndex(decision.action, [...changedPaths, rel]);
 
     const doctorErrors = await runDoctor();
     const doctorNote = doctorErrors ? `\n⚠️ doctor 报 ${doctorErrors} 个 error，请抽空看看` : '';
@@ -308,8 +327,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     if (notifyLevel !== 'quiet' || doctorErrors) {
       await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${model}）${doctorNote}`);
     }
-    // filed 目前无 tier 细分 → disposition=accepted（字段留位，未来低置信入库可记 candidate）
-    audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'filed', disposition: 'accepted', detail, model, usage, ms: Date.now() - t0 });
+    // filed 的分层去向：canonical → disposition=accepted（进主库）；candidate → disposition=candidate
+    // （入库但默认检索不含）。两者都算「已进库」（metrics IN_LIBRARY），verdict 旧字段仍 filed（向后兼容）。
+    const filedDisposition = decision.tier === 'candidate' ? 'candidate' : 'accepted';
+    audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'filed', disposition: filedDisposition, tier: decision.tier ?? 'canonical', detail, model, usage, ms: Date.now() - t0 });
     return 'filed';
   }
 

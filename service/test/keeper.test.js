@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
+import { readTier } from '../src/tier.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -257,6 +258,125 @@ test('埋点：rejected 的审计条目记 disposition=rejected', async () => {
   await keeper.processPending();
   const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
   assert.equal(rec.disposition, 'rejected');
+});
+
+// ==== M4.2 分层：写路径 ====
+
+test('tier=candidate 落盘：新页 frontmatter 写 tier: candidate；审计 disposition=candidate（仍算已进库）', async () => {
+  const { work, inbox, keeper, auditLog } = setup({
+    providerScript: [{
+      disposition: 'canonical', tier: 'candidate', zone: 'knowledge', action: 'new_page',
+      target: 'maybe-note', title: '存疑一条', summary: '价值待验证', confidence: 0.9,
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '也许有用的一段随笔。', client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.filed, 1, 'candidate 仍是 filed（入库、不丢）');
+  const raw = readFileSync(path.join(work, 'knowledge', 'maybe-note.md'), 'utf8');
+  assert.equal(readTier(raw), 'candidate', '新页应带 tier: candidate');
+  const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
+  assert.equal(rec.verdict, 'filed', 'verdict 旧字段不变');
+  assert.equal(rec.disposition, 'candidate', 'candidate 去向 → disposition=candidate（metrics 视为进库）');
+  assert.equal(rec.tier, 'candidate');
+});
+
+test('缺陷3：upsert_row + tier=candidate 无 tier 落点 → 归一 canonical（落盘可见 + 审计 disposition=accepted/tier=canonical）', async () => {
+  const { work, inbox, keeper, auditLog } = setup({
+    providerScript: [{
+      disposition: 'canonical', tier: 'candidate', zone: 'collections', action: 'upsert_row',
+      target: 'restaurants', fields: { id: 'cand-place', name: '候选餐厅', city: '样例城' },
+      summary: '收录 候选餐厅', confidence: 0.9,
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'collection', payload: { name: 'restaurants', row: { name: '候选餐厅', city: '样例城' } }, client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.filed, 1);
+  // CSV 无 tier 粒度 → 行照常落盘、默认可见
+  assert.match(readFileSync(path.join(work, 'collections', 'restaurants', 'data.csv'), 'utf8'), /cand-place,候选餐厅,样例城/);
+  const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
+  assert.equal(rec.disposition, 'accepted', 'upsert_row 无 tier 落点 → 审计不谎报 candidate');
+  assert.equal(rec.tier, 'canonical', '审计记录的是实际落盘的 tier=canonical（审计不说谎）');
+});
+
+test('tier 缺省即 canonical：模型不给 tier，新页写 tier: canonical（向后兼容）', async () => {
+  const { work, inbox, keeper, auditLog } = setup({
+    providerScript: [{
+      disposition: 'canonical', zone: 'knowledge', action: 'new_page',
+      target: 'plain-fact', title: '普通事实', summary: '一条事实', confidence: 0.95,
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '一条确定的事实。', client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  assert.equal(readTier(readFileSync(path.join(work, 'knowledge', 'plain-fact.md'), 'utf8')), 'canonical');
+  const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
+  assert.equal(rec.disposition, 'accepted', '缺省 canonical → 旧口径 accepted 不变');
+});
+
+test('merge 不降级：candidate 合并进无 tier 的存量页 → 页仍 canonical（不被拉低、不凭空加行）', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [{
+      disposition: 'canonical', tier: 'candidate', zone: 'knowledge', action: 'merge_into',
+      target: 'coffee-brewing', summary: '补充一句', confidence: 0.9,
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '手冲补充：注水要匀。', client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  const raw = readFileSync(path.join(work, 'knowledge', 'coffee-brewing.md'), 'utf8');
+  assert.equal(readTier(raw), 'canonical', '已 canonical（无 tier 视同）的页不因一次 candidate 合并被拉低');
+  assert.ok(!/tier: candidate/.test(raw), '不该写入 candidate');
+  assert.match(raw, /注水要匀/, '内容照常并入');
+});
+
+test('merge 可晋升：canonical 合并进 candidate 页 → 页升为 canonical', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [
+      { disposition: 'canonical', tier: 'candidate', zone: 'knowledge', action: 'new_page', target: 'seedling', title: '幼苗页', summary: '存疑', confidence: 0.9 },
+      { disposition: 'canonical', tier: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'seedling', summary: '补权威内容', confidence: 0.95 },
+    ],
+  });
+  const a = inbox.addEntry({ kind: 'save', content: '一条待验证的说法。', client: 'cc-test' });
+  await a.synced;
+  await keeper.processPending();
+  assert.equal(readTier(readFileSync(path.join(work, 'knowledge', 'seedling.md'), 'utf8')), 'candidate');
+  const b = inbox.addEntry({ kind: 'save', content: '权威来源已证实这一点。', client: 'cc-test' });
+  await b.synced;
+  await keeper.processPending();
+  assert.equal(readTier(readFileSync(path.join(work, 'knowledge', 'seedling.md'), 'utf8')), 'canonical', 'canonical 并入 → 晋升');
+});
+
+test('非法 tier（如被注入产出 tier: admin）→ 决定校验不过 → held，不落盘', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [
+      { disposition: 'canonical', tier: 'admin', zone: 'knowledge', action: 'new_page', target: 'x', title: 'x', summary: 'x', confidence: 0.99 },
+      { disposition: 'canonical', tier: 'admin', zone: 'knowledge', action: 'new_page', target: 'x', title: 'x', summary: 'x', confidence: 0.99 },
+    ],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '正常内容夹带 tier 越权', client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.held, 1, '非法 tier → held');
+  assert.ok(!existsSync(path.join(work, 'knowledge', 'x.md')), '不落盘');
+});
+
+test('lossless：keeper 主动拒收的低价值合法件不丢——留 inbox + status/tier: rejected（可复核可查）', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [{
+      disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x',
+      confidence: 0.9, reject_reason: '一次性闲聊，无留存价值',
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '哈哈今天真无聊。', client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.rejected, 1);
+  assert.ok(existsSync(path.join(work, receipt.path)), '拒收件不物理删除（lossless）');
+  const raw = readFileSync(path.join(work, receipt.path), 'utf8');
+  assert.match(raw, /status: rejected/);
+  assert.equal(readTier(raw), 'rejected', 'frontmatter 打旗标 tier: rejected（隔离可查）');
 });
 
 test('主判异常 → 自动升级档重试成功 → filed 不打扰主人', async () => {

@@ -40,15 +40,24 @@ test('search：低信任看不到 sensitive 区内容', async () => {
   assert.equal(results.length, 0);
 });
 
-test('缺陷1附带：低信任 search 不得命中未注册 zone（inbox 隔离件）；高信任仍可见', async () => {
+test('缺陷1：search 只扫注册 zone——inbox pending 件任何信任任何档都命不中；governance 从 search 消失', async () => {
   const inboxDir = path.join(instanceDir, 'inbox');
   mkdirSync(inboxDir, { recursive: true });
   writeFileSync(path.join(inboxDir, '_2026-07-05-q.md'),
     '---\nstatus: pending\n---\n\n隔离件 searchquarantine 龙虾待判。\n');
-  const low = await tools.search({ query: 'searchquarantine', trust: 'low' });
-  assert.equal(low.results.length, 0, '低信任不得 search 到 inbox 隔离件（未注册 zone 收紧为仅 high 可读）');
-  const high = await tools.search({ query: 'searchquarantine', trust: 'high' });
-  assert.ok(high.results.some((r) => r.path.startsWith('inbox/')), '高信任仍可见');
+  // pending 待判件：任何 trust、任何 include 都不得命中（不变式：pending/held 任何档任何组合绝不可查）。
+  // 关键回归：high + 默认档也不得见（旧行为「未注册 zone 仅 high 放行」正是缺陷 1 的根）。
+  for (const trust of ['low', 'high']) {
+    for (const include of [undefined, 'rejected', 'candidate,rejected']) {
+      const { results } = await tools.search({ query: 'searchquarantine', trust, include });
+      assert.ok(!results.some((r) => r.path.startsWith('inbox/')),
+        `pending 隔离件不得被 search 命中（trust=${trust} include=${include}）`);
+    }
+  }
+  // governance 未注册区（zones.md）：连高信任默认档也从 search 消失（只扫注册 zone）。
+  const gov = await tools.search({ query: '分区注册表', trust: 'high' });
+  assert.ok(!gov.results.some((r) => r.path.startsWith('governance/')),
+    'governance 从 search 消失（readPage/getContext 是另一条通路、各自把关，不受影响）');
 });
 
 test('read_page：读页全文', async () => {
@@ -104,4 +113,33 @@ test('collections_search：空 query 返回全部行；未知收藏名报可读�
   const { rows } = await tools.collectionsSearch({ name: 'restaurants', query: '' });
   assert.equal(rows.length, 2);
   await assert.rejects(() => tools.collectionsSearch({ name: 'nope', query: 'x' }), /restaurants/);
+});
+
+test('M4.2 search 分层：默认只返 canonical；include=candidate 现候选页；rejected 隔离件仅高信任+include 可见', async () => {
+  const kDir = path.join(instanceDir, 'knowledge');
+  writeFileSync(path.join(kDir, 'tier-cand.md'),
+    '---\ntier: candidate\ntitle: 候选\ntype: knowledge\n---\n\n分层词 stierprobe 出现在候选页。\n');
+  writeFileSync(path.join(kDir, 'tier-canon.md'),
+    '---\ntier: canonical\ntitle: 正典\ntype: knowledge\n---\n\n分层词 stierprobe 出现在正典页。\n');
+  const inboxDir = path.join(instanceDir, 'inbox');
+  mkdirSync(inboxDir, { recursive: true });
+  writeFileSync(path.join(inboxDir, '_2026-07-05-rej.md'),
+    '---\nid: rj\ntype: inbox\ntier: rejected\nstatus: rejected\n---\n\n分层词 stierprobe 出现在隔离件。\n');
+
+  const P = (r) => r.results.map((x) => x.path);
+  // 默认（high）：只见 canonical 页；不见 candidate、不见 rejected 隔离件
+  const def = await tools.search({ query: 'stierprobe', trust: 'high' });
+  assert.ok(P(def).includes('knowledge/tier-canon.md'));
+  assert.ok(!P(def).includes('knowledge/tier-cand.md'), '默认不含 candidate');
+  assert.ok(!P(def).some((p) => p.startsWith('inbox/')), '默认不含 rejected 隔离件');
+  assert.ok(def.results.every((r) => r.tier === 'canonical'), '结果带 tier 字段');
+  // include=candidate：候选页现
+  const incC = await tools.search({ query: 'stierprobe', trust: 'high', include: 'candidate' });
+  assert.ok(P(incC).includes('knowledge/tier-cand.md'), 'include=candidate 现候选页');
+  // include=rejected 高信任：隔离件现
+  const incR = await tools.search({ query: 'stierprobe', trust: 'high', include: 'rejected' });
+  assert.ok(P(incR).some((p) => p.startsWith('inbox/')), 'include=rejected 高信任可见隔离件');
+  // 低信任 include=rejected：隔离件不可见（未注册 zone 仅 high）
+  const lowR = await tools.search({ query: 'stierprobe', trust: 'low', include: 'rejected' });
+  assert.ok(!P(lowR).some((p) => p.startsWith('inbox/')), '低信任仍不得见隔离件');
 });

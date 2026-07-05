@@ -22,8 +22,9 @@ export function parseZones(instanceDir) {
   return zones;
 }
 
-function stripScalar(v) {
-  return v.replace(/^["']|["']$/g, '').trim();
+// YAML 标量归一：剥一层首尾引号 + trim。导出供 tier.js 复用（缺陷4：tier 写法变体去引号——单一实现，杜绝分叉）。
+export function stripScalar(v) {
+  return String(v).replace(/^["']|["']$/g, '').trim();
 }
 
 export function zoneFor(zones, relPath) {

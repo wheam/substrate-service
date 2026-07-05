@@ -4,9 +4,13 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { newContentId } from './content-id.js';
+import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
 const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page', 'todo_done']);
+// 缺陷3：只有落成页文件的 action（new_page/merge_into）能把 tier 写进 frontmatter 持久化。
+// upsert_row（.csv 行）/todo_add（清单行）/todo_done/remove_page 无 tier 粒度落点 → 见下方归一。
+const TIER_BEARING_ACTIONS = new Set(['new_page', 'merge_into']);
 // 骨架/流水区永久禁删（keeper 对 inbox 的清理走内部通路，不经 remove_page）
 const NO_DELETE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
 
@@ -33,6 +37,15 @@ export function validateDecision({ instanceDir, decision, entry }) {
   if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无意义（无本地），需主人定夺' };
   if (!ACTIONS.has(d.action)) return { ok: false, reason: `action 不合法：${d.action}` };
   if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: '缺 confidence 或 summary' };
+  // 分层白名单（spec §6.1）：模型只能产出 canonical|candidate；缺省视为 canonical（向后兼容）。
+  // 非法值（如被注入产出 tier: rejected / admin）→ 拒（落 held），rejected 只能由 keeper 判 forbidden 后代码落。
+  if (d.tier !== undefined && d.tier !== null && !DECISION_TIERS.has(d.tier)) {
+    return { ok: false, reason: `tier 不合法：${d.tier}（只接受 canonical|candidate，缺省视为 canonical）` };
+  }
+  // 缺陷3：对无法持久化 tier 的 action，把 candidate 归一为 canonical（CSV/todo 行本就默认可见）——
+  // 就地改写 decision.tier，使 keeper 审计记录的 tier/disposition = 实际落盘的 tier（审计不说谎）。
+  // 不搞行级 tier（过度设计）。candidate 只对 new_page/merge_into 有意义。
+  if (d.tier === 'candidate' && !TIER_BEARING_ACTIONS.has(d.action)) d.tier = 'canonical';
 
   const zones = parseZones(instanceDir);
   const zone = zones.find((z) => z.id === d.zone);
@@ -161,6 +174,7 @@ async function newPage(instanceDir, entry, decision, zone) {
   const fm = [
     '---',
     `content_id: ${newContentId()}`, // 稳定短 id：落盘即写，扛改名（spec §6.1）
+    `tier: ${normTier(decision.tier)}`, // 分层：高置信 canonical / 价值可疑 candidate（缺省 canonical）
     `title: ${(decision.title ?? slug).replace(/\n/g, ' ')}`,
     `created: ${today()}`,
     `updated: ${today()}`,
@@ -188,7 +202,14 @@ function mergeInto(instanceDir, entry, decision, zone) {
   const abs = path.join(instanceDir, rel);
   if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`目标页不存在：${rel}`);
   let text = readFileSync(abs, 'utf8');
+  // 分层不降级（spec §6.1）：目标页现档（无 tier 视同 canonical）与本次决定档取较高者——
+  // 已 canonical 的页不因一次 candidate 合并被拉低；反向可晋升（canonical 内容并入 candidate 页 → 升 canonical）。
+  const curTier = readTier(text);
+  const decTier = normTier(decision.tier);
+  const effTier = TIER_RANK[decTier] > TIER_RANK[curTier] ? decTier : curTier;
   text = text.replace(/^updated: .*$/m, `updated: ${today()}`);
+  // 仅当档位非 canonical、或页上本就有显式 tier 行时才写——不给无 tier 的存量 canonical 页凭空加行（零回填即兼容）。
+  if (effTier !== 'canonical' || hasExplicitTier(text)) text = setTierLine(text, effTier);
   text += `\n\n---\n\n**${today()} keeper 归档**（inbox ${entry.id}，来自 ${entry.client}）：\n\n${entry.body.trim()}\n`;
   writeFileSync(abs, text);
   return { changedPaths: [rel], detail: rel };

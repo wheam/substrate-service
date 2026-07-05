@@ -19,7 +19,7 @@ const CREDENTIAL_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,  // PEM 私钥
 ];
 
-export function createInbox({ instanceDir, writer }) {
+export function createInbox({ instanceDir, writer, indexStore = null }) {
   function addEntry({ kind, content = '', hint, client, payload }) {
     if (!KINDS.has(kind)) throw new Error(`未知的 kind：${kind}`);
     const scanTarget = `${content}\n${payload ? JSON.stringify(payload) : ''}\n${hint ?? ''}`;
@@ -116,6 +116,9 @@ export function createInbox({ instanceDir, writer }) {
     raw = raw
       .replace(/^status: .*$/m, 'status: pending')
       .replace(/^updated: .*$/m, `updated: ${new Date().toISOString().slice(0, 10)}`)
+      // 缺陷2b：复位已拒件时清掉 keeper 打的 tier: rejected 旗标——否则件虽复位 pending，frontmatter 仍带
+      // rejected 残留，索引旧行继续可查。清行 + 下方 refreshIndex 一并抹掉派生索引里的隔离-rejected 残留。
+      .replace(/^tier: .*\n/m, '')
       .replace(/^owner_ruling: .*\n/m, '')
       .replace(/^ruling_via: .*\n/m, '')
       .replace(/^ruling_via_trust: .*\n/m, '');
@@ -129,6 +132,13 @@ export function createInbox({ instanceDir, writer }) {
       raw += `\n<!--owner-decision\n${JSON.stringify(approvedDecision)}\n-->\n`;
     }
     writeFileSync(abs, raw);
+    // 缺陷2b：复位后刷新派生索引——件现为 status:pending（不再满足隔离-rejected 双条件），updatePage 会
+    // DELETE 掉它此前作为 rejected 入的旧行、不再重插。索引在 git 之外、可随时重建，故刷新失败绝不影响复位
+    // 落盘，只记日志（与 keeper.refreshIndex 同规矩：索引故障不阻断写路径）。
+    if (indexStore) {
+      try { indexStore.updatePage(hit.path); }
+      catch (e) { console.error(`复位后索引刷新失败（不影响复位）：${e.message}`); }
+    }
     const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling), held_at: heldAt, resolved_at: resolvedAt, held_ms: heldMs };
     receipt.synced = writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` });
     return receipt;
