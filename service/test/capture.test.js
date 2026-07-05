@@ -100,6 +100,20 @@ test('POST /capture/resolve：App 可裁定任意收件，落 owner_ruling + 通
   assert.equal((await post('/capture/resolve', null, { id: posted.id, ruling: 'x' })).status, 401);
 });
 
+test('POST /capture/resolve：点选候选（option 参数）→ 预批决定落盘', async () => {
+  const posted = await (await post('/capture', 'cap-token', { text: '点选裁定的一条' })).json();
+  const fs = await import('node:fs');
+  const abs = path.join(work, posted.path);
+  fs.writeFileSync(abs, fs.readFileSync(abs, 'utf8') + `\n<!--keeper-options\n${JSON.stringify({ options: [
+    { label: '进待办', decision: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: 's', confidence: 0.9 } },
+  ] })}\n-->\n`);
+  const res = await post('/capture/resolve', 'cap-token', { id: posted.id, option: 0 });
+  assert.equal(res.status, 200, `应 200，实际 ${res.status}: ${JSON.stringify(await res.json().catch(() => ''))}`);
+  const after = fs.readFileSync(abs, 'utf8');
+  assert.match(after, /owner_ruling: 进待办/);
+  assert.match(after, /<!--owner-decision/);
+});
+
 test('eventStore：重启后从文件恢复', async () => {
   const file = path.join(mkdtempSync(path.join(tmpdir(), 'substrate-ev-')), 'ev.jsonl');
   const s1 = createEventStore({ file });

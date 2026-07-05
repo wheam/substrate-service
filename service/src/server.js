@@ -119,9 +119,9 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.post('/capture/resolve', (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
-    const { id, ruling } = req.body ?? {};
+    const { id, ruling, option } = req.body ?? {};
     try {
-      const r = inbox.resolveEntry({ id, ruling, via: identity.client, viaTrust: identity.trust });
+      const r = inbox.resolveEntry({ id, ruling, option, via: identity.client, viaTrust: identity.trust });
       audit({ client: identity.client, tool: 'capture_resolve', args: { id, ruling }, ok: true });
       return res.json({ ok: true, id: r.id, status: r.status });
     } catch (e) {
