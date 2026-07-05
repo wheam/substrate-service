@@ -13,7 +13,8 @@
 //       每处理一次一条；同一 entry 可出现多次（先 held、后被裁定再 accepted），以最后一条为「最终去向」。
 //   - 被裁定耗时（held→resolve）：裁定事件带 { event:"ruling", held_ms:<毫秒>, resolved_at, ts }
 //       held_ms = 从件被 keeper held 到主人裁定的时长；件此前没被 held 过则不带该字段（跳过）。
-//   - 检索命中： { tool:"search", hit:<bool>, result_count:<n>, query?:<原文截断>, ts }
+//   - 检索命中： { tool:"search"|"recall", hit:<bool>, result_count:<n>, query?:<原文截断>, ts }
+//       search=关键词检索；recall=带引用问答（result_count=候选页数，hit=是否检到候选）。两者合并计入落空率同一口径。
 //
 // 输出两条曲线（按天或按周分桶）：
 //   曲线 1：held 半衰期（各桶内 held→裁定的中位时长）+ 捕获放弃率
@@ -204,7 +205,8 @@ function computeCurve1(events, by, offsetMin = 0) {
 function computeCurve2(events, by, offsetMin = 0) {
   const buckets = new Map(); // key → { searches, misses }
   for (const e of events) {
-    if (e.tool !== 'search') continue;
+    // search（关键词）与 recall（带引用问答）合并同一落空率口径（spec §6.3：两者都记 result_count/hit）
+    if (e.tool !== 'search' && e.tool !== 'recall') continue;
     // 命中口径：优先 hit 字段，缺失则退回 result_count
     let hit;
     if (typeof e.hit === 'boolean') hit = e.hit;

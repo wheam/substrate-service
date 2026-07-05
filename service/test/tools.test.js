@@ -40,6 +40,17 @@ test('search：低信任看不到 sensitive 区内容', async () => {
   assert.equal(results.length, 0);
 });
 
+test('缺陷1附带：低信任 search 不得命中未注册 zone（inbox 隔离件）；高信任仍可见', async () => {
+  const inboxDir = path.join(instanceDir, 'inbox');
+  mkdirSync(inboxDir, { recursive: true });
+  writeFileSync(path.join(inboxDir, '_2026-07-05-q.md'),
+    '---\nstatus: pending\n---\n\n隔离件 searchquarantine 龙虾待判。\n');
+  const low = await tools.search({ query: 'searchquarantine', trust: 'low' });
+  assert.equal(low.results.length, 0, '低信任不得 search 到 inbox 隔离件（未注册 zone 收紧为仅 high 可读）');
+  const high = await tools.search({ query: 'searchquarantine', trust: 'high' });
+  assert.ok(high.results.some((r) => r.path.startsWith('inbox/')), '高信任仍可见');
+});
+
 test('read_page：读页全文', async () => {
   const { content } = await tools.readPage({ path: 'todo/owner.md', trust: 'high' });
   assert.match(content, /柠檬树/);
