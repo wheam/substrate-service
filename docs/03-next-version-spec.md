@@ -164,7 +164,7 @@
 - **M4.1 读侧智能**：`recall`/`think` 工具 + SQLite FTS5(+可选 vec) 可抛索引 + `content_id` / 重建契约。**验收**：语义化提问召回明显优于 grep；删索引能秒重建；索引无独有正典。（是否开语义由 M4.0 落空率数据定。）
 - **M4.2 lossless + 分层**：`tier` 字段贯穿写入 / 检索；`rejected` 隔离可查；检索默认只看 `canonical`。**验收**：低价值件不丢仍可查、默认检索不含它；密钥仍真拒。
 - **M4.3 主频道 agent + 装 prompt**：`channel: primary` 标记 + 房规 + INSTALL_FOR_AGENTS 式安装协议。**验收**：一个新用户一段 prompt 起库；held 件在主频道被主动浮出并可对话裁定。
-- **M4.4 溯源 / 置信 frontmatter + schema 演化提议 + 审批式夜班**。**验收**：新 zone 能被提议 → 一句话批 → 落地且 doctor 0 error；夜班提案走 inbox。
+- **M4.4 溯源 / 置信 frontmatter + schema 演化提议 + 审批式夜班**。**验收**：新 zone 能被提议 → 一句话批 → 落地且 doctor 0 error；夜班提案走 inbox。✅ **已完成**（编排验证：244 测试绿 + 考卷 25/25 + 端到端烟雾 18/18 + Codex xhigh 四轮对抗 review 收敛至 merge-ready；决策见 §9）。
 - **M4.5 抗注入 + 开源打包**：对抗样本进考卷、Railway button、本地单机入口、干净 README / 安装文档、模式 spec 对外版。
 
 ## 9. 决策记录与开放问题
@@ -176,6 +176,9 @@
 - **命名**：模式对外名暂定 **Governed Agent Memory / 受治理的 agent 记忆**（临时，不纠结）；**项目名保持 `substrate` 不改**。
 - **主频道「主动浮出」= 拉为主（M4.3 裁定）**：**不做 server push**——无状态 HTTP transport 没有 server→client 推送通道，改有状态 SSE 是架构手术、不值；且主频道 agent 只在主人对话时在场，push 没有常驻接收端。改**拉**，三条承接：① primary 客户端每次工具成功响应**尾部 piggyback** 一行「📥 待主人裁定 N 件」提示——浮出恰好发生在主人已在的那个对话里，零轮询成本；防重复 = held id 集合为 key，`NUDGE_TTL_MS`（默认 4h）窗口内只发一次，`inbox_list`/`inbox_resolve` 豁免（正在处置面里不再自扰）。② **不消费 MCP instructions 的宿主**（如 Hermes）用 primary token 定期拉 `/digest` 承接——digest 的 primary 版已含主频道房规 + 实时 held 摘要，等效于把「连接即下发」补成「拉取即保鲜」。③ 飞书 webhook 降为**哑兜底**通知。**安全红线**：piggyback 与 digest 的 held 摘要都**只带 id/kind/计数**，待裁件正文（= 对抗输入）绝不进提示面 / instructions / digest（与 M4.0 考卷同款威胁模型）。
 
-**仍开放**
-- 语义索引默认开的阈值：落空率到多少才值得引入 embedding 依赖？（M4.1 用 M4.0 的数据回答）
-- `epistemic_type` 由 keeper 判时产出，还是夜班回填历史页？（M4.4 定）
+- **M4.4 三项设计裁定（2026-07-05 编排落地）**：
+  - **D1 溯源/置信/epistemic_type（§3.3/§6.1）= keeper 判时产出，不回填历史页**（本条即上面「仍开放」里 epistemic_type 那问的答案）。白名单 `fact|preference|decision|opinion|excerpt|to-verify`，缺省/非法一律归 null **绝不因此拒件**（描述性元数据、容错优先，旧金标/假 provider 无此字段仍过考卷）。落点：`new_page` 写页级 `source_agent`/`confidence`/`epistemic_type`；`merge_into` 只在归档注记行携带、不动页级（一页可混多种认知类型）。归一化就地改写进 decision（审计=落盘事实）。历史页由日后夜班自然覆盖，不做一次性回填。
+  - **D2 schema 演化 = 提案件即 inbox 件 + 点选预批**（§3.4/§6.3）：新 kind `schema`/`maintenance` 创建即 `status:held`（keeper 对其零 LLM）。批准全复用现有**点选候选**通路（`<!--keeper-options-->` → `inbox_resolve` 传 `option` → `<!--owner-decision-->` 预批 → keeper 直执行）；**纯文字裁定永不触发执行或清场 → re-held**（防误伤）。`schema_apply` 双入口一实现（MCP 工具 + keeper 点选都走 executor 同一函数）；**schema 内容只认提案件正文的 ```json 块**，decision 只能「指向」件（`target === payload.id`）——LLM/裁定无法携带 schema 正文（白名单原则）。apply = 确定性三步（`governance/zones.md` yaml 追加 + zone 目录/.gitkeep + README stub）→ `doctor` → **errors>0 显式回滚**（不 commit）。骨架区（governance/skills/inbox/keeper-feedback）禁作 zone path；purpose 落 zones.md 前剥反引号+换行+长度上限（防截断 yaml 围栏破 ACL）。
+  - **D3 审批式夜班 v0 = 纯确定性零 LLM**（§3.5）：跑在 keeper tick 里（`NIGHTLY_INTERVAL_MS` 默认 7d、0=禁用；状态文件在实例 git 外）。检出**近似去重**（标题词集 / 正文 bigram Jaccard ≥0.6）与**薄页**（<200 字符）→ 出 `merge_pages` 预批提案；**断链**只报告不自动改。每轮 ≤5 件、同 target 未决不重复提、**sensitive zone 整体不扫**（否则敏感页路径经 `/capture/status` 泄给 capture 档）。**明确不做**（v0 守焦点）：孤儿检测、矛盾旗标、keeper 聚簇自动提 zone。新增 executor action `merge_pages`（源页正文并入目标 + `curate rm` 清反链，`rulingMarked` 硬校验同 remove_page，失败整树 `git checkout` 回滚且排除 inbox/）。
+- **M4.4 抗注入加固（Codex xhigh 四轮对抗 review 的收敛结论，2026-07-05）**：本批把「**inbox 文件活在 git 里、`git pull` 进来的文件 = 对抗输入**」这条威胁模型贯彻到治理/删除路径。核心机制 = **进程内批准登记表**：keeper 只认经 `resolveEntry` 真记过账的批准（token = `sha256(id+ruling+decision+rel+kind+parseEntryBody(content))`），**文件里裸的 `owner_ruling`/`owner-decision`/`ruling_via_trust` 一律不信**——伪造件（含 capture 正文注入的 owner-decision 块、approve-then-swap 改 payload/body/kind）token 失配即 re-held；认证票一次性（任何触达执行的尝试即销账，防 stale 复燃）。维护提案点选执行**绑定可见 json op 块**（隐藏 options 决定不得与可见提案不符）。残余同主题 exploit 均需**私库 git 推送权限**（该 principal 本可直接改库），记为个人 alpha 已知限制、不再深挖。
+- 语义索引默认开的阈值：落空率到多少才值得引入 embedding 依赖？（M4.1 用 M4.0 的数据回答，仍开放）

@@ -6,7 +6,8 @@ import crypto from 'node:crypto';
 
 // 导出供读路径复验：实例仓库经 git pull 同步，inbox 件可以不经 addEntry、被手工伪造后拉进来——
 // 「kind 合法、id 是服务端生成的」只在写路径成立，任何要把 id/kind 拼进响应面的读方必须自己再验。
-export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture']);
+// schema/maintenance = M4.4 提案件（D2）：创建即 held、直达主人，keeper 不 LLM 判它们（走点选预批通路）。
+export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture', 'schema', 'maintenance']);
 // 服务端生成 id 的形状（见 addEntry：Date.now 的 base36 + '-' + 2 字节 hex）。
 // 首段长度上限放到 12：只为防伪造件灌长文本，不过拟合当前时间戳位数（base36 毫秒到 2059 年也才 9 位）。
 export const ID_FORMAT = /^[a-z0-9]{1,12}-[a-f0-9]{4}$/;
@@ -24,8 +25,36 @@ const CREDENTIAL_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,  // PEM 私钥
 ];
 
-export function createInbox({ instanceDir, writer, indexStore = null }) {
-  function addEntry({ kind, content = '', hint, client, payload }) {
+// F1（Critical）进程内批准登记表：resolveEntry 是【唯一】合法批准入口（MCP inbox_resolve / App
+// /capture/resolve 都经它、都在本进程）。它敲定 ruling+approvedDecision 后向 approvals Map 记一笔
+// id→{token, viaTrust}；keeper 只在登记表命中且 token 匹配时才认「主人批准」，绝不信文件里裸的
+// owner_ruling / owner-decision 块（git pull 可伪造任何 frontmatter/正文）。createApp 建这一个 Map、
+// 经 app.locals.approvals 同时给 inbox 与 keeper。缺省 new Map()：单独构造的 inbox（无共享 Map）
+// 记的账无人核验 = 安全失败（相关件重判/re-held），不会误放行。
+// token 覆盖 id+ruling+decision + rel + 被批文件正文（G1）；viaTrust（capture/high…）另存 Map value——
+// 通道限权（capture 无权删页）是认证相关决定，同样只认 registry，不认文件里的 ruling_via_trust（伪造件可随意改写它）。
+// G1（Critical）approve-then-swap：旧 token 只绑 id+ruling+decision，keeper/executor 之后又【重读可变文件】
+// 拿 payload（schema applySchema）/body（new_page/merge_into）——批准落定后经 git pull 换掉正文/payload
+// （owner_ruling/owner-decision 块不动 → 旧 token 仍验过）即被按篡改内容执行。故把「被批对象」也绑进哈希：
+// rel 定位文件、content=parseEntryBody(当前raw).content（已剥掉易变的 keeper 注记/options/owner-decision 块、
+// 却含 schema 的 ```json payload 块，稳定可复算）。resolveEntry 按最终落盘文件记账；keeper honor 前对当前
+// 文件复算同款——不匹配即不认证 → approved_decision 作废 → re-held（fail-safe）。
+// H1（Critical）：kind 在 frontmatter、被 parseEntryBody 剥掉、原不进 token，却是可执行字段——keeper 的
+// maintenance 守卫只在 kind==='maintenance' 触发、remove_page 放行独立于 kind。批准一个 maintenance 提案后
+// 仅把 kind: maintenance→save（token 不含 kind 仍验过）即绕过维护守卫删要害页。故 kind 也绑进哈希（rel 与
+// content 之间）——kind 是 resolveEntry 从不改写的稳定字段，绑它安全；swap kind → 哈希失配 → 不认证 → re-held。
+export function approvalToken({ id, ruling, decision, rel = '', kind = '', content = '' }) {
+  const norm = `${id}\n${oneline(ruling)}\n${decision ? JSON.stringify(decision) : ''}\n${rel}\n${kind}\n${content}`;
+  return crypto.createHash('sha256').update(norm).digest('hex');
+}
+
+export function createInbox({ instanceDir, writer, indexStore = null, approvals = new Map() }) {
+  // status/optionsBlock（M4.4 D2）：提案件创建即 status:'held'（直达主人，不经 keeper LLM）并带确定性候选块，
+  // 走与 keeper held 同一条点选预批通路（resolveEntry({option}) → owner-decision → keeper 直执行）。缺省保持旧行为。
+  // queuedWrite（G4）：把「写入」也放进 writer.transact，与 commit 在同一队列串行点成对发生。夜班（nightly）
+  // 提案走这条——否则 writeFileSync 在队列外先落盘，并发 keeper 的 paths:['.'] 提交可能把半写的提案文件卷进
+  // 无关 commit（git 历史不整洁）。缺省 false：save/capture/resolve 等其余写路径行为不变。
+  function addEntry({ kind, content = '', hint, client, payload, status = 'pending', optionsBlock = null, queuedWrite = false }) {
     if (!KINDS.has(kind)) throw new Error(`未知的 kind：${kind}`);
     const scanTarget = `${content}\n${payload ? JSON.stringify(payload) : ''}\n${hint ?? ''}`;
     for (const pattern of CREDENTIAL_PATTERNS) {
@@ -52,20 +81,36 @@ export function createInbox({ instanceDir, writer, indexStore = null }) {
       `kind: ${kind}`,
       ...(hint ? [`hint: ${oneline(hint)}`] : []),
       ...(payload?.name ? [`collection: ${oneline(payload.name)}`] : []),
-      'status: pending',
+      // status:'held' 的提案件同时落 keeper_held_at 机器标记：resolveEntry 只信 frontmatter 这个键算 held→裁定
+      // 耗时（held_ms 曲线），令提案件的这条曲线同样有效（正文伪造无法进 frontmatter）。
+      ...(status === 'held' ? [`keeper_held_at: ${receivedAt}`] : []),
+      `status: ${status}`,
       '---',
       '',
     ].join('\n');
-    const body = payload?.row
+    let body = payload?.row
       ? '```json\n' + JSON.stringify(payload.row, null, 2) + '\n```\n'
       : content.trim() + '\n';
+    // 预批候选块：与 keeper held 写的 <!--keeper-options--> 同形状，parseEntryBody 照常读回、resolveEntry({option}) 照常点选。
+    if (optionsBlock) body += `\n<!--keeper-options\n${JSON.stringify(optionsBlock)}\n-->\n`;
 
+    const abs = path.join(instanceDir, relPath);
+    const fileText = fm + body;
+    const message = `inbox: 收件 ${id} (${kind} via ${client})`;
     mkdirSync(path.join(instanceDir, 'inbox'), { recursive: true });
-    writeFileSync(path.join(instanceDir, relPath), fm + body);
 
-    const receipt = { id, path: relPath, status: 'pending' };
-    // 落盘即受理；git 同步在后台单写者队列里完成，不阻塞回执
-    receipt.synced = writer.commitAndPush({ paths: [relPath], message: `inbox: 收件 ${id} (${kind} via ${client})` });
+    const receipt = { id, path: relPath, status };
+    if (queuedWrite) {
+      // G4：write 与 commit 同进 transact——写与提交边界一致，并发的整树提交不会卷进半写文件。
+      receipt.synced = writer.transact(async (commit) => {
+        writeFileSync(abs, fileText);
+        return commit({ paths: [relPath], message });
+      });
+    } else {
+      // 落盘即受理；git 同步在后台单写者队列里完成，不阻塞回执
+      writeFileSync(abs, fileText);
+      receipt.synced = writer.commitAndPush({ paths: [relPath], message });
+    }
     return receipt;
   }
 
@@ -137,6 +182,13 @@ export function createInbox({ instanceDir, writer, indexStore = null }) {
       raw += `\n<!--owner-decision\n${JSON.stringify(approvedDecision)}\n-->\n`;
     }
     writeFileSync(abs, raw);
+    // F1/G1：记账进批准登记表。token 覆盖 id+ruling+decision + rel + 被批文件正文（按最终落盘 raw 算——
+    // status/owner_ruling/owner-decision 改动已写完）。keeper 读回同一文件复算同款 token 比对；批准后正文/payload
+    // 被 pull-swap 换掉即失配 → 不认证。viaTrust 另存（通道限权只认这里）。同 id 覆盖取最后一次裁定（再批即新账）。
+    approvals.set(id, {
+      token: approvalToken({ id, ruling, decision: approvedDecision, rel: hit.path, kind: hit.kind, content: parseEntryBody(raw).content }),
+      viaTrust: viaTrust ?? null,
+    });
     // 缺陷2b：复位后刷新派生索引——件现为 status:pending（不再满足隔离-rejected 双条件），updatePage 会
     // DELETE 掉它此前作为 rejected 入的旧行、不再重插。索引在 git 之外、可随时重建，故刷新失败绝不影响复位
     // 落盘，只记日志（与 keeper.refreshIndex 同规矩：索引故障不阻断写路径）。

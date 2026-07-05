@@ -2,6 +2,7 @@
 // 每客户端一把 token（TOKENS_JSON），trust 决定 sensitive 区可见性。
 import express from 'express';
 import path from 'node:path';
+import { rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -13,6 +14,8 @@ import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
 import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
 import { createKeeper } from './keeper.js';
+import { createNightly } from './nightly.js';
+import { applySchema, validateSchemaProposal } from './executor.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
 import { createEventStore } from './events.js';
@@ -36,11 +39,17 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   }
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
-  const inbox = createInbox({ instanceDir, writer, indexStore });
+  // F1（Critical）进程内批准登记表：resolveEntry（唯一合法批准入口，本进程内）记账、keeper 查表核验。
+  // inbox 与 keeper 必须共享【这一个】 Map——经 app.locals.approvals（下方 app 建好后暴露）给 isMain 的
+  // keeper/nightly。取舍：Map 是进程内状态，重启即丢在途批准；届时相关件因登记表无记录变「未认证」→ 提案件
+  // re-held、普通件回落 LLM 重判（安全失败，主人再批一次）。绝不把认证信息落盘（落盘即可被 git pull 伪造）。
+  const approvals = new Map();
+  const inbox = createInbox({ instanceDir, writer, indexStore, approvals });
   // recall（读侧智能）需要 LLM：无 provider（如缺 DEEPSEEK_API_KEY）时不注册该工具，与 keeper 同一档降级。
   const recall = provider ? createRecall({ indexStore, provider, instanceDir }) : null;
   const app = express();
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
+  app.locals.approvals = approvals; // F1：keeper（isMain）经此拿到与 inbox 同一个批准登记表
 
   const identify = (req) => {
     const auth = req.headers.authorization ?? '';
@@ -105,7 +114,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
 
     const primary = identity.channel === 'primary' && identity.trust === 'high';
-    const server = buildMcpServer({ tools, inbox, recall, identity, audit, nudge: primary ? nudgeFor : null });
+    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, identity, audit, nudge: primary ? nudgeFor : null });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -203,7 +212,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   return app;
 }
 
-function buildMcpServer({ tools, inbox, recall, identity, audit, nudge = null }) {
+function buildMcpServer({ instanceDir, writer, tools, inbox, recall, identity, audit, nudge = null }) {
   const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity) });
   const { client, trust } = identity;
 
@@ -365,17 +374,75 @@ function buildMcpServer({ tools, inbox, recall, identity, audit, nudge = null })
 
     server.registerTool('inbox_resolve', {
       title: '主人裁定收件',
-      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。仅在主人明确表态后使用，id 用 inbox_list 查。',
+      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。提案件（schema/maintenance）批准请传 option 点选候选。仅在主人明确表态后使用，id 用 inbox_list 查。',
       inputSchema: {
         id: z.string().describe('收件 id（inbox_list 可查）'),
         ruling: z.string().describe('主人的裁定原话，一句话'),
+        option: z.number().int().min(0).optional().describe('点选候选方案的序号（inbox_list 里 options[].index）——提案件（schema/maintenance）批准用它，比转述 ruling 更准'),
       },
-    }, wrap('inbox_resolve', async ({ id, ruling }) => inbox.resolveEntry({ id, ruling, via: client, viaTrust: trust }),
+    }, wrap('inbox_resolve', async ({ id, ruling, option }) => inbox.resolveEntry({ id, ruling, option, via: client, viaTrust: trust }),
       (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`,
       rulingAuditFields));
+
+    // ==== schema 演化（M4.4）：提议新 zone → 主频道浮出 → 主人点选批准 → apply（doctor 校验回滚）====
+    server.registerTool('schema_propose', {
+      title: '提议新建一个 zone（分区）',
+      description: '当现有分区都放不下某类内容、需要给知识库开一个新分区（zone）时用。提案落 inbox 隔离区、创建即待主人定夺——主频道会浮出，主人点选「建/扔」即可，keeper 不擅自建 zone。id 英文小写连字符；path 一级相对目录、以 / 结尾（如 health/）；privacy=private（默认）或 sensitive（仅高信任可读）。',
+      inputSchema: {
+        id: z.string().regex(/^[a-z][a-z0-9-]{1,30}$/).describe('新 zone 的 id（英文小写连字符，2-31 位）'),
+        path: z.string().describe('新 zone 的目录路径，一级相对目录、以 / 结尾（如 health/）'),
+        purpose: z.string().describe('这个 zone 存什么、用途一句话'),
+        privacy: z.enum(['private', 'sensitive']).optional().describe('private（默认）/ sensitive（仅高信任可读）'),
+      },
+    }, wrap('schema_propose', async ({ id, path: zpath, purpose, privacy }) =>
+      schemaPropose({ instanceDir, inbox, client, id, path: zpath, purpose, privacy }),
+      (r) => `✅ 已提议新建 zone「${r.zoneId}」→ ${r.path}（状态 held，主频道会浮出待批，主人点选「建这个 zone / 扔掉别建」即可）`));
+
+    server.registerTool('schema_apply', {
+      title: '批准并落地一个 zone 提案',
+      description: '把某条 schema 提案件直接落地（追加 zones.md + 建目录 + doctor 校验；doctor 报错自动回滚）。通常主人在主频道点选批准即可，无需手工调本工具；id 用 inbox_list 查、须是 kind=schema 的提案件。',
+      inputSchema: { id: z.string().describe('schema 提案件的 inbox id（inbox_list 可查）') },
+    }, wrap('schema_apply', async ({ id }) => schemaApply({ instanceDir, inbox, writer, id }),
+      (r) => `✅ 已落地 zone「${r.zoneId}」→ ${r.changedPaths.join('、')}（提案件已移除，doctor 0 error）`,
+      (r) => ({ event: 'schema_apply', zone_id: r?.zoneId })));
   }
 
   return server;
+}
+
+// schema_propose 实现：冲突/形状校验（zod 已过 id 正则/privacy 枚举，这里查与现有 zones 的 id/path 冲突 + path 形状）
+// → 人话一行 + ```json 块（提案全量）写进件正文，创建即 held + 带两点选候选（批准=schema_apply / 扔掉=forbidden）。
+function schemaPropose({ instanceDir, inbox, client, id, path: zpath, purpose, privacy = 'private' }) {
+  const v = validateSchemaProposal({ instanceDir, payload: { id, path: zpath, purpose, privacy } });
+  if (!v.ok) throw new Error(v.reason);
+  const proposal = { id: v.id, path: v.path, purpose: v.purpose, privacy: v.privacy };
+  const content = `提议新建 zone「${v.id}」（${v.path}）：${v.purpose}\n\n\`\`\`json\n${JSON.stringify(proposal, null, 2)}\n\`\`\`\n`;
+  const optionsBlock = {
+    options: [
+      // 批准：decision 只「指向」件（target=id），schema 内容由 applySchema 从件正文重取（白名单原则）
+      { label: '✅ 建这个 zone', decision: { action: 'schema_apply', zone: 'governance', disposition: 'canonical', target: v.id, summary: `建 zone ${v.id}`, confidence: 1 } },
+      // 扔掉：走现有 forbidden → keeper 判 reject → 主人裁定清场路径，零新语义
+      { label: '扔掉别建', decision: { disposition: 'forbidden', reject_reason: '主人不要这个 zone' } },
+    ],
+  };
+  const receipt = inbox.addEntry({ kind: 'schema', content, client, status: 'held', optionsBlock });
+  return { ...receipt, zoneId: v.id };
+}
+
+// schema_apply 工具入口：定位件（kind 必须 schema）→ writer.transact 内 applySchema + 移除件 + 一并 commit。
+// 与 keeper approved_decision 入口共用 executor.applySchema（doctor 校验 + errors>0 回滚 throw）。
+async function schemaApply({ instanceDir, inbox, writer, id }) {
+  const hit = inbox.listEntries().entries.find((e) => e.id === id);
+  if (!hit) throw new Error(`找不到收件 ${id}`);
+  if (hit.kind !== 'schema') throw new Error(`不是 schema 提案件（kind=${hit.kind}），schema_apply 只落地 schema 件`);
+  let out;
+  await writer.transact(async (commit) => {
+    const applied = await applySchema({ instanceDir, entry: { rel: hit.path } });
+    rmSync(path.join(instanceDir, hit.path));
+    await commit({ paths: [...applied.changedPaths, hit.path], message: `schema: 落地 zone ${applied.zoneId}（${id}）` });
+    out = applied;
+  });
+  return { id, zoneId: out.zoneId, changedPaths: out.changedPaths };
 }
 
 // 裁定埋点：把 resolveEntry 返回的 held→被裁定耗时并入审计（供 held 半衰期曲线）。
@@ -418,6 +485,7 @@ if (isMain) {
     KEEPER_MIN_CONFIDENCE = 0.75,
     KEEPER_NOTIFY_LEVEL = 'all',
     NUDGE_TTL_MS = 14_400_000,
+    NIGHTLY_INTERVAL_MS = 604_800_000, // 夜班默认 7 天一轮；0=禁用
   } = process.env;
   if (!REPO_URL || !TOKENS_JSON) {
     console.error('缺少 REPO_URL / TOKENS_JSON 环境变量');
@@ -461,8 +529,18 @@ if (isMain) {
 
   if (provider) {
     const notifier = createNotifier({ webhookUrl: FEISHU_WEBHOOK_URL, secret: FEISHU_WEBHOOK_SECRET });
+    // 夜班（M4.4 D3）只在 provider 在场时挂：它的提案执行依赖 keeper 循环（tick 里勾 maybeRun），
+    // 降级模式（无 key）下 keeper 不跑、夜班也不跑——文档口径不变。inbox 是无状态门面，另开一个实例
+    // 安全（与写工具共用同一个单写者 writer，串行不打架；createApp 不动）。
+    const nightly = createNightly({
+      instanceDir,
+      inbox: createInbox({ instanceDir, writer: app.locals.writer, approvals: app.locals.approvals }),
+      notifier, audit,
+      intervalMs: Number(NIGHTLY_INTERVAL_MS),
+    });
     const keeper = createKeeper({
-      instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore,
+      instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly,
+      approvals: app.locals.approvals, // F1：与 createApp 内 inbox 共享同一个批准登记表
       onEvent: (e) => eventStore.push(e),
       minConfidence: Number(KEEPER_MIN_CONFIDENCE),
       notifyLevel: KEEPER_NOTIFY_LEVEL,
@@ -473,7 +551,7 @@ if (isMain) {
       .catch((e) => console.error(`keeper 循环异常：${e.message}`));
     setTimeout(tick, 5_000); // 启动后先扫一轮
     setInterval(tick, Number(KEEPER_INTERVAL_MS)).unref?.();
-    console.log(`keeper enabled（${DEEPSEEK_MODEL} → ${DEEPSEEK_ESCALATION_MODEL}，每 ${KEEPER_INTERVAL_MS}ms）`);
+    console.log(`keeper enabled（${DEEPSEEK_MODEL} → ${DEEPSEEK_ESCALATION_MODEL}，每 ${KEEPER_INTERVAL_MS}ms；夜班每 ${NIGHTLY_INTERVAL_MS}ms，0=禁用）`);
   } else {
     state.keeper = { enabled: false };
     console.log('keeper disabled（缺 DEEPSEEK_API_KEY）');

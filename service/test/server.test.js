@@ -60,13 +60,14 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   await client.close();
 });
 
-test('tools/list：高信任 = 5 读 + 4 写；低信任只有读且无 sensitive 通路', async () => {
+test('tools/list：高信任 = 5 读 + 6 写（含 schema_propose/apply）；低信任只有读且无 sensitive 通路', async () => {
   const client = await mcpClient('test-token-high');
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
     'collections_search', 'collections_upsert', 'get_context', 'inbox_list', 'inbox_resolve',
-    'read_page', 'remember', 'remove', 'save', 'search', 'todo_add', 'todo_done', 'todo_list',
+    'read_page', 'remember', 'remove', 'save', 'schema_apply', 'schema_propose', 'search',
+    'todo_add', 'todo_done', 'todo_list',
   ]);
   await client.close();
 
