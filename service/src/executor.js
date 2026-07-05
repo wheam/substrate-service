@@ -43,10 +43,18 @@ export function validateDecision({ instanceDir, decision, entry }) {
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_done 只能作用于 todo 区' };
     if (!d.target?.trim()) return { ok: false, reason: 'todo_done 缺 target（待办条目原文）' };
   } else if (d.action === 'remove_page') {
+    if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
+    // 硬校验爆炸半径（spec §7）：remove_page 只允许「删除件（kind=remove）」或「主人裁定过的件」。
+    // 判定裁定件的真实标记：resolveEntry 会写入 owner_ruling（点选候选也会，见 inbox.js），
+    // 带通道的裁定还会写 ruling_via_trust。普通 capture/save 件三者皆无——即便模型被注入
+    // 产出 remove_page，也在此拦下（ok:false → 落 held 给主人定夺），删页永不由数据触发。
+    const rulingMarked = !!(entry?.owner_ruling || entry?.ruling_via_trust);
+    if (entry?.kind !== 'remove' && !rulingMarked) {
+      return { ok: false, reason: `remove_page 仅用于删除件（kind=remove）或主人明确裁定；本件 kind=${entry?.kind ?? '未知'} 且无主人裁定，不予删除（需主人确认）` };
+    }
     if (entry?.ruling_via_trust === 'capture') {
       return { ok: false, reason: 'capture 通道（App）的裁定无权删除页面——删页请在高信任客户端（CC/Hermes）发起' };
     }
-    if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
     const slug = d.target.replace(/\.md$/, '');
     const rel = slug.startsWith(zone.path) ? `${slug}.md` : path.posix.join(zone.path, `${slug}.md`);

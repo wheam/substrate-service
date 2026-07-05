@@ -103,6 +103,16 @@ export function createInbox({ instanceDir, writer }) {
     }
     if (!ruling?.trim()) throw new Error('ruling 不能为空');
     let raw = readFileSync(abs, 'utf8');
+    // held→被裁定耗时（供使用仪表的 held 半衰期曲线）：只信 keeper 写进【frontmatter】的机器可辨标记
+    // keeper_held_at——它在文件首个 ---…--- 块内，正文数据无法伪造进去（旧版全文扫 **keeper held**
+    // 文本注记会被捕获正文里巧合/恶意的同款字样污染）。keeper 每次 held 覆盖该字段 → 天然取最后一次。
+    // 件此前没被 held 过（如直接对 pending 件裁定），或只有旧文本注记的历史件：无该字段 → held_at/ms=null（不崩）。
+    const fmBlock = raw.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
+    const heldAt = fmBlock.match(/^keeper_held_at: (.+)$/m)?.[1]?.trim() || null;
+    const resolvedAt = new Date().toISOString();
+    const heldStart = heldAt ? Date.parse(heldAt) : NaN;
+    let heldMs = Number.isFinite(heldStart) ? Date.parse(resolvedAt) - heldStart : null;
+    if (heldMs != null && heldMs < 0) heldMs = null; // 负数（时钟错乱/未来时间戳）不可信 → 置 null
     raw = raw
       .replace(/^status: .*$/m, 'status: pending')
       .replace(/^updated: .*$/m, `updated: ${new Date().toISOString().slice(0, 10)}`)
@@ -119,7 +129,7 @@ export function createInbox({ instanceDir, writer }) {
       raw += `\n<!--owner-decision\n${JSON.stringify(approvedDecision)}\n-->\n`;
     }
     writeFileSync(abs, raw);
-    const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling) };
+    const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling), held_at: heldAt, resolved_at: resolvedAt, held_ms: heldMs };
     receipt.synced = writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` });
     return receipt;
   }
