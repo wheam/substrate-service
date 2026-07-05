@@ -238,11 +238,19 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
 
     if (v.ok && v.verdict === 'reject') {
       await writer.transact(async (commit) => {
-        rewriteEntry(entry, 'rejected', v.reason);
-        await commit({ paths: [rel], message: `keeper: rejected ${entry.id}` });
+        if (entry.owner_ruling) {
+          // 主人亲自裁定不保存：件直接清场（git 历史留痕），裁定进判例
+          rmSync(path.join(instanceDir, rel));
+          const paths = [rel, appendCase(entry, decision, 'rejected（主人裁定）')];
+          await commit({ paths, message: `keeper: rejected ${entry.id}（主人裁定）` });
+        } else {
+          // keeper 主动拒收：件保留待主人复核
+          rewriteEntry(entry, 'rejected', v.reason);
+          await commit({ paths: [rel], message: `keeper: rejected ${entry.id}` });
+        }
       });
       emit(entry, 'rejected', rel, v.reason);
-      await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}）`);
+      await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}${entry.owner_ruling ? '，按你的裁定已清场' : '，件保留在收件箱可复核'}）`);
       audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'rejected', ms: Date.now() - t0 });
       return 'rejected';
     }

@@ -178,3 +178,25 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
   const fs2 = await import('node:fs');
   assert.match(fs2.readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /让主判失败的内容/);
 });
+
+test('主人裁定的拒收：件直接清场（git 留痕）+ 记判例；keeper 主动拒收仍保留待复核', async () => {
+  const { work } = makeInstance();
+  const writer = createWriter({ instanceDir: work });
+  const inbox = createInbox({ instanceDir: work, writer });
+  const provider = { judge: async (req) => req.mode === 'options'
+    ? { json: { options: [] }, model: 'pro', usage: {} }
+    : { json: { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 's', confidence: 0.9, reject_reason: '主人选择不保存' }, model: 'flash', usage: {} } };
+  const keeper = createKeeper({
+    instanceDir: work, writer, provider,
+    notifier: { notify: async () => ({ ok: true }) }, doctor: false,
+  });
+  const r = inbox.addEntry({ kind: 'save', content: '要被扔掉的内容', client: 'cc-test' });
+  await r.synced;
+  const resolved = inbox.resolveEntry({ id: r.id, ruling: '扔掉别存', via: 'app-ios', viaTrust: 'capture' });
+  await resolved.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.rejected, 1);
+  const fs3 = await import('node:fs');
+  assert.ok(!fs3.existsSync(path.join(work, r.path)), '主人裁定的拒收应从 inbox 清场');
+  assert.match(fs3.readFileSync(path.join(work, 'keeper-feedback', '_cases.md'), 'utf8'), /扔掉别存/, '裁定应进判例');
+});

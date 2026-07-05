@@ -9,7 +9,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createTools } from './tools.js';
 import { createAudit } from './audit.js';
 import { INSTRUCTIONS } from './instructions.js';
-import { ensureRepo, pullOnce, startPullLoop } from './repo.js';
+import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
 import { createInbox } from './inbox.js';
 import { createKeeper } from './keeper.js';
@@ -302,10 +302,14 @@ if (isMain) {
   const app = createApp({ instanceDir, tokens, audit, eventStore });
   const state = app.locals.state;
   state.lastPull = await pullOnce(instanceDir);
-  startPullLoop(instanceDir, Number(PULL_INTERVAL_MS), (result) => {
-    state.lastPull = result;
-    if (!result.ok) console.error(`pull 失败：${result.error}`);
-  });
+  // pull 与写入共用同一棵工作树：必须串行进单写者队列，否则 pull 会撞上未提交的写入
+  setInterval(() => {
+    app.locals.writer.transact(async () => {
+      const result = await pullOnce(instanceDir);
+      state.lastPull = result;
+      if (!result.ok) console.error(`pull 失败：${result.error}`);
+    }).catch((e) => console.error(`pull 队列异常：${e.message}`));
+  }, Number(PULL_INTERVAL_MS)).unref?.();
 
   if (DEEPSEEK_API_KEY) {
     const notifier = createNotifier({ webhookUrl: FEISHU_WEBHOOK_URL, secret: FEISHU_WEBHOOK_SECRET });
