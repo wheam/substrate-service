@@ -215,3 +215,20 @@ test('notifyLevel=quiet：已存不播报，held/rejected 照常', async () => {
   assert.equal(notifier.messages.length, 1, '拒收必须照常播报');
   assert.match(notifier.messages[0], /拒收/);
 });
+
+test('主判异常 → 自动升级档重试成功 → filed 不打扰主人', async () => {
+  const { work, inbox, keeper, provider, notifier } = setup({
+    providerScript: [
+      new Error('模型输出为空（finish_reason=length）'),
+      { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '重试成功', confidence: 0.95 },
+    ],
+  });
+  const receipt = inbox.addEntry({ kind: 'todo', content: '升级档兜住这条', client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.filed, 1, '升级档成功就该归档');
+  assert.equal(provider.calls.length, 2);
+  assert.equal(provider.calls[1].escalate, true);
+  assert.match(readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /升级档兜住这条/);
+  assert.match(notifier.messages[0], /✅/);
+});
