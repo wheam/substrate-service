@@ -87,4 +87,5 @@
 ## 文档索引
 
 - **[01-personal-alpha.md](01-personal-alpha.md)** —— 我的个人版：部署选择、M0–M3 里程碑与验收、keeper v0 规格、App v0 规格、现有 fleet 的切换与退役、安全清单、成本与回退。
-- **[02-productization.md](02-productization.md)** —— 长期产品化：产品定义与体验、多租户架构、keeper 规模化、安全与信任、多人共享、open-core 立场、难点与非目标。
+- **[02-productization.md](02-productization.md)** —— 长期产品化：产品定义与体验、多租户架构、keeper 规模化、安全与信任、多人共享、open-core 立场、难点与非目标。含 §9 竞品格局与借鉴清单（gbrain / openhuman 调研）。
+- **[03-next-version-spec.md](03-next-version-spec.md)** —— 下一版 spec（MCP 版 v0.3）：定位为「受治理的 agent 记忆（GAM）」开源参考实现（项目名仍 `substrate`）；成功判据、两条硬原则（装得极简 / 用得零负担）、能力增量（分层 lossless、服务端读侧智能 + 可抛索引、溯源置信、schema 演化、审批式夜班、抗注入、判例考卷 + 仪表）、主频道 agent、安装模型、**数据模型与契约（frontmatter 字段 / inbox 状态机 / 工具面 / 迁移）**、**安全与隐私威胁册**、M4.x 里程碑、决策记录。

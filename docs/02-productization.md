@@ -75,3 +75,56 @@
 
 - 非目标（当前不设计）：浏览器插件、邮件转发入库、语音捕获、本地端侧模型。
 - 开放问题：产品名 / 域名；国内主体与合规路径；免费层的滥用防护；共享库的冲突仲裁 UX；是否提供"只读公开页"分享形态。
+
+## 9. 竞品格局、架构自省与借鉴清单（2026-07-05 调研）
+
+> 起因：调研两个同赛道开源项目，确认我们的产品位置、避免"重造一个更差的它"，并挑出值得借鉴的机制。做产品时直接用。
+
+### 9.1 调研对象与三者定位
+
+| | **substrate-service（我们）** | **gbrain**（garrytan） | **openhuman**（tinyhumansai） |
+|---|---|---|---|
+| 一句话 | 知识库的**服务化访问层**：任何 AI 经 MCP 直连 | AI agent 的**"大脑层"**：检索+综合+图谱 | 你的**个人超级智能**：桌面 agent 运行时 |
+| 本质 | 记忆层（agent 中立、**托管服务**） | 记忆层（agent 中立、**自托管工具箱**） | **agent 运行时**（它就是你的 AI） |
+| 语言/许可 | Node.js / 私有 | TypeScript / MIT | Rust / GPL-3.0 |
+| 体量 | M3 alpha，单人 | 25k star，v0.41，146K 页生产，跑在 OpenClaw/Hermes | 34k star，曾连霸趋势榜 |
+| 背后 | 我 | Garry Tan（YC 总裁 CEO） | tinyhumans.ai，商业化中 |
+
+openhuman 与我们**不同物种**（它自带 agent 舰队、要替你装一个超级 AI），只作赛道热度旁证。真正的同类是 gbrain。
+
+### 9.2 核心哲学分野：capture-first vs curate-first（= 我们的产品位置）
+
+- **gbrain = 先全收、夜里自动整理（capture-first）**：`signal-detector` 在每条消息上**静默自动写库**（"无可见输出、后台运行"），默认**不问**你；干净靠**事后** dream cycle（去重 / 修引用 / consolidation / 矛盾检测 / takes 提升）。它的信条是"never lose context"、146K 页、"别跳过写入"。
+- **我们 = 进门先审（curate-at-the-door）**：一切写入过 inbox，keeper 判**四去向**（canonical/reference/local-only/forbidden）+ 能**拒收 / held / 给可读理由 / 立判例**，只让策展过的进库。
+- **结论：我们不是 gbrain 的子集，是它的"另一半"。** 用户"记笔记不会什么都往里写"的直觉，站在我们这边；gbrain 主动接受"全丢进去、夜里收敛"的代价。我们的位置 = **curate-first + 用户主权 + 托管零配置**，别跟它比事后整理的机器多寡。
+
+### 9.3 架构自省：gbrain ≈ 我们的 v1，我们已主动离开那个架构
+
+- **substrate v1（引擎仓库 `substrate/`，开源）**：每机 clone 实例 + 每个 agent 装 ~10 个 `substrate-*` skill + 5 个 host adapter；治理靠 skill **自律**（"协议是导航不是强制"：skill 预防 / doctor 检测 / audit 纠正）。其中 `substrate-intake` 就是**准入分类器**（四问四去向 + 三层去重 + 密钥剔除），但**跑在每个 agent 里**。
+- **这与 gbrain 的 fat-skills-in-every-agent 是同一形状**（gbrain 的 ethos 就叫 `THIN_HARNESS_FAT_SKILLS`：43 skill scaffold 进 agent、维护由 agent 干、cron 夜班、host adapter）。
+- **我们因"同步税 + 自律不可靠"主动 centralize** → substrate-service：把 intake 的活变成**服务端 keeper**（LLM 只判断、代码才执行、连接即强制），全 fleet 卸掉 skill。
+- **所以：服务化 / 服务端强制不是落后 gbrain，是我们比它多走的一步。** gbrain 还没撞上（或选择接受）那堵墙——它把复杂度推给用户自己的 agent 去跑。
+
+### 9.4 我们已有、gbrain 没有的资产（守住并放大）
+
+1. **准入即治理**：intake 四问四去向 → keeper **服务端强制**，可拒收 / held / 立判例。gbrain **没有准入闸**（写入自由，只事后清理）。
+2. **托管零配置**：keeper / cron / git / 通知全在服务端，客户端只需 `claude mcp add`。gbrain 的"完整自治"是 30 分钟、9 步、3 个 API key、多条 cron、43 skill、带 DB 的自托管安装（README troubleshooting 半屏在修 Postgres/pooler/sync）。
+3. **极简 + 单人主权**：无 DB，markdown+git 即检索、即真相；库永远是主人的。
+
+### 9.5 该借鉴清单（做产品时按这个抄）
+
+**A. 不引入数据库也能先做（近期）：**
+1. **轻量综合层（gbrain 的 `think`）**：retrieval 后让 LLM 出**带引用的答案 + gap 提示**（"库里没存过 X / 这页 N 周没更新，可能在你看不到的渠道"）。比现在的"查无不编"再进一步。
+2. **keeper 夜班**：把 keeper 从纯守门扩成"守门 + 夜间养护"——加 consolidation（合并薄页/去重）、**矛盾检测**（定期抽样对照 takes/facts）、citation 与互链修复。
+3. **takes-vs-facts 认知分层**：区分"主人的稳定事实"与"别人被归因的观点/预测/直觉"，带 confidence 权重；先在 memory zone 轻量落地。
+4. **ask-user choice-gate 标准化**：held 件给主人 2-4 个一键选项 + Skip 退路（App 候选方案已是雏形，继续做成通用模式）。
+5. **schema 自演化**：让 agent 提议演化 zones（我们的 zones ≈ gbrain 的 schema packs），人 review 后生效。
+6. **quiet-hours / 时区感知通知**：夜间通知折进晨间 briefing（飞书通知加静音时段）。
+
+**B. 需要检索层（中长期；保留 markdown+git 当真相，同步进检索 DB——gbrain 已证明可两全）：**
+7. **向量 + BM25 + 图谱混合检索**；typed-edge 图谱多跳查询（我们已有 wikilink + doctor 互链，是天生地基，且契合"约束靠结构不靠 prompt"）。
+8. **eval / golden 判例回归框架**（M2 已规划 golden 判例，可扩成检索质量 bench）。
+
+### 9.6 一句话战略
+
+把"**准入即治理 + 托管零配置 + 单人主权**"做到极致（gbrain 的 capture-first、openhuman 的重量级 app 都不占这个窄位），选择性偷 gbrain 的**综合层 / 夜间养护 / 混合检索**来补短板。
