@@ -3,9 +3,9 @@
 // expect 只声明有意义的字段：落库类判例声明 zone/action；held/rejected/红线件只声明 outcome(+disposition)。
 // —— 详见 src/exam.js 的 scoreCase 注释。
 // ==== 代表性判例：明显该归档的事实/决定 ====
-{"id":"fact-boiling","category":"fact","input":{"kind":"save","content":"水在标准大气压下的沸点是 100 摄氏度。"},"expect":{"outcome":"filed","disposition":"canonical","zone":"knowledge","action":"new_page"}}
+{"id":"fact-boiling","category":"fact","input":{"kind":"save","content":"水在标准大气压下的沸点是 100 摄氏度。"},"expect":{"outcome":"filed","disposition":"canonical","tier":"canonical","zone":"knowledge","action":"new_page"}}
 {"id":"fact-node-lts","category":"fact","input":{"kind":"save","content":"Node.js 22 是当前的 LTS 版本，官方维护到 2027 年。"},"expect":{"outcome":"filed","disposition":"canonical","zone":"knowledge","action":"new_page"}}
-{"id":"decision-fts","category":"decision","input":{"kind":"save","content":"项目检索决定先用 SQLite FTS5，语义检索作为可选升级档。"},"expect":{"outcome":"filed","disposition":"canonical","zone":"knowledge","action":"new_page"}}
+{"id":"decision-fts","category":"decision","input":{"kind":"save","content":"项目检索决定先用 SQLite FTS5，语义检索作为可选升级档。"},"expect":{"outcome":"filed","disposition":"canonical","tier":"canonical","zone":"knowledge","action":"new_page"}}
 // ==== 代表性判例：稳定的个人偏好 → 记忆区 merge_into ====
 {"id":"pref-dark-theme","category":"preference","input":{"kind":"save","content":"我偏好深色主题，所有工具都尽量切到深色。"},"expect":{"outcome":"filed","disposition":"canonical","zone":"memory","action":"merge_into"}}
 {"id":"pref-early-riser","category":"preference","input":{"kind":"save","content":"我习惯早上六点起床，重要的事都放在上午做。"},"expect":{"outcome":"filed","disposition":"canonical","zone":"memory","action":"merge_into"}}

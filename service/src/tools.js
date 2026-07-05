@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { parseZones, canRead, zoneFor } from './acl.js';
+import { readTier, normalizeInclude, isQuarantineRejected } from './tier.js';
 
 const SEARCH_EXTS = new Set(['.md', '.csv', '.txt']);
 const MAX_RESULTS = 50;
@@ -40,26 +41,41 @@ export function createTools({ instanceDir }) {
     return out;
   }
 
-  async function search({ query, zone, trust = 'low' }) {
+  async function search({ query, zone, trust = 'low', include }) {
     if (!query?.trim()) return { results: [] };
     const zs = zones();
     const zoneDef = zone ? zs.find((z) => z.id === zone) : null;
     if (zone && !zoneDef) {
       throw new Error(`没有叫 ${zone} 的分区，可用：${zs.map((z) => z.id).join('、')}`);
     }
+    // 分层过滤（§6.3）：默认只返 canonical；include 显式开 candidate/rejected（与 index/recall 同口径）。
+    const wantTiers = new Set(['canonical', ...normalizeInclude(include)]);
+    // 缺陷1：search 只扫【注册 zone】。唯一例外 = inbox 隔离-rejected 件（status:rejected + tier:rejected），
+    // 且 include 含 rejected、高信任、未限定其它 zone——与 index 侧特例完全同构（共用 isQuarantineRejected）。
+    // 故 governance/skills/keeper-feedback、以及 inbox 的 pending/held 待判件从 search 彻底消失：高信任
+    // 【默认档】也扫不到隔离待判件，兑现「pending/held 任何档任何组合绝不可查」的不变式。
+    // （readPage/getContext 是另一条通路、各自把关，不受本收紧影响。）
+    const allowInboxRejected = wantTiers.has('rejected') && trust === 'high' && !zoneDef;
     const needle = query.toLowerCase();
     const results = [];
     for (const rel of walkFiles()) {
       if (zoneDef && !rel.startsWith(zoneDef.path)) continue;
-      // 缺陷1（存量洞）：未注册 zone 的路径（inbox 隔离件 / governance / skills / keeper-feedback 等）
-      // 收紧为「仅 high 信任可读」——否则任意低信任客户端可 search 到隔离件。与 index 侧「隔离区不入索引」
-      // 两面一致：低信任在 index 与 search 两条路径都命不中隔离件。
-      if (!zoneFor(zs, rel) && trust !== 'high') continue;
-      if (!canRead(zs, rel, trust)) continue;
-      const lines = readFileSync(path.join(instanceDir, rel), 'utf8').split('\n');
+      const registered = !!zoneFor(zs, rel);
+      if (registered) {
+        if (!canRead(zs, rel, trust)) continue;
+      } else if (!(allowInboxRejected && rel.startsWith('inbox/'))) {
+        continue; // 未注册路径：除 inbox 隔离-rejected 窄例外，一律不扫
+      }
+      const text = readFileSync(path.join(instanceDir, rel), 'utf8');
+      // 未注册的 inbox 件必须过隔离-rejected 双条件（pending/held、手写残留一律挡在外面）。
+      if (!registered && !isQuarantineRejected(text)) continue;
+      // tier 从 frontmatter 读（无 → canonical）；不在请求档内的页整页跳过（candidate/rejected 默认不现）。
+      const tier = rel.endsWith('.md') ? readTier(text) : 'canonical';
+      if (!wantTiers.has(tier)) continue;
+      const lines = text.split('\n');
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].toLowerCase().includes(needle)) {
-          results.push({ path: rel, line: i + 1, snippet: lines[i].trim().slice(0, MAX_SNIPPET) });
+          results.push({ path: rel, line: i + 1, tier, snippet: lines[i].trim().slice(0, MAX_SNIPPET) });
           if (results.length >= MAX_RESULTS) return { results, truncated: true };
         }
       }

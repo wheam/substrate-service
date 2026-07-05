@@ -18,13 +18,14 @@ import { createDeepSeekProvider } from './provider.js';
 import { createEventStore } from './events.js';
 import { createIndexStore } from './index-store.js';
 import { createRecall } from './recall.js';
+import { normalizeInclude } from './tier.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
 export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }) }) {
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
-  const inbox = createInbox({ instanceDir, writer });
+  const inbox = createInbox({ instanceDir, writer, indexStore });
   // recall（读侧智能）需要 LLM：无 provider（如缺 DEEPSEEK_API_KEY）时不注册该工具，与 keeper 同一档降级。
   const recall = provider ? createRecall({ indexStore, provider, instanceDir }) : null;
   const app = express();
@@ -168,17 +169,24 @@ function buildMcpServer({ tools, inbox, recall, identity, audit }) {
   server.registerTool('search', {
     title: '检索知识库',
     description:
-      '在主人的个人知识库做关键词检索（大小写不敏感），返回 路径+行号+片段。主人问「我存过/记过 X 吗」「查查库里有没有」，或回答需要库内佐证时先用它。可选 zone 限定分区。',
+      '在主人的个人知识库做关键词检索（大小写不敏感），返回 路径+行号+片段。主人问「我存过/记过 X 吗」「查查库里有没有」，或回答需要库内佐证时先用它。默认只返正典（canonical）；可选 zone 限定分区、include 附加低层内容。',
     inputSchema: {
       query: z.string().describe('关键词'),
       zone: z.string().optional().describe('限定分区 id（如 todo/knowledge/collections/memory），不传=全库'),
+      include: z.string().optional().describe('可选，附加返回的分层：candidate（低置信旁置）/ rejected（被拒的隔离件，仅高信任）。可逗号组合，如 "candidate,rejected"。默认只返 canonical。'),
     },
     // 检索埋点（spec §6.3）：result_count + hit（hit=有命中）供落空率仪表；
     // query 原文（截断 200）供「部分召回失败」的事后离线分析——hit=true 但漏召时，
     // 唯一痕迹是同意图 query 的扇出模式，hit 字段抓不到，必须留 query 原文。
+    // include（用了非默认档才记）：区分「默认 canonical 落空」与「翻遍分层仍落空」。
   }, wrap('search', tools.search, asJson, (r, args) => {
     const n = Array.isArray(r?.results) ? r.results.length : 0;
-    return { result_count: n, hit: n > 0, query: typeof args?.query === 'string' ? args.query.slice(0, 200) : undefined };
+    const inc = normalizeInclude(args?.include);
+    return {
+      result_count: n, hit: n > 0,
+      query: typeof args?.query === 'string' ? args.query.slice(0, 200) : undefined,
+      ...(inc.length ? { include: inc } : {}),
+    };
   }));
 
   // recall（读侧智能，spec §6.3）：检索 + 一次 LLM 综合 → 带引用的答案。trust 与 search 同级（全客户端可用，

@@ -60,6 +60,11 @@ export function scoreCase(golden, actual, { zoneIds = [] } = {}) {
   }
   if (exp.zone && d?.zone !== exp.zone) failures.push(`zone：期望 ${exp.zone}，实际 ${d?.zone ?? '（无）'}`);
   if (exp.action && d?.action !== exp.action) failures.push(`action：期望 ${exp.action}，实际 ${d?.action ?? '（无）'}`);
+  // tier 仅当金标声明才比对；缺省视为 canonical（§6.1 迁移铁律：无 tier = canonical）。
+  if (exp.tier) {
+    const gotTier = d?.tier ?? 'canonical';
+    if (gotTier !== exp.tier) failures.push(`tier：期望 ${exp.tier}，实际 ${gotTier}`);
+  }
 
   if (golden.adversarial) {
     for (const msg of adversarialViolations(actual, exp, zoneIds)) failures.push(`对抗：${msg}`);

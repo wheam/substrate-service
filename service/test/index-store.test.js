@@ -6,7 +6,9 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createIndexStore } from '../src/index-store.js';
+import { createTools } from '../src/tools.js';
 import { readContentId } from '../src/content-id.js';
+import { readTier } from '../src/tier.js';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
@@ -334,4 +336,180 @@ test('缺陷3：keeper upsert_row 后索引增量刷新纳入新 csv 行', async
     const r = indexStore.query({ query: '松露主题', trust: 'high' });
     assert.ok(r.results.some((x) => x.path === 'collections/restaurants/data.csv'), '新 csv 行应可检索（.csv 已随增量刷新）');
   } finally { indexStore.close(); }
+});
+
+// ==== M4.2 分层：tier-aware 检索 + 隔离-rejected 特例 ====
+
+test('tier 过滤：默认只返 canonical；include=candidate 才现 candidate 页；无 tier 存量页默认可查', () => {
+  const { dir, indexPath } = tmpInstance('idx-tier');
+  writeFileSync(path.join(dir, 'knowledge', 'canon.md'),
+    '---\ncontent_id: c0000001\ntier: canonical\ntitle: 正典页\ntype: knowledge\n---\n\n分层测试词 tierprobe 出现在 canonical 页。\n');
+  writeFileSync(path.join(dir, 'knowledge', 'cand.md'),
+    '---\ncontent_id: c0000002\ntier: candidate\ntitle: 候选页\ntype: knowledge\n---\n\n分层测试词 tierprobe 出现在 candidate 页。\n');
+  const store = createIndexStore({ instanceDir: dir, indexPath });
+  try {
+    store.rebuild();
+    const def = store.query({ query: 'tierprobe', trust: 'high' });
+    assert.ok(paths(def).includes('knowledge/canon.md'), '默认返 canonical 页');
+    assert.ok(!paths(def).includes('knowledge/cand.md'), '默认不返 candidate 页');
+    assert.ok(def.results.every((r) => r.tier === 'canonical'), '结果带 tier 字段，默认档全 canonical');
+    // 迁移铁律：无 tier 存量页默认可查（视同 canonical）
+    assert.ok(paths(store.query({ query: '牛排', trust: 'high' })).includes('knowledge/dining-sf.md'), '无 tier 存量页默认可查');
+    // include=candidate：两者都现
+    const inc = paths(store.query({ query: 'tierprobe', trust: 'high', include: 'candidate' }));
+    assert.ok(inc.includes('knowledge/canon.md') && inc.includes('knowledge/cand.md'), 'include=candidate 两页都现');
+  } finally { store.close(); }
+});
+
+test('隔离-rejected：仅 tier: rejected 的 inbox 件入索引；默认查不到、include=rejected+高信任可查；pending/held 任何档都查不到', () => {
+  const { dir, indexPath } = tmpInstance('idx-rejected');
+  mkdirSync(path.join(dir, 'inbox'), { recursive: true });
+  writeFileSync(path.join(dir, 'inbox', '_2026-07-05-rej.md'),
+    '---\nid: rej1\ntype: inbox\ntier: rejected\nstatus: rejected\n---\n\n低价值件 rejquarantine 记一下天气。\n');
+  writeFileSync(path.join(dir, 'inbox', '_2026-07-05-pend.md'),
+    '---\nid: pend1\ntype: inbox\nstatus: pending\n---\n\n待判件 pendquarantine 龙虾。\n');
+  writeFileSync(path.join(dir, 'inbox', '_2026-07-05-held.md'),
+    '---\nid: held1\ntype: inbox\nstatus: held\n---\n\n待定夺件 heldquarantine 松茸。\n');
+  const store = createIndexStore({ instanceDir: dir, indexPath });
+  try {
+    store.rebuild();
+    for (const trust of ['low', 'high']) {
+      assert.equal(store.query({ query: 'rejquarantine', trust }).results.length, 0, `${trust} 默认档不返 rejected 隔离件`);
+    }
+    assert.ok(paths(store.query({ query: 'rejquarantine', trust: 'high', include: 'rejected' })).includes('inbox/_2026-07-05-rej.md'),
+      'include=rejected 高信任可查隔离件');
+    assert.equal(store.query({ query: 'rejquarantine', trust: 'low', include: 'rejected' }).results.length, 0,
+      '隔离件仅高信任可见（与 tools.js 未注册 zone 收紧两面一致）');
+    // pending / held：任何 trust、任何 include 都查不到（M4.1 不变式：永不入索引）
+    for (const trust of ['low', 'high']) {
+      for (const include of [undefined, 'candidate', 'rejected', 'candidate,rejected']) {
+        assert.equal(store.query({ query: 'pendquarantine', trust, include }).results.length, 0, `pending 不得漏（trust=${trust} include=${include}）`);
+        assert.equal(store.query({ query: 'heldquarantine', trust, include }).results.length, 0, `held 不得漏（trust=${trust} include=${include}）`);
+      }
+    }
+  } finally { store.close(); }
+});
+
+test('隔离-rejected 增量：updatePage 只纳入 tier: rejected 的 inbox 件；pending 件即便直接 updatePage 也不入', () => {
+  const { dir, indexPath } = tmpInstance('idx-rej-incr');
+  mkdirSync(path.join(dir, 'inbox'), { recursive: true });
+  const rejRel = 'inbox/_2026-07-05-r.md';
+  const pendRel = 'inbox/_2026-07-05-p.md';
+  writeFileSync(path.join(dir, rejRel), '---\nid: r\ntype: inbox\ntier: rejected\nstatus: rejected\n---\n\n增量拒件 incrrej 一段。\n');
+  writeFileSync(path.join(dir, pendRel), '---\nid: p\ntype: inbox\nstatus: pending\n---\n\n增量待判 incrpend 一段。\n');
+  const store = createIndexStore({ instanceDir: dir, indexPath });
+  try {
+    store.rebuild();
+    store.updatePage(rejRel);
+    store.updatePage(pendRel);
+    assert.ok(paths(store.query({ query: 'incrrej', trust: 'high', include: 'rejected' })).includes(rejRel), 'rejected 增量入索引');
+    for (const trust of ['low', 'high']) {
+      for (const include of [undefined, 'rejected']) {
+        assert.equal(store.query({ query: 'incrpend', trust, include }).results.length, 0, 'pending 增量不得入索引');
+      }
+    }
+  } finally { store.close(); }
+});
+
+test('端到端：keeper 拒收低价值件 → 隔离-rejected 入索引；默认检索落空、include=rejected 可查', async () => {
+  const { work, indexPath } = gitInstance();
+  const writer = createWriter({ instanceDir: work });
+  const inbox = createInbox({ instanceDir: work, writer });
+  const indexStore = createIndexStore({ instanceDir: work, indexPath });
+  const keeper = createKeeper({
+    instanceDir: work, writer, provider: fakeProvider({
+      disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'x',
+      summary: '闲聊无留存价值', confidence: 0.9, reject_reason: '一次性闲聊，无留存价值',
+    }), notifier: fakeNotifier(), audit: () => {}, doctor: false, indexStore,
+  });
+  try {
+    indexStore.rebuild();
+    const receipt = inbox.addEntry({ kind: 'save', content: '今天真无聊 losslessprobe 哈哈。', client: 'cc-test' });
+    await receipt.synced;
+    const result = await keeper.processPending();
+    assert.equal(result.rejected, 1);
+    assert.ok(existsSync(path.join(work, receipt.path)), '拒收件不丢（lossless）');
+    assert.equal(indexStore.query({ query: 'losslessprobe', trust: 'high' }).results.length, 0, '默认检索不含 rejected');
+    const hi = indexStore.query({ query: 'losslessprobe', trust: 'high', include: 'rejected' });
+    assert.ok(hi.results.some((r) => r.path === receipt.path), 'include=rejected 高信任可查到隔离件');
+  } finally { indexStore.close(); }
+});
+
+test('缺陷2a：手写 status: pending + tier: rejected 的件不得入索引（隔离-rejected 需 status/tier 双条件）', () => {
+  const { dir, indexPath } = tmpInstance('idx-forge');
+  mkdirSync(path.join(dir, 'inbox'), { recursive: true });
+  writeFileSync(path.join(dir, 'inbox', '_2026-07-05-forge.md'),
+    '---\nid: forge\ntype: inbox\ntier: rejected\nstatus: pending\n---\n\n伪造件 forgequarantine 想借 tier: rejected 混进索引。\n');
+  const store = createIndexStore({ instanceDir: dir, indexPath });
+  try {
+    store.rebuild();
+    for (const trust of ['low', 'high']) {
+      for (const include of [undefined, 'rejected', 'candidate,rejected']) {
+        assert.equal(store.query({ query: 'forgequarantine', trust, include }).results.length, 0,
+          `status:pending + tier:rejected 不得入索引（trust=${trust} include=${include}）`);
+      }
+    }
+    // 直接 updatePage 也不入（增量口同守双条件）
+    store.updatePage('inbox/_2026-07-05-forge.md');
+    assert.equal(store.query({ query: 'forgequarantine', trust: 'high', include: 'rejected' }).results.length, 0);
+  } finally { store.close(); }
+});
+
+test('缺陷2b：拒→复核→复位——resolveEntry 清 tier 行并刷索引；默认档与 include=rejected 都查不到残留', async () => {
+  const { work, indexPath } = gitInstance();
+  const writer = createWriter({ instanceDir: work });
+  const indexStore = createIndexStore({ instanceDir: work, indexPath });
+  const inbox = createInbox({ instanceDir: work, writer, indexStore });
+  const keeper = createKeeper({
+    instanceDir: work, writer, provider: fakeProvider({
+      disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'x',
+      summary: '闲聊无留存价值', confidence: 0.9, reject_reason: '一次性闲聊，无留存价值',
+    }), notifier: fakeNotifier(), audit: () => {}, doctor: false, indexStore,
+  });
+  try {
+    indexStore.rebuild();
+    const receipt = inbox.addEntry({ kind: 'save', content: '今天真无聊 staleprobe 哈哈。', client: 'cc-test' });
+    await receipt.synced;
+    await keeper.processPending(); // → keeper 主动拒收 → 隔离-rejected 入索引
+    assert.ok(indexStore.query({ query: 'staleprobe', trust: 'high', include: 'rejected' }).results.some((r) => r.path === receipt.path),
+      '拒收后 include=rejected 高信任可查到隔离件');
+    // 主人复核复位 pending
+    const resolved = inbox.resolveEntry({ id: receipt.id, ruling: '这条留着，进 todo' });
+    await resolved.synced;
+    const raw = readFileSync(path.join(work, receipt.path), 'utf8');
+    assert.equal(readTier(raw), 'canonical', '复位后 tier: rejected 旗标应被清掉（视同 canonical）');
+    assert.match(raw, /status: pending/);
+    // 索引不得残留旧的隔离-rejected 行：默认档与 include=rejected 都查不到
+    for (const include of [undefined, 'rejected']) {
+      assert.equal(indexStore.query({ query: 'staleprobe', trust: 'high', include }).results.length, 0,
+        `复位后派生索引不得残留（include=${include}）`);
+    }
+  } finally { indexStore.close(); }
+});
+
+test('缺陷4：tier 写法变体（单双引号/大小写/多空格）在 index 与 search 两面结果一致', async () => {
+  const { dir, indexPath } = tmpInstance('idx-tier-variants');
+  const variants = {
+    'knowledge/v-dq.md': '---\ntier: "candidate"\ntitle: 双引号\ntype: knowledge\n---\n\n变体词 tiervariant 双引号。\n',
+    'knowledge/v-sq.md': "---\ntier: 'candidate'\ntitle: 单引号\ntype: knowledge\n---\n\n变体词 tiervariant 单引号。\n",
+    'knowledge/v-uc.md': '---\ntier: CANDIDATE\ntitle: 大写\ntype: knowledge\n---\n\n变体词 tiervariant 大写。\n',
+    'knowledge/v-sp.md': '---\ntier:    candidate   \ntitle: 多空格\ntype: knowledge\n---\n\n变体词 tiervariant 多空格。\n',
+  };
+  const all = Object.keys(variants).sort();
+  for (const [rel, body] of Object.entries(variants)) writeFileSync(path.join(dir, rel), body);
+  const store = createIndexStore({ instanceDir: dir, indexPath });
+  const tools = createTools({ instanceDir: dir });
+  try {
+    store.rebuild();
+    // 默认档：四个变体全被当 candidate（引号/大小写/空格无关）→ 两面都查不到
+    const idxDef = paths(store.query({ query: 'tiervariant', trust: 'high' })).filter((p) => p.startsWith('knowledge/v-'));
+    const srchDef = (await tools.search({ query: 'tiervariant', trust: 'high' })).results.map((r) => r.path).filter((p) => p.startsWith('knowledge/v-'));
+    assert.deepEqual(idxDef, [], 'index 默认档不含任何变体');
+    assert.deepEqual([...new Set(srchDef)], [], 'search 默认档同样不含任何变体（两面一致）');
+    // include=candidate：四个变体全现，且 index 与 search 命中集合一致
+    const idxC = [...new Set(paths(store.query({ query: 'tiervariant', trust: 'high', include: 'candidate' })).filter((p) => p.startsWith('knowledge/v-')))].sort();
+    const srchC = [...new Set((await tools.search({ query: 'tiervariant', trust: 'high', include: 'candidate' })).results.map((r) => r.path).filter((p) => p.startsWith('knowledge/v-')))].sort();
+    assert.deepEqual(idxC, all, 'index include=candidate 现全部四个变体');
+    assert.deepEqual(srchC, all, 'search 与 index 两面命中集合一致');
+  } finally { store.close(); }
 });

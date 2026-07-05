@@ -97,6 +97,29 @@ test('低信任 token：get_context 连注册都没有、search 不见 sensitive
   await client.close();
 });
 
+test('审计：search 的 include 字段——用了非默认档才记（默认档不带该字段），旧字段只加不改', async () => {
+  const auditLog = [];
+  const app2 = createApp({ instanceDir, tokens: TOKENS, audit: (e) => auditLog.push(e) });
+  const srv = await new Promise((res) => { const s = app2.listen(0, '127.0.0.1', () => res(s)); });
+  try {
+    const url = `http://127.0.0.1:${srv.address().port}/mcp`;
+    const client = new Client({ name: 'audit-client', version: '0.0.1' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { Authorization: 'Bearer test-token-high' } },
+    }));
+    await client.callTool({ name: 'search', arguments: { query: '耶加雪菲' } });
+    await client.callTool({ name: 'search', arguments: { query: '耶加雪菲', include: 'candidate,rejected' } });
+    await client.close();
+    const searchAudits = auditLog.filter((e) => e.tool === 'search');
+    assert.equal(searchAudits.length, 2);
+    assert.ok(!('include' in searchAudits[0]), '默认档不带 include 字段');
+    assert.deepEqual(searchAudits[1].include, ['candidate', 'rejected'], '非默认档记录 include');
+    // 旧字段仍在（只加不改）
+    assert.equal(typeof searchAudits[1].result_count, 'number');
+    assert.equal(typeof searchAudits[1].hit, 'boolean');
+  } finally { srv.close(); }
+});
+
 test('GET /digest：高信任返回常驻小抄纯文本；低信任/capture 403；无 token 401', async () => {
   const ok = await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-high' } });
   assert.equal(ok.status, 200);
