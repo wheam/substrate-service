@@ -3,7 +3,7 @@
 > 状态：SPEC / 待动工（2026-07-05）。承接 [01](01-personal-alpha.md)（个人 alpha，M0–M3 已完成、已上真机）、[02](02-productization.md)（长期产品化——其中托管 SaaS 部分本版**冻结**）。
 > 定位一句话：把已跑通的个人 alpha，升级为 **「受治理的 agent 记忆」这个模式的开源参考实现**——我自己是租户 #1，也是模式作者。
 > **命名约定**：项目名保持 **`substrate`**（不改）；**模式**对外名暂用 **Governed Agent Memory / 受治理的 agent 记忆（GAM）**（临时，不纠结，见 §9）。
-> 依据：2026-07-05 对 gbrain / openhuman 的调研 + fable5 / Codex(GPT-5.5) 两轮外部评审（见 [02 §9](02-productization.md) 与 `scratchpad/review-2026-07-05.md`），据拥有者定调收敛。
+> 依据：2026-07-05 对 gbrain / openhuman 的调研 + fable5 / Codex(GPT-5.5) 两轮外部评审（要点已并入 [02 §9](02-productization.md) 与本 spec 各节），据拥有者定调收敛。
 
 ---
 
