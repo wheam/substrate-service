@@ -2,7 +2,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
-import { parseZones, canRead } from './acl.js';
+import { parseZones, canRead, zoneFor } from './acl.js';
 
 const SEARCH_EXTS = new Set(['.md', '.csv', '.txt']);
 const MAX_RESULTS = 50;
@@ -51,6 +51,10 @@ export function createTools({ instanceDir }) {
     const results = [];
     for (const rel of walkFiles()) {
       if (zoneDef && !rel.startsWith(zoneDef.path)) continue;
+      // 缺陷1（存量洞）：未注册 zone 的路径（inbox 隔离件 / governance / skills / keeper-feedback 等）
+      // 收紧为「仅 high 信任可读」——否则任意低信任客户端可 search 到隔离件。与 index 侧「隔离区不入索引」
+      // 两面一致：低信任在 index 与 search 两条路径都命不中隔离件。
+      if (!zoneFor(zs, rel) && trust !== 'high') continue;
       if (!canRead(zs, rel, trust)) continue;
       const lines = readFileSync(path.join(instanceDir, rel), 'utf8').split('\n');
       for (let i = 0; i < lines.length; i++) {

@@ -50,8 +50,20 @@ const OPTIONS_PROMPT = `上一轮归档判断没有落定。你的任务：给�
 
 要求：方案彼此实质不同、都必须可执行（merge_into 的 target 只能取材料里实际列出的页；不确定去向就用 new_page）；第一个放你最推荐的；禁用 remove_page；最多 3 个；如内容不值得保存，其中一个方案用 disposition=forbidden 且 label 写「扔掉别存」。`;
 
-export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all' }) {
+export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null }) {
   let running = false;
+
+  // 派生检索索引的增量刷新（spec §6.4：增量由 keeper 单写口驱动）。indexStore 缺省 null → 完全无副作用
+  // （老调用方行为不变）。索引在 git 之外、可随时重建，故刷新失败绝不回滚归档、只记日志。
+  function refreshIndex(action, changedPaths) {
+    if (!indexStore) return;
+    try {
+      if (action === 'remove_page') indexStore.rebuild(); // 删页牵动全库反向链接 → 全量重建最稳
+      // 缺陷3：不再只挑 .md——收藏 upsert 改的是 .csv，漏刷会让索引与 collections 不一致。
+      // 交给 index-store.updatePage 按自身支持的扩展名（.md/.csv/.txt）决定更新或 no-op。
+      else for (const p of changedPaths ?? []) indexStore.updatePage(p);
+    } catch (e) { console.error(`索引增量刷新失败（不影响归档）：${e.message}`); }
+  }
 
   const emit = (entry, verdict, detail, summary) => {
     try {
@@ -270,11 +282,12 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       return 'held';
     }
 
-    let detail;
+    let detail, changedPaths = [];
     try {
       await writer.transact(async (commit) => {
         const applied = await applyDecision({ instanceDir, entry, decision, zone: v.zone });
         detail = applied.detail;
+        changedPaths = applied.changedPaths;
         rmSync(path.join(instanceDir, rel));
         const paths = [...applied.changedPaths, rel];
         if (entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
@@ -285,6 +298,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', error: e.message, ms: Date.now() - t0 });
       return 'held';
     }
+    // 归档已落定 → 刷新派生索引（受影响页；删页则全量重建）。仅到此处代表 filed 成功。
+    refreshIndex(decision.action, changedPaths);
 
     const doctorErrors = await runDoctor();
     const doctorNote = doctorErrors ? `\n⚠️ doctor 报 ${doctorErrors} 个 error，请抽空看看` : '';

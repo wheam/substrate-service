@@ -30,8 +30,13 @@ export function zoneFor(zones, relPath) {
   return zones.find((z) => z.path && relPath.startsWith(z.path)) ?? null;
 }
 
-export function canRead(zones, relPath, trust) {
-  const zone = zoneFor(zones, relPath);
+// 单个 zone 是否对该 trust 可读（zone 可为 null）。sensitive 只放高信任；其余（含未注册 null）放行。
+// index-store 查询侧据此把「可读 zone 集合」预过滤进 SQL（ACL 在 LIMIT 之前生效）。
+export function canReadZone(zone, trust) {
   if (zone?.privacy === 'sensitive') return trust === 'high';
   return true;
+}
+
+export function canRead(zones, relPath, trust) {
+  return canReadZone(zoneFor(zones, relPath), trust);
 }

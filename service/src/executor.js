@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, readdirSync } from '
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { parseZones } from './acl.js';
+import { newContentId } from './content-id.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
 const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page', 'todo_done']);
@@ -159,6 +160,7 @@ async function newPage(instanceDir, entry, decision, zone) {
   if (existsSync(abs)) throw new Error(`页已存在：${rel}（该用 merge_into）`);
   const fm = [
     '---',
+    `content_id: ${newContentId()}`, // 稳定短 id：落盘即写，扛改名（spec §6.1）
     `title: ${(decision.title ?? slug).replace(/\n/g, ' ')}`,
     `created: ${today()}`,
     `updated: ${today()}`,
