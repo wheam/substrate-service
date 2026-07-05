@@ -4,7 +4,12 @@ import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from 
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture']);
+// 导出供读路径复验：实例仓库经 git pull 同步，inbox 件可以不经 addEntry、被手工伪造后拉进来——
+// 「kind 合法、id 是服务端生成的」只在写路径成立，任何要把 id/kind 拼进响应面的读方必须自己再验。
+export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture']);
+// 服务端生成 id 的形状（见 addEntry：Date.now 的 base36 + '-' + 2 字节 hex）。
+// 首段长度上限放到 12：只为防伪造件灌长文本，不过拟合当前时间戳位数（base36 毫秒到 2059 年也才 9 位）。
+export const ID_FORMAT = /^[a-z0-9]{1,12}-[a-f0-9]{4}$/;
 
 // 与引擎 doctor 的凭据扫描同族的模式集（服务侧写路径前置一道）
 const CREDENTIAL_PATTERNS = [

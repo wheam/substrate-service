@@ -8,10 +8,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createTools } from './tools.js';
 import { createAudit } from './audit.js';
-import { INSTRUCTIONS } from './instructions.js';
+import { PRIMARY_RULES, instructionsFor } from './instructions.js';
 import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
-import { createInbox } from './inbox.js';
+import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
 import { createKeeper } from './keeper.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
@@ -22,7 +22,18 @@ import { normalizeInclude } from './tier.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
-export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }) }) {
+// 主频道 nudge 的豁免工具：inbox_list/inbox_resolve 是「正在处置待裁件」的动作本身——
+// 给它们再尾附待裁提示是噪音（agent 已在裁决面里），故排除。
+const NUDGE_EXEMPT = new Set(['inbox_list', 'inbox_resolve']);
+
+export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000 }) {
+  // 配置健全性：channel:primary 只在 high 客户端生效（主频道房规/nudge 依赖 inbox 工具，而 inbox 是 high-only）。
+  // 标了 primary 却非 high = 无声失效的误配 —— 启动即告警点名，而不是运行期静默丢行为。
+  for (const t of Object.values(tokens)) {
+    if (t.channel === 'primary' && t.trust !== 'high') {
+      console.warn(`TOKENS_JSON 配置告警：client ${t.client} 标了 channel:primary 但 trust=${t.trust}——主频道需要 high（inbox 工具是 high-only），该标记不会生效`);
+    }
+  }
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
   const inbox = createInbox({ instanceDir, writer, indexStore });
@@ -37,6 +48,44 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     return (token && tokens[token]) || null;
   };
   app.use(express.json({ limit: '1mb' }));
+
+  // held 摘要收集：piggyback nudge 与 /digest 两处共用。只带 id/kind/计数——件正文是对抗输入，
+  // 绝不进 instructions/响应面/digest（M4.0 考卷同款威胁模型）。key = held id 集合，供 piggyback 防重复。
+  const heldSummary = () => {
+    const held = inbox.listEntries().entries.filter((e) => e.status === 'held');
+    if (!held.length) return null;
+    // 读路径必须再验 id/kind：实例仓库经 git pull 同步，inbox 件可以不经 addEntry 写路径、被手工伪造后
+    // 拉进来——伪造 frontmatter 的 id/kind 是单行任意文本，直接拼进 sample 就是注入面。sample 只收
+    // 「id 合服务端生成格式（ID_FORMAT）且 kind 在白名单（KINDS）」的件；count 仍计全部 held——把异常件
+    // 藏出计数反而帮攻击者隐身。全部异常时 sample 为空，行退化为「📥 待主人裁定 N 件」。
+    const trusted = held.filter((e) => ID_FORMAT.test(e.id) && KINDS.has(e.kind));
+    const shown = trusted.slice(0, 3);
+    const sample = shown.map((e) => `${e.id}(${e.kind})`).join('、');
+    return {
+      count: held.length,
+      key: held.map((e) => e.id).sort().join(','),
+      line: `📥 待主人裁定 ${held.length} 件${sample ? `（${sample}${held.length > shown.length ? '…' : ''}）` : ''}`,
+    };
+  };
+
+  // 主频道「主动浮出」的服务端半边（spec §4；push/pull 之争已裁决为拉）：primary 客户端每次工具
+  // 成功响应尾部 piggyback 一行待裁提示。stateless transport 没有 server→client 推送通道，而主频道
+  // agent 只在主人对话时在场——把提示搭在既有响应上，浮出恰好发生在主人已在的对话里，零轮询成本。
+  // 防重复：held id 集合为 key，同 key 在 TTL 内只发一次（进程级状态，重启即重置，丢的只是提示）。
+  // key = token 身份（identify() 返回的 identity 对象；tokens[token] 引用在进程内每 token 恒等）。
+  // 不能用 client 显示名做 key：TOKENS_JSON 里显示名可重复，同名两把 primary token 会共享防重复
+  // 状态——A 收到提示后 B 在 TTL 内被吞。audit 里仍记 client 显示名（那是给人看的）。
+  const nudgeState = new Map(); // identity -> { key, at }
+  const nudgeFor = (identity) => {
+    try {
+      const s = heldSummary();
+      if (!s) { nudgeState.delete(identity); return null; }
+      const prev = nudgeState.get(identity);
+      if (prev && prev.key === s.key && Date.now() - prev.at < nudgeTtlMs) return null;
+      nudgeState.set(identity, { key: s.key, at: Date.now() });
+      return { text: `\n\n---\n${s.line}。请按主频道房规浮出：inbox_list 查详情，主人表态后用 inbox_resolve 回传原话。`, count: s.count };
+    } catch { return null; } // inbox 读挂不碎工具主路径
+  };
 
   const state = { startedAt: new Date().toISOString(), lastPull: null };
   app.locals.state = state;
@@ -55,7 +104,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     }
     if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
 
-    const server = buildMcpServer({ tools, inbox, recall, identity, audit });
+    const primary = identity.channel === 'primary' && identity.trust === 'high';
+    const server = buildMcpServer({ tools, inbox, recall, identity, audit, nudge: primary ? nudgeFor : null });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -81,8 +131,19 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     if (identity.trust !== 'high') return res.status(403).json({ error: '常驻小抄含敏感记忆，仅高信任客户端可取' });
     try {
       const { content } = await tools.getContext({ trust: identity.trust });
+      let out = content + DIGEST_RULES;
+      // 主频道客户端（channel:primary，上面已 high-gated）额外下发主频道房规 + 实时 held 摘要——与 MCP
+      // instructions 的 primary 分支同源。digest 是拉取快照，故每次给全量现状（不走 piggyback 的防重复
+      // state，防重复只属于 piggyback 通路）。held 摘要只带 id/kind/计数：件正文是对抗输入，绝不进 digest 面。
+      if (identity.channel === 'primary') {
+        // held 摘要读挂（如 inbox 被同名文件顶替 → readdirSync 抛 ENOTDIR）不得碎掉 digest 主路径：
+        // primary 客户端的基础 digest（含主频道房规）必须照常下发，仅优雅省略实时 held 行——与 nudgeFor 同规矩。
+        let s = null;
+        try { s = heldSummary(); } catch { /* inbox 读挂不碎 digest 主路径 */ }
+        out += PRIMARY_RULES + (s ? `\n\n---\n${s.line}。（主频道实时待裁；inbox_list 查详情，主人表态后 inbox_resolve 回传原话）` : '');
+      }
       audit({ client: identity.client, tool: 'digest', ok: true });
-      res.type('text/plain; charset=utf-8').send(content + DIGEST_RULES);
+      res.type('text/plain; charset=utf-8').send(out);
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -142,8 +203,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   return app;
 }
 
-function buildMcpServer({ tools, inbox, recall, identity, audit }) {
-  const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
+function buildMcpServer({ tools, inbox, recall, identity, audit, nudge = null }) {
+  const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity) });
   const { client, trust } = identity;
 
   // auditFields(result, args)：可选，从工具结果/入参里抽结构化埋点字段并入审计条目（如 search 的 result_count/hit/query）。
@@ -156,7 +217,11 @@ function buildMcpServer({ tools, inbox, recall, identity, audit }) {
       const extra = auditFields ? auditFields(result, args) : null;
       const cap = captureKind ? { event: 'capture_attempt', id: result?.id, kind: captureKind, source: client } : null;
       audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ...(cap ?? {}), ...(extra ?? {}), ms: Date.now() - t0 });
-      return { content: [{ type: 'text', text: render(result) }] };
+      // 主频道 piggyback：成功响应尾附待裁提示（豁免正在处置的 inbox_* 工具）。发出即单记一条 nudge 审计。
+      // nudge 传 identity 非 client 显示名——防重复状态按 token 身份隔离（显示名可重复，同名会互吞）。
+      const n = nudge && !NUDGE_EXEMPT.has(name) ? nudge(identity) : null;
+      if (n) audit({ client, trust, event: 'nudge', held_count: n.count });
+      return { content: [{ type: 'text', text: render(result) + (n?.text ?? '') }] };
     } catch (e) {
       const cap = captureKind ? { event: 'capture_attempt', kind: captureKind, source: client } : null;
       audit({ client, trust, tool: name, args: auditArgs(args), ok: false, ...(cap ?? {}), error: e.message, ms: Date.now() - t0 });
@@ -352,6 +417,7 @@ if (isMain) {
     KEEPER_INTERVAL_MS = 60_000,
     KEEPER_MIN_CONFIDENCE = 0.75,
     KEEPER_NOTIFY_LEVEL = 'all',
+    NUDGE_TTL_MS = 14_400_000,
   } = process.env;
   if (!REPO_URL || !TOKENS_JSON) {
     console.error('缺少 REPO_URL / TOKENS_JSON 环境变量');
@@ -378,7 +444,7 @@ if (isMain) {
     : null;
 
   // recall 复用 keeper 单写口增量刷新的【同一个】 indexStore，读到的是最新归档结果。
-  const app = createApp({ instanceDir, tokens, audit, eventStore, provider, indexStore });
+  const app = createApp({ instanceDir, tokens, audit, eventStore, provider, indexStore, nudgeTtlMs: Number(NUDGE_TTL_MS) });
   const state = app.locals.state;
 
   state.lastPull = await pullOnce(instanceDir);
