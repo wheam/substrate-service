@@ -58,8 +58,10 @@ function setup({ providerScript }) {
   const inbox = createInbox({ instanceDir: work, writer });
   const provider = fakeProvider(providerScript);
   const notifier = fakeNotifier();
-  const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, doctor: false });
-  return { origin, work, inbox, keeper, provider, notifier };
+  const auditLog = [];
+  const audit = (e) => auditLog.push(e);
+  const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, audit, doctor: false });
+  return { origin, work, inbox, keeper, provider, notifier, auditLog };
 }
 
 test('save→knowledge new_page：建页、reindex、删收件、commit、通知', async () => {
@@ -215,6 +217,46 @@ test('notifyLevel=quiet：已存不播报，held/rejected 照常', async () => {
   await quietKeeper.processPending();
   assert.equal(notifier.messages.length, 1, '拒收必须照常播报');
   assert.match(notifier.messages[0], /拒收/);
+});
+
+test('埋点：filed 的审计条目记 disposition=accepted + kind', async () => {
+  const { inbox, keeper, auditLog } = setup({
+    providerScript: [{ disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '买猫粮', confidence: 0.97 }],
+  });
+  const receipt = inbox.addEntry({ kind: 'capture', content: '买猫粮', client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
+  assert.ok(rec, '应有 keeper 审计条目');
+  assert.equal(rec.disposition, 'accepted', 'filed → disposition=accepted');
+  assert.equal(rec.verdict, 'filed', 'verdict 旧字段保持不变（向后兼容）');
+  assert.equal(rec.kind, 'capture', '带上件的 kind 供仪表分口径');
+});
+
+test('埋点：held 的审计条目记 disposition=held', async () => {
+  const { inbox, keeper, auditLog } = setup({
+    providerScript: [
+      { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.5 },
+      { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.6 },
+    ],
+  });
+  const receipt = inbox.addEntry({ kind: 'capture', content: '拿不准的一句', client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
+  assert.equal(rec.disposition, 'held');
+  assert.equal(rec.kind, 'capture');
+});
+
+test('埋点：rejected 的审计条目记 disposition=rejected', async () => {
+  const { inbox, keeper, auditLog } = setup({
+    providerScript: [{ disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.95, reject_reason: '闲聊无留存价值' }],
+  });
+  const receipt = inbox.addEntry({ kind: 'capture', content: '一次性闲聊', client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
+  assert.equal(rec.disposition, 'rejected');
 });
 
 test('主判异常 → 自动升级档重试成功 → filed 不打扰主人', async () => {

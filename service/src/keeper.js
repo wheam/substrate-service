@@ -129,10 +129,19 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
   }
 
   function rewriteEntry(entry, status, extra) {
-    const updated = entry.raw
+    const now = new Date().toISOString();
+    let updated = entry.raw
       .replace(/^status: pending$/m, `status: ${status}`)
-      .replace(/^updated: .*$/m, `updated: ${new Date().toISOString().slice(0, 10)}`)
-      + `\n---\n**keeper ${status}**（${new Date().toISOString()}）：${extra}\n`;
+      .replace(/^updated: .*$/m, `updated: ${now.slice(0, 10)}`);
+    if (status === 'held') {
+      // held 时把时间戳落进 frontmatter 的机器可辨标记 keeper_held_at（resolveEntry 只信这里，正文伪造无效）；
+      // 多次 held 覆盖该字段（取最后一次）。人话注记仍另行追加进正文供主人阅读。
+      const heldLine = `keeper_held_at: ${now}`;
+      updated = /^keeper_held_at: .*$/m.test(updated)
+        ? updated.replace(/^keeper_held_at: .*$/m, heldLine)
+        : updated.replace(/^status: held$/m, `${heldLine}\nstatus: held`);
+    }
+    updated += `\n---\n**keeper ${status}**（${now}）：${extra}\n`;
     writeFileSync(path.join(instanceDir, entry.rel), updated);
   }
 
@@ -223,13 +232,13 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         judged = await judgeEntry(entry);
       } catch (e) {
         await holdEntry(entry, rel, `两档判断都没成（${e.message.slice(0, 120)}）`);
-        audit({ tool: 'keeper', entry: entry.id, ok: false, error: e.message, ms: Date.now() - t0 });
+        audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, ok: false, error: e.message, verdict: 'held', disposition: 'held', ms: Date.now() - t0 });
         return 'held';
       }
       decision = judged.json; model = judged.model; usage = judged.usage;
       if ((decision.confidence ?? 0) < minConfidence) {
         await holdEntry(entry, rel, `两轮置信度仍低（${decision.confidence}）`);
-        audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'held', reason: 'low-confidence', ms: Date.now() - t0 });
+        audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', reason: 'low-confidence', ms: Date.now() - t0 });
         return 'held';
       }
     }
@@ -251,13 +260,13 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       });
       emit(entry, 'rejected', rel, v.reason);
       await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}${entry.owner_ruling ? '，按你的裁定已清场' : '，件保留在收件箱可复核'}）`);
-      audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'rejected', ms: Date.now() - t0 });
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'rejected', disposition: 'rejected', ms: Date.now() - t0 });
       return 'rejected';
     }
 
     if (!v.ok) {
       await holdEntry(entry, rel, v.reason);
-      audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'held', reason: v.reason, ms: Date.now() - t0 });
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', reason: v.reason, ms: Date.now() - t0 });
       return 'held';
     }
 
@@ -273,7 +282,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       });
     } catch (e) {
       await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`);
-      audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'held', error: e.message, ms: Date.now() - t0 });
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', error: e.message, ms: Date.now() - t0 });
       return 'held';
     }
 
@@ -284,7 +293,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     if (notifyLevel !== 'quiet' || doctorErrors) {
       await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${model}）${doctorNote}`);
     }
-    audit({ tool: 'keeper', entry: entry.id, decision, verdict: 'filed', detail, model, usage, ms: Date.now() - t0 });
+    // filed 目前无 tier 细分 → disposition=accepted（字段留位，未来低置信入库可记 candidate）
+    audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'filed', disposition: 'accepted', detail, model, usage, ms: Date.now() - t0 });
     return 'filed';
   }
 

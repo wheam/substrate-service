@@ -92,15 +92,19 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     }
     const { url, text, note } = req.body ?? {};
     if (!url?.trim() && !text?.trim()) {
+      // 捕获尝试但参数缺失：从没进 inbox → 仍记 capture_attempt(ok:false)，供放弃率分母（spec §0：App 发起却没进库）
+      audit({ client: identity.client, tool: 'capture', event: 'capture_attempt', kind: 'capture', source: identity.client, ok: false, error: 'url 与 text 至少要有一个' });
       return res.status(400).json({ ok: false, error: 'url 与 text 至少要有一个' });
     }
     const content = [url?.trim(), text?.trim()].filter(Boolean).join('\n\n').slice(0, 20_000);
     try {
       const receipt = inbox.addEntry({ kind: 'capture', content, hint: note?.slice(0, 500), client: identity.client });
-      audit({ client: identity.client, tool: 'capture', args: { url, note }, ok: true });
+      // 成功的捕获尝试带 inbox entry id：metrics 按 id join keeper 最终去向，算「发起→进库/拒收」
+      audit({ client: identity.client, tool: 'capture', event: 'capture_attempt', kind: 'capture', source: identity.client, id: receipt.id, args: { url, note }, ok: true });
       return res.json({ ok: true, id: receipt.id, path: receipt.path });
     } catch (e) {
-      audit({ client: identity.client, tool: 'capture', ok: false, error: e.message });
+      // addEntry 抛错（如凭据红线）：进不了 inbox → capture_attempt(ok:false) 带失败原因，计入「没进库」
+      audit({ client: identity.client, tool: 'capture', event: 'capture_attempt', kind: 'capture', source: identity.client, ok: false, error: e.message });
       return res.status(400).json({ ok: false, error: e.message });
     }
   });
@@ -122,7 +126,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     const { id, ruling, option } = req.body ?? {};
     try {
       const r = inbox.resolveEntry({ id, ruling, option, via: identity.client, viaTrust: identity.trust });
-      audit({ client: identity.client, tool: 'capture_resolve', args: { id, ruling }, ok: true });
+      audit({ client: identity.client, tool: 'capture_resolve', args: { id, ruling }, ok: true, ...rulingAuditFields(r) });
       return res.json({ ok: true, id: r.id, status: r.status });
     } catch (e) {
       audit({ client: identity.client, tool: 'capture_resolve', args: { id }, ok: false, error: e.message });
@@ -137,14 +141,20 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
   const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
   const { client, trust } = identity;
 
-  const wrap = (name, fn, render) => async (args) => {
+  // auditFields(result, args)：可选，从工具结果/入参里抽结构化埋点字段并入审计条目（如 search 的 result_count/hit/query）。
+  // captureKind：可选，标记这是「捕获/写入意图」的工具——成功/失败都记 event:'capture_attempt'（带 kind+source，
+  //   成功再带 inbox entry id），供 metrics 把 MCP 面的写入与 /capture 端点统一计入捕获放弃率的分母。
+  const wrap = (name, fn, render, auditFields, captureKind) => async (args) => {
     const t0 = Date.now();
     try {
       const result = await fn({ ...args, trust });
-      audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ms: Date.now() - t0 });
+      const extra = auditFields ? auditFields(result, args) : null;
+      const cap = captureKind ? { event: 'capture_attempt', id: result?.id, kind: captureKind, source: client } : null;
+      audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ...(cap ?? {}), ...(extra ?? {}), ms: Date.now() - t0 });
       return { content: [{ type: 'text', text: render(result) }] };
     } catch (e) {
-      audit({ client, trust, tool: name, args: auditArgs(args), ok: false, error: e.message, ms: Date.now() - t0 });
+      const cap = captureKind ? { event: 'capture_attempt', kind: captureKind, source: client } : null;
+      audit({ client, trust, tool: name, args: auditArgs(args), ok: false, ...(cap ?? {}), error: e.message, ms: Date.now() - t0 });
       return { content: [{ type: 'text', text: e.message }], isError: true };
     }
   };
@@ -159,7 +169,13 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
       query: z.string().describe('关键词'),
       zone: z.string().optional().describe('限定分区 id（如 todo/knowledge/collections/memory），不传=全库'),
     },
-  }, wrap('search', tools.search, asJson));
+    // 检索埋点（spec §6.3）：result_count + hit（hit=有命中）供落空率仪表；
+    // query 原文（截断 200）供「部分召回失败」的事后离线分析——hit=true 但漏召时，
+    // 唯一痕迹是同意图 query 的扇出模式，hit 字段抓不到，必须留 query 原文。
+  }, wrap('search', tools.search, asJson, (r, args) => {
+    const n = Array.isArray(r?.results) ? r.results.length : 0;
+    return { result_count: n, hit: n > 0, query: typeof args?.query === 'string' ? args.query.slice(0, 200) : undefined };
+  }));
 
   server.registerTool('read_page', {
     title: '读一页全文',
@@ -204,13 +220,13 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
         content: z.string().describe('要保存的内容原文'),
         hint: z.string().optional().describe('去向提示（可选），如：决定/事实/餐厅/想试'),
       },
-    }, wrap('save', async ({ content, hint }) => inbox.addEntry({ kind: 'save', content, hint, client }), receiptText));
+    }, wrap('save', async ({ content, hint }) => inbox.addEntry({ kind: 'save', content, hint, client }), receiptText, null, 'save'));
 
     server.registerTool('todo_add', {
       title: '加待办（经收件箱）',
       description: '给主人加一条待办。主人说「记得提醒我/要做 X/加个待办」时用。',
       inputSchema: { item: z.string().describe('待办事项，一句话') },
-    }, wrap('todo_add', async ({ item }) => inbox.addEntry({ kind: 'todo', content: item, client }), receiptText));
+    }, wrap('todo_add', async ({ item }) => inbox.addEntry({ kind: 'todo', content: item, client }), receiptText, null, 'todo'));
 
     server.registerTool('collections_upsert', {
       title: '加收藏条目（经收件箱）',
@@ -219,25 +235,25 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
         name: z.string().describe('收藏名（collections/ 下的目录名）'),
         row: z.record(z.string(), z.any()).describe('结构化字段，如 {name, city, cuisine, notes}'),
       },
-    }, wrap('collections_upsert', async ({ name, row }) => inbox.addEntry({ kind: 'collection', payload: { name, row }, client }), receiptText));
+    }, wrap('collections_upsert', async ({ name, row }) => inbox.addEntry({ kind: 'collection', payload: { name, row }, client }), receiptText, null, 'collection'));
 
     server.registerTool('remember', {
       title: '记住关于主人的事实（经收件箱）',
       description: '记录关于主人的稳定事实/偏好（跨 agent 共享记忆）。主人说「记住我…/我的偏好是…」时用。临时性、一次性的信息不要用这个。',
       inputSchema: { fact: z.string().describe('稳定事实或偏好，一句话') },
-    }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText));
+    }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText, null, 'memory'));
 
     server.registerTool('todo_done', {
       title: '标待办完成（经收件箱）',
       description: '把主人的某条待办标为已完成（挪进「已完成」小节）。主人说「X 做完了/完成了/搞定了」时用。item 写主人指的那条（原话即可，keeper 会对着清单精确匹配）。',
       inputSchema: { item: z.string().describe('主人说的哪条待办，原话') },
-    }, wrap('todo_done', async ({ item }) => inbox.addEntry({ kind: 'todo_done', content: item, client }), receiptText));
+    }, wrap('todo_done', async ({ item }) => inbox.addEntry({ kind: 'todo_done', content: item, client }), receiptText, null, 'todo_done'));
 
     server.registerTool('remove', {
       title: '删除库中内容（经收件箱）',
       description: '删除知识库中的某一页。仅当主人明确要求删除时使用（例：「把 X 那页删了」）——不要因为内容过时/你认为没用就主动删。keeper 会校验目标并执行；git 历史永远可找回；骨架区（governance/skills）禁删。',
       inputSchema: { what: z.string().describe('主人要删什么，原话或页路径（如 knowledge/xxx）') },
-    }, wrap('remove', async ({ what }) => inbox.addEntry({ kind: 'remove', content: what, client }), receiptText));
+    }, wrap('remove', async ({ what }) => inbox.addEntry({ kind: 'remove', content: what, client }), receiptText, null, 'remove'));
 
     server.registerTool('inbox_list', {
       title: '查收件箱',
@@ -253,10 +269,23 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
         ruling: z.string().describe('主人的裁定原话，一句话'),
       },
     }, wrap('inbox_resolve', async ({ id, ruling }) => inbox.resolveEntry({ id, ruling, via: client, viaTrust: trust }),
-      (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`));
+      (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`,
+      rulingAuditFields));
   }
 
   return server;
+}
+
+// 裁定埋点：把 resolveEntry 返回的 held→被裁定耗时并入审计（供 held 半衰期曲线）。
+// 件此前未被 held（held_ms=null）时只标 event，不带时长字段。
+function rulingAuditFields(r) {
+  const fields = { event: 'ruling' };
+  if (r && typeof r.held_ms === 'number') {
+    fields.held_at = r.held_at;
+    fields.resolved_at = r.resolved_at;
+    fields.held_ms = r.held_ms;
+  }
+  return fields;
 }
 
 // 审计里长内容截断（日志可读性；全文反正已在 inbox/git 里）
