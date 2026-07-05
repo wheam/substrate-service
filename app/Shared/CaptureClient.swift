@@ -14,7 +14,14 @@ struct PendingEntry: Codable, Identifiable {
     let status: String
     let received_at: String
     let hint: String?
+    let client: String?
     let excerpt: String
+    let content: String?
+}
+
+struct ResolveResponse: Codable {
+    let ok: Bool
+    let error: String?
 }
 
 struct KeeperEvent: Codable, Identifiable {
@@ -64,6 +71,22 @@ enum CaptureClient {
             throw CaptureError.server(decoded.error ?? "服务返回异常")
         }
         return decoded
+    }
+
+    static func resolve(id: String, ruling: String) async throws {
+        guard AppConfig.isConfigured, let endpoint = URL(string: AppConfig.serverURL + "/capture/resolve") else {
+            throw CaptureError.notConfigured
+        }
+        var req = URLRequest(url: endpoint, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(AppConfig.token)", forHTTPHeaderField: "Authorization")
+        req.httpBody = try JSONEncoder().encode(["id": id, "ruling": ruling])
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let decoded = try? JSONDecoder().decode(ResolveResponse.self, from: data)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200, decoded?.ok == true else {
+            throw CaptureError.server(decoded?.error ?? "裁定提交失败")
+        }
     }
 
     static func status() async throws -> StatusResponse {

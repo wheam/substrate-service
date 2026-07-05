@@ -19,13 +19,13 @@ export function createDeepSeekProvider({
     if (escalate) {
       // 升级档要的就是深想；预算须容得下 reasoning + JSON
       body.thinking = { type: 'enabled' };
-      body.max_tokens = 8000;
+      body.max_tokens = 16000;
     } else {
       // 主判官关思考：v4 默认开思考，reasoning 会吃光 max_tokens 致正文为空；
       // 且思考模式下 temperature 无效——关掉才真正可复现（判例回归的前提）
       body.thinking = { type: 'disabled' };
       body.temperature = 0;
-      body.max_tokens = 2000;
+      body.max_tokens = 6000;
     }
     const res = await fetchImpl(`${baseUrl}/chat/completions`, {
       method: 'POST',

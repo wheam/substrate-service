@@ -77,14 +77,27 @@ test('capture token 不能碰 /mcp（403）', async () => {
   assert.equal(res.status, 403);
 });
 
-test('GET /capture/status：设备 token 只见自己的件与事件，高信任全见', async () => {
+test('GET /capture/status：App 是收件审阅界面——capture 与高信任全见（含全文），并带 content', async () => {
   eventStore.push({ id: 'e1', client: 'app-ios', verdict: 'filed', detail: 'knowledge/x.md', summary: '已存', ts: 't1' });
   eventStore.push({ id: 'e2', client: 'cc-test', verdict: 'held', detail: '', summary: '待定夺', ts: 't2' });
   const mine = await (await fetch(`${baseUrl}/capture/status`, { headers: { Authorization: 'Bearer cap-token' } })).json();
-  assert.ok(mine.pending.every((p) => p.client === 'app-ios'));
-  assert.deepEqual(mine.events.map((e) => e.id), ['e1']);
+  assert.ok(mine.pending.length >= 1, 'capture token 应看到全部待处理件（含其他客户端投的）');
+  assert.ok(mine.pending.every((p) => typeof p.content === 'string' && p.content.length > 0), '带全文供审阅');
+  assert.deepEqual(mine.events.map((e) => e.id).sort(), ['e1', 'e2'], 'capture token 全见事件（心脏界面）');
   const all = await (await fetch(`${baseUrl}/capture/status`, { headers: { Authorization: 'Bearer high-token' } })).json();
   assert.deepEqual(all.events.map((e) => e.id).sort(), ['e1', 'e2']);
+});
+
+test('POST /capture/resolve：App 可裁定任意收件，落 owner_ruling + 通道标记', async () => {
+  const posted = await (await post('/capture', 'cap-token', { text: '待裁定的一条' })).json();
+  const res = await post('/capture/resolve', 'cap-token', { id: posted.id, ruling: '这条进待办' });
+  assert.equal(res.status, 200);
+  const raw = readFileSync(path.join(work, posted.path), 'utf8');
+  assert.match(raw, /owner_ruling: 这条进待办/);
+  assert.match(raw, /ruling_via: app-ios/);
+  assert.match(raw, /ruling_via_trust: capture/);
+  assert.equal((await post('/capture/resolve', 'cap-token', { id: 'nope', ruling: 'x' })).status, 400);
+  assert.equal((await post('/capture/resolve', null, { id: posted.id, ruling: 'x' })).status, 401);
 });
 
 test('eventStore：重启后从文件恢复', async () => {

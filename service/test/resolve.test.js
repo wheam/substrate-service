@@ -93,3 +93,14 @@ test('keeper：主人裁定进 prompt、按裁定执行、判例自动落 _cases
   assert.match(cases, /这是待办不是知识/);
   assert.match(git(origin, 'log', '--oneline', '-2'), /keeper/);
 });
+
+test('capture 通道的裁定无权触发删页：remove_page 校验直接不过', async () => {
+  const { work } = makeInstance();
+  const { validateDecision } = await import('../src/executor.js');
+  const decision = { disposition: 'canonical', zone: 'knowledge', action: 'remove_page', target: 'coffee-brewing', summary: 's', confidence: 0.99 };
+  const viaApp = validateDecision({ instanceDir: work, decision, entry: { ruling_via_trust: 'capture' } });
+  assert.equal(viaApp.ok, false);
+  assert.match(viaApp.reason, /无权删除|capture/);
+  const viaHigh = validateDecision({ instanceDir: work, decision, entry: { ruling_via_trust: 'high' } });
+  assert.equal(viaHigh.ok, true, '高信任通道的裁定可删');
+});

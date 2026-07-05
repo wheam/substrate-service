@@ -76,14 +76,15 @@ export function createInbox({ instanceDir, writer }) {
         return {
           id: get('id'), path: `inbox/${f}`, kind: get('kind'), status: get('status'),
           received_at: get('received_at'), hint: get('hint') || undefined,
-          excerpt: body.slice(0, 120),
+          client: get('client'), excerpt: body.slice(0, 120), content: body.slice(0, 2000),
         };
       });
     return { entries };
   }
 
-  // 主人裁定：把件复位为 pending 并携带 owner_ruling，keeper 下一轮按裁定执行并自动立判例
-  function resolveEntry({ id, ruling }) {
+  // 主人裁定：把件复位为 pending 并携带 owner_ruling，keeper 下一轮按裁定执行并自动立判例。
+  // via/viaTrust 记录裁定进来的通道——capture 通道的裁定在执行层被限权（如无权删页）。
+  function resolveEntry({ id, ruling, via, viaTrust }) {
     const { entries } = listEntries();
     const hit = entries.find((e) => e.id === id);
     if (!hit) {
@@ -95,8 +96,14 @@ export function createInbox({ instanceDir, writer }) {
     raw = raw
       .replace(/^status: .*$/m, 'status: pending')
       .replace(/^updated: .*$/m, `updated: ${new Date().toISOString().slice(0, 10)}`)
-      .replace(/^owner_ruling: .*\n/m, '');
-    raw = raw.replace(/^status: pending$/m, `owner_ruling: ${oneline(ruling)}\nstatus: pending`);
+      .replace(/^owner_ruling: .*\n/m, '')
+      .replace(/^ruling_via: .*\n/m, '')
+      .replace(/^ruling_via_trust: .*\n/m, '');
+    const rulingLines = [
+      `owner_ruling: ${oneline(ruling)}`,
+      ...(via ? [`ruling_via: ${oneline(via)}`, `ruling_via_trust: ${oneline(viaTrust ?? '')}`] : []),
+    ].join('\n');
+    raw = raw.replace(/^status: pending$/m, `${rulingLines}\nstatus: pending`);
     writeFileSync(abs, raw);
     const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling) };
     receipt.synced = writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` });

@@ -25,7 +25,7 @@ function badTarget(target) {
 }
 
 // 决定合法性校验（代码层，模型说什么不算数）
-export function validateDecision({ instanceDir, decision }) {
+export function validateDecision({ instanceDir, decision, entry }) {
   const d = decision ?? {};
   if (!DISPOSITIONS.has(d.disposition)) return { ok: false, reason: `disposition 不合法：${d.disposition}` };
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
@@ -43,6 +43,9 @@ export function validateDecision({ instanceDir, decision }) {
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_done 只能作用于 todo 区' };
     if (!d.target?.trim()) return { ok: false, reason: 'todo_done 缺 target（待办条目原文）' };
   } else if (d.action === 'remove_page') {
+    if (entry?.ruling_via_trust === 'capture') {
+      return { ok: false, reason: 'capture 通道（App）的裁定无权删除页面——删页请在高信任客户端（CC/Hermes）发起' };
+    }
     if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
     const slug = d.target.replace(/\.md$/, '');

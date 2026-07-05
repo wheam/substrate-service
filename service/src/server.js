@@ -105,14 +105,29 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     }
   });
 
-  // App 状态页：自己的待处理件 + keeper 裁决事件（高信任 token 可见全部）
+  // App 状态页 = 收件审阅心脏界面：capture 与高信任 token 全见（含全文）；低信任仅见自己的
   app.get('/capture/status', (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
-    const mineOnly = identity.trust !== 'high';
+    const mineOnly = identity.trust !== 'high' && identity.trust !== 'capture';
     const pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
     const events = (eventStore?.list() ?? []).filter((e) => !mineOnly || e.client === identity.client).slice(-100).reverse();
     return res.json({ ok: true, pending, events });
+  });
+
+  // App 定夺通道：裁定落 owner_ruling + 通道标记（capture 通道在执行层限权：无权触发删页）
+  app.post('/capture/resolve', (req, res) => {
+    const identity = identify(req);
+    if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    const { id, ruling } = req.body ?? {};
+    try {
+      const r = inbox.resolveEntry({ id, ruling, via: identity.client, viaTrust: identity.trust });
+      audit({ client: identity.client, tool: 'capture_resolve', args: { id, ruling }, ok: true });
+      return res.json({ ok: true, id: r.id, status: r.status });
+    } catch (e) {
+      audit({ client: identity.client, tool: 'capture_resolve', args: { id }, ok: false, error: e.message });
+      return res.status(400).json({ ok: false, error: e.message });
+    }
   });
 
   return app;
@@ -237,7 +252,7 @@ function buildMcpServer({ tools, inbox, identity, audit }) {
         id: z.string().describe('收件 id（inbox_list 可查）'),
         ruling: z.string().describe('主人的裁定原话，一句话'),
       },
-    }, wrap('inbox_resolve', async ({ id, ruling }) => inbox.resolveEntry({ id, ruling }),
+    }, wrap('inbox_resolve', async ({ id, ruling }) => inbox.resolveEntry({ id, ruling, via: client, viaTrust: trust }),
       (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`));
   }
 

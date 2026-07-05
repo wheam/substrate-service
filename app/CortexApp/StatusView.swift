@@ -6,6 +6,7 @@ struct StatusView: View {
     @State private var events: [KeeperEvent] = []
     @State private var errorText: String?
     @State private var showSettings = false
+    @State private var resolving: PendingEntry?
 
     var body: some View {
         NavigationStack {
@@ -26,12 +27,16 @@ struct StatusView: View {
                     }
                 }
                 if !pending.isEmpty {
-                    Section("⏳ keeper 处理中 / 待定夺") {
+                    Section("⏳ keeper 处理中 / 待定夺（点开可裁定）") {
                         ForEach(pending) { entry in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(entry.excerpt).lineLimit(2)
-                                Text("\(statusLabel(entry.status)) · \(entry.kind)")
-                                    .font(.footnote).foregroundStyle(.secondary)
+                            Button {
+                                resolving = entry
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(entry.excerpt).lineLimit(2).foregroundStyle(.primary)
+                                    Text("\(statusLabel(entry.status)) · \(entry.kind) · \(entry.client ?? "")")
+                                        .font(.footnote).foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
@@ -54,6 +59,9 @@ struct StatusView: View {
             }
             .sheet(isPresented: $showSettings, onDismiss: { Task { await refresh() } }) {
                 SettingsView()
+            }
+            .sheet(item: $resolving, onDismiss: { Task { await refresh() } }) { entry in
+                ResolveView(entry: entry, onResolved: {})
             }
             .refreshable { await refresh() }
             .task { await refresh() }
