@@ -103,6 +103,7 @@
   - 裁决功能**上移到主频道 agent**（不再需要专门开 App 看）。
   - 分享捕获入口（如刷 Twitter 分享进库）视作**「未来 agent 有没有入口」的问题，不由我们解决**；保留 `/capture` 端点（快捷指令 / webhook 仍可投），但**不把 App 当核心**。
   - 现有 iOS App 保留为实验件，不投入迭代，待观察。
+- **落点（M4.3 已实现）**：主动浮出 = primary 客户端工具成功响应**尾部 piggyback**「📥 待主人裁定 N 件」提示（防重复：held id 集合为 key，`NUDGE_TTL_MS`（默认 4h）窗口内只发一次；`inbox_list`/`inbox_resolve` 豁免）+ **per-client MCP instructions**（primary 附主频道房规 `PRIMARY_RULES`）+ **`/digest` primary 版**（房规 + 实时 held 摘要，只带 id/kind/计数）。push/pull 之争的裁决见 §9。
 
 ## 5. 安装模型（原则 A 落地）
 
@@ -173,8 +174,8 @@
 - **检索**：**默认纯词法（SQLite FTS5）**，语义（sqlite-vec + embedding）作一键升级档；**开不开由 M4.0 的「检索落空率」仪表用真实数据定**，不拍脑袋。
 - **分层落点**：用 **frontmatter `tier` 字段**（`raw` 住 inbox zone；keeper 归档后落真 zone 带 `tier: candidate|canonical`；`rejected` = `tier: rejected` 隔离可查）。晋升 = 翻字段，不搬文件、`content_id` 稳定。
 - **命名**：模式对外名暂定 **Governed Agent Memory / 受治理的 agent 记忆**（临时，不纠结）；**项目名保持 `substrate` 不改**。
+- **主频道「主动浮出」= 拉为主（M4.3 裁定）**：**不做 server push**——无状态 HTTP transport 没有 server→client 推送通道，改有状态 SSE 是架构手术、不值；且主频道 agent 只在主人对话时在场，push 没有常驻接收端。改**拉**，三条承接：① primary 客户端每次工具成功响应**尾部 piggyback** 一行「📥 待主人裁定 N 件」提示——浮出恰好发生在主人已在的那个对话里，零轮询成本；防重复 = held id 集合为 key，`NUDGE_TTL_MS`（默认 4h）窗口内只发一次，`inbox_list`/`inbox_resolve` 豁免（正在处置面里不再自扰）。② **不消费 MCP instructions 的宿主**（如 Hermes）用 primary token 定期拉 `/digest` 承接——digest 的 primary 版已含主频道房规 + 实时 held 摘要，等效于把「连接即下发」补成「拉取即保鲜」。③ 飞书 webhook 降为**哑兜底**通知。**安全红线**：piggyback 与 digest 的 held 摘要都**只带 id/kind/计数**，待裁件正文（= 对抗输入）绝不进提示面 / instructions / digest（与 M4.0 考卷同款威胁模型）。
 
 **仍开放**
-- 主频道 agent 如何「主动浮出」待裁件——agent 轮询工具，还是 push？不消费 instructions 的宿主怎么承接？（M4.3 再定）
 - 语义索引默认开的阈值：落空率到多少才值得引入 embedding 依赖？（M4.1 用 M4.0 的数据回答）
 - `epistemic_type` 由 keeper 判时产出，还是夜班回填历史页？（M4.4 定）
