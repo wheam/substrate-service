@@ -7,6 +7,12 @@ struct CaptureResponse: Codable {
     let error: String?
 }
 
+struct PendingOption: Codable, Identifiable {
+    let index: Int
+    let label: String
+    var id: Int { index }
+}
+
 struct PendingEntry: Codable, Identifiable {
     let id: String
     let path: String
@@ -17,6 +23,8 @@ struct PendingEntry: Codable, Identifiable {
     let client: String?
     let excerpt: String
     let content: String?
+    let reason: String?
+    let options: [PendingOption]?
 }
 
 struct ResolveResponse: Codable {
@@ -73,7 +81,13 @@ enum CaptureClient {
         return decoded
     }
 
-    static func resolve(id: String, ruling: String) async throws {
+    private struct ResolveRequest: Encodable {
+        let id: String
+        var ruling: String?
+        var option: Int?
+    }
+
+    static func resolve(id: String, ruling: String? = nil, option: Int? = nil) async throws {
         guard AppConfig.isConfigured, let endpoint = URL(string: AppConfig.serverURL + "/capture/resolve") else {
             throw CaptureError.notConfigured
         }
@@ -81,7 +95,7 @@ enum CaptureClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(AppConfig.token)", forHTTPHeaderField: "Authorization")
-        req.httpBody = try JSONEncoder().encode(["id": id, "ruling": ruling])
+        req.httpBody = try JSONEncoder().encode(ResolveRequest(id: id, ruling: ruling, option: option))
         let (data, response) = try await URLSession.shared.data(for: req)
         let decoded = try? JSONDecoder().decode(ResolveResponse.self, from: data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200, decoded?.ok == true else {

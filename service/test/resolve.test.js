@@ -104,3 +104,77 @@ test('capture 通道的裁定无权触发删页：remove_page 校验直接不过
   const viaHigh = validateDecision({ instanceDir: work, decision, entry: { ruling_via_trust: 'high' } });
   assert.equal(viaHigh.ok, true, '高信任通道的裁定可删');
 });
+
+test('listEntries：正文干净（不含 keeper 注记）、解析 held 人话原因与候选方案', async () => {
+  const { work } = makeInstance();
+  const writer = createWriter({ instanceDir: work });
+  const inbox = createInbox({ instanceDir: work, writer });
+  const r = inbox.addEntry({ kind: 'save', content: '原始内容一句话', client: 'cc-test' });
+  await r.synced;
+  // 模拟 keeper 置 held + 写候选方案块
+  const fs = await import('node:fs');
+  const abs = path.join(work, r.path);
+  let raw = fs.readFileSync(abs, 'utf8').replace(/^status: pending$/m, 'status: held');
+  raw += `\n---\n**keeper held**（2026-07-05T02:00:00Z）：local-only 在服务端无意义；keeper 决定 {"zone":"memory"}\n`;
+  raw += `\n<!--keeper-options\n${JSON.stringify({ options: [
+    { label: '存为临时旅行记忆（过期不保留）', decision: { disposition: 'canonical', zone: 'memory', action: 'merge_into', target: 'platforms-devices-and-smart-home', summary: 's1', confidence: 0.9 } },
+    { label: '扔掉别存', decision: { disposition: 'forbidden', zone: 'memory', action: 'merge_into', target: 'x', summary: 's2', confidence: 0.9, reject_reason: '主人选择不保存' } },
+  ] })}\n-->\n`;
+  fs.writeFileSync(abs, raw);
+  const e = inbox.listEntries().entries.find((x) => x.id === r.id);
+  assert.equal(e.content, '原始内容一句话', '正文不应包含 keeper 注记与候选块');
+  assert.match(e.reason, /local-only 在服务端无意义/);
+  assert.ok(!e.reason.includes('{'), '人话原因不应带原始 JSON');
+  assert.equal(e.options.length, 2);
+  assert.equal(e.options[0].label, '存为临时旅行记忆（过期不保留）');
+
+  // 选项裁定：resolveEntry({option:0}) → owner_ruling=label + 预批决定块
+  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'capture' });
+  await resolved.synced;
+  const after = fs.readFileSync(abs, 'utf8');
+  assert.match(after, /status: pending/);
+  assert.match(after, /owner_ruling: 存为临时旅行记忆/);
+  assert.match(after, /<!--owner-decision/);
+});
+
+test('keeper：预批决定直接执行不再重判；held 时自动生成候选方案块并在通知里列出', async () => {
+  const { work } = makeInstance();
+  const writer = createWriter({ instanceDir: work });
+  const inbox = createInbox({ instanceDir: work, writer });
+  const calls = [];
+  const provider = {
+    judge: async (req) => {
+      calls.push(req);
+      if (req.mode === 'options') {
+        return { json: { options: [
+          { label: '方案A：进待办', decision: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'A', confidence: 0.9 } },
+          { label: '方案B：扔掉', decision: { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'B', confidence: 0.9, reject_reason: '不保存' } },
+        ] }, model: 'pro', usage: {} };
+      }
+      return { json: { disposition: 'canonical', zone: 'nonexistent', action: 'new_page', target: 'x', summary: 'x', confidence: 0.99 }, model: 'flash', usage: {} };
+    },
+  };
+  const messages = [];
+  const keeper = createKeeper({
+    instanceDir: work, writer, provider,
+    notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
+    doctor: false,
+  });
+  const r = inbox.addEntry({ kind: 'save', content: '让主判失败的内容', client: 'cc-test' });
+  await r.synced;
+  const round1 = await keeper.processPending();
+  assert.equal(round1.held, 1);
+  const e = inbox.listEntries().entries.find((x) => x.id === r.id);
+  assert.equal(e.options.length, 2, 'held 后应带 pro 生成的候选');
+  assert.match(messages[0], /方案A：进待办/, '通知应列出候选');
+
+  // 主人点了方案A → 预批决定直接执行（不再调 judge）
+  const before = calls.length;
+  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'capture' });
+  await resolved.synced;
+  const round2 = await keeper.processPending();
+  assert.equal(round2.filed, 1);
+  assert.equal(calls.length, before, '预批决定不应再调用 LLM');
+  const fs2 = await import('node:fs');
+  assert.match(fs2.readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /让主判失败的内容/);
+});

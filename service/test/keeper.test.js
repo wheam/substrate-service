@@ -122,8 +122,9 @@ test('两轮低置信 → held 不猜、通知待定夺、件保留', async () =
   await receipt.synced;
   const result = await keeper.processPending();
   assert.equal(result.held, 1);
-  assert.equal(provider.calls.length, 2, '应升级重判一次');
+  assert.equal(provider.calls.length, 3, '升级重判一次 + held 后生成候选一次');
   assert.equal(provider.calls[1].escalate, true);
+  assert.equal(provider.calls[2].mode, 'options');
   const raw = readFileSync(path.join(work, receipt.path), 'utf8');
   assert.match(raw, /status: held/);
   assert.match(notifier.messages[0], /🤔.*待你定夺/s);

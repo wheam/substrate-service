@@ -1,52 +1,65 @@
 import SwiftUI
 
-/// 收件审阅：看全文 → 一句话裁定（或快捷键）→ keeper 按裁定执行并自动立判例。
+/// 收件审阅：干净正文 + keeper 的困惑（人话）+ 候选方案一键选；实在不对再自己写一句。
 struct ResolveView: View {
     let entry: PendingEntry
     let onResolved: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var ruling = ""
-    @State private var busy = false
+    @State private var busySubmit: Int? = nil   // 正在提交的候选 index；-1 = 自由文本
     @State private var errorText: String?
-
-    private let presets = ["进待办", "存进知识库", "记为关于我的事实", "扔掉别存"]
+    @State private var showFreeform = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("内容") {
+                Section("要存的内容") {
                     Text(entry.content ?? entry.excerpt)
                         .font(.callout)
                         .textSelection(.enabled)
-                }
-                Section("状态") {
-                    LabeledContent("状态", value: statusLabel)
                     if let hint = entry.hint, !hint.isEmpty {
-                        LabeledContent("意图提示", value: hint)
+                        Label(hint, systemImage: "tag")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
-                    LabeledContent("来源", value: entry.client ?? "-")
                 }
-                Section("你的裁定") {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack {
-                            ForEach(presets, id: \.self) { p in
-                                Button(p) { ruling = p }
-                                    .buttonStyle(.bordered)
-                                    .font(.footnote)
+                if let reason = entry.reason, !reason.isEmpty {
+                    Section("keeper 为什么拿不准") {
+                        Text(reason).font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+                if let options = entry.options, !options.isEmpty {
+                    Section("怎么处理？点一个") {
+                        ForEach(options) { opt in
+                            Button {
+                                Task { await submit(option: opt.index) }
+                            } label: {
+                                HStack {
+                                    Text("\(opt.index + 1)").bold().foregroundStyle(.secondary)
+                                    Text(opt.label).multilineTextAlignment(.leading)
+                                    Spacer()
+                                    if busySubmit == opt.index { ProgressView() }
+                                }
                             }
+                            .disabled(busySubmit != nil)
                         }
                     }
-                    TextField("一句话（如：这条进 todo / 并入某某页）", text: $ruling, axis: .vertical)
+                }
+                Section {
+                    DisclosureGroup("都不合适？自己说一句", isExpanded: $showFreeform) {
+                        TextField("如：这条进 todo / 并入某某页 / 扔掉", text: $ruling, axis: .vertical)
+                        Button {
+                            Task { await submit(option: nil) }
+                        } label: {
+                            if busySubmit == -1 { ProgressView() } else { Text("提交").frame(maxWidth: .infinity) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(busySubmit != nil || ruling.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
                     if let errorText {
                         Text(errorText).foregroundStyle(.red).font(.footnote)
                     }
-                    Button {
-                        Task { await submit() }
-                    } label: {
-                        if busy { ProgressView() } else { Text("提交裁定").frame(maxWidth: .infinity) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(busy || ruling.trimmingCharacters(in: .whitespaces).isEmpty)
+                } footer: {
+                    Text("来源：\(entry.client ?? "-") · 你的选择会成为 keeper 的判例，它下次会学乖")
                 }
             }
             .navigationTitle("待你定夺")
@@ -57,20 +70,15 @@ struct ResolveView: View {
         }
     }
 
-    private var statusLabel: String {
-        switch entry.status {
-        case "pending": return "排队中"
-        case "held": return "keeper 拿不准，等你"
-        case "rejected": return "已拒收"
-        default: return entry.status
-        }
-    }
-
-    private func submit() async {
-        busy = true
-        defer { busy = false }
+    private func submit(option: Int?) async {
+        busySubmit = option ?? -1
+        defer { busySubmit = nil }
         do {
-            try await CaptureClient.resolve(id: entry.id, ruling: ruling.trimmingCharacters(in: .whitespaces))
+            if let option {
+                try await CaptureClient.resolve(id: entry.id, option: option)
+            } else {
+                try await CaptureClient.resolve(id: entry.id, ruling: ruling.trimmingCharacters(in: .whitespaces))
+            }
             onResolved()
             dismiss()
         } catch {

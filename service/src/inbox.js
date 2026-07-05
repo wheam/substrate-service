@@ -72,11 +72,12 @@ export function createInbox({ instanceDir, writer }) {
       .map((f) => {
         const raw = readFileSync(path.join(dir, f), 'utf8');
         const get = (k) => raw.match(new RegExp(`^${k}: (.*)$`, 'm'))?.[1] ?? '';
-        const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '').trim();
+        const parsed = parseEntryBody(raw);
         return {
           id: get('id'), path: `inbox/${f}`, kind: get('kind'), status: get('status'),
           received_at: get('received_at'), hint: get('hint') || undefined,
-          client: get('client'), excerpt: body.slice(0, 120), content: body.slice(0, 2000),
+          client: get('client'), excerpt: parsed.content.slice(0, 120), content: parsed.content.slice(0, 2000),
+          reason: parsed.reason, options: parsed.options.map((o, i) => ({ index: i, label: o.label })),
         };
       });
     return { entries };
@@ -84,14 +85,23 @@ export function createInbox({ instanceDir, writer }) {
 
   // 主人裁定：把件复位为 pending 并携带 owner_ruling，keeper 下一轮按裁定执行并自动立判例。
   // via/viaTrust 记录裁定进来的通道——capture 通道的裁定在执行层被限权（如无权删页）。
-  function resolveEntry({ id, ruling, via, viaTrust }) {
+  function resolveEntry({ id, ruling, option, via, viaTrust }) {
     const { entries } = listEntries();
     const hit = entries.find((e) => e.id === id);
     if (!hit) {
       throw new Error(`找不到收件 ${id}。当前 inbox 里有：${entries.map((e) => `${e.id}(${e.status})`).join('、') || '（空）'}`);
     }
-    if (!ruling?.trim()) throw new Error('ruling 不能为空');
     const abs = path.join(instanceDir, hit.path);
+    let approvedDecision = null;
+    if (option !== undefined && option !== null) {
+      // 点选候选方案：取出该方案的完整决定作为预批，keeper 直接执行不再重判
+      const parsed = parseEntryBody(readFileSync(abs, 'utf8'));
+      const chosen = parsed.options[Number(option)];
+      if (!chosen) throw new Error(`没有候选方案 #${option}（共 ${parsed.options.length} 个）`);
+      ruling = chosen.label;
+      approvedDecision = chosen.decision;
+    }
+    if (!ruling?.trim()) throw new Error('ruling 不能为空');
     let raw = readFileSync(abs, 'utf8');
     raw = raw
       .replace(/^status: .*$/m, 'status: pending')
@@ -104,6 +114,10 @@ export function createInbox({ instanceDir, writer }) {
       ...(via ? [`ruling_via: ${oneline(via)}`, `ruling_via_trust: ${oneline(viaTrust ?? '')}`] : []),
     ].join('\n');
     raw = raw.replace(/^status: pending$/m, `${rulingLines}\nstatus: pending`);
+    raw = raw.replace(/<!--owner-decision\n[\s\S]*?\n-->\n?/g, '');
+    if (approvedDecision) {
+      raw += `\n<!--owner-decision\n${JSON.stringify(approvedDecision)}\n-->\n`;
+    }
     writeFileSync(abs, raw);
     const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling) };
     receipt.synced = writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` });
@@ -115,4 +129,32 @@ export function createInbox({ instanceDir, writer }) {
 
 function oneline(v) {
   return String(v ?? '').replace(/\s+/g, ' ').trim();
+}
+
+// 解析件的正文/keeper 注记/候选块/预批决定——inbox 与 keeper 共用，保证「主人看到的=干净正文」
+export function parseEntryBody(raw) {
+  const afterFm = raw.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  // 干净正文：keeper 注记（\n---\n**keeper …）与机器块之前的部分
+  const content = afterFm
+    .split(/\n---\n\*\*keeper /)[0]
+    .replace(/<!--keeper-options\n[\s\S]*?\n-->/g, '')
+    .replace(/<!--owner-decision\n[\s\S]*?\n-->/g, '')
+    .trim();
+  // 人话原因：最后一条 keeper held/rejected 注记，剥掉原始 JSON 尾巴
+  const notes = [...afterFm.matchAll(/\*\*keeper (?:held|rejected)\*\*（[^）]*）：([^\n]*)/g)];
+  let reason = notes.length ? notes[notes.length - 1][1] : '';
+  reason = reason.split('；keeper 决定')[0].split('{')[0].trim().replace(/[；;]$/, '');
+  // 候选方案（最后一个块为准）
+  const optBlocks = [...afterFm.matchAll(/<!--keeper-options\n([\s\S]*?)\n-->/g)];
+  let options = [];
+  if (optBlocks.length) {
+    try { options = JSON.parse(optBlocks[optBlocks.length - 1][1]).options ?? []; } catch { options = []; }
+  }
+  // 主人预批的决定（App 点选后写入）
+  const apBlocks = [...afterFm.matchAll(/<!--owner-decision\n([\s\S]*?)\n-->/g)];
+  let approvedDecision = null;
+  if (apBlocks.length) {
+    try { approvedDecision = JSON.parse(apBlocks[apBlocks.length - 1][1]); } catch { approvedDecision = null; }
+  }
+  return { content, reason, options, approvedDecision };
 }

@@ -34,6 +34,9 @@ struct StatusView: View {
                             } label: {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(entry.excerpt).lineLimit(2).foregroundStyle(.primary)
+                                    if let reason = entry.reason, !reason.isEmpty {
+                                        Text("🤔 \(reason)").font(.footnote).foregroundStyle(.orange).lineLimit(1)
+                                    }
                                     Text("\(statusLabel(entry.status)) · \(entry.kind) · \(entry.client ?? "")")
                                         .font(.footnote).foregroundStyle(.secondary)
                                 }
