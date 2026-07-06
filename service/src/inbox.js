@@ -57,8 +57,20 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
   function addEntry({ kind, content = '', hint, client, payload, status = 'pending', optionsBlock = null, queuedWrite = false }) {
     if (!KINDS.has(kind)) throw new Error(`未知的 kind：${kind}`);
     const scanTarget = `${content}\n${payload ? JSON.stringify(payload) : ''}\n${hint ?? ''}`;
+    // 凭据模式要求连续字符——把 key 用空格/换行/零宽字符切碎（`sk-ab cd ef…` / `sk-abcdefghij\n0123…` /
+    // 零宽空格夹在段间）即可逐段逃过 \bsk-[A-Za-z0-9]{20,} 之类。故【同时】扫原文与「折叠掉全部空白【及零宽/
+    // 格式字符】的副本」：任一命中即拒。只对折叠副本额外把关，不改任何模式；\b 前缀（如 \bsk-）在折叠后仍需
+    // 词边界，普通散文里 task/risk/disk 等含 sk 子串的词不在词边界起「sk-」，不会被误伤（见 inbox.test.js 的
+    // FP 护栏）。原文扫描保留：含内建空格的模式（PEM `-----BEGIN [A-Z ]*PRIVATE KEY-----`）折叠后反而不匹配，
+    // 靠原文这一遍兜住。隐形/组合字符同样能拆碎 key，且 \s 全漏：\p{Cf}=格式字符（零宽空格 U+200B /
+    // word-joiner U+2060 / BOM U+FEFF）、\p{Mn}/\p{Me}=组合标记（variation selector U+FE0F / combining
+    // grapheme joiner U+034F / 各类重音声调）、\p{Cc}=控制字符。故折叠副本扩为剥 [\s\p{Cf}\p{Mn}\p{Me}\p{Cc}]
+    //（需 u 标志）。这几类几近穷尽「视觉/功能可忽略、能隐形拆 key」的字符空间——可见字符（如 `sk-a.b.c`）拆
+    // key 会破坏其可用性、非有效攻击，不剥；\p{Mc}（可见的间距组合标记）FP 高且可见，不纳入。正常内容极罕见含
+    // 这些字符，剥后仅当巧合凑成词边界凭据前缀才误判（FP 面比纯空白略大但可控，见 inbox.test.js 组合标记 FP 护栏）。
+    const collapsedTarget = scanTarget.replace(/[\s\p{Cf}\p{Mn}\p{Me}\p{Cc}]+/gu, '');
     for (const pattern of CREDENTIAL_PATTERNS) {
-      if (pattern.test(scanTarget)) {
+      if (pattern.test(scanTarget) || pattern.test(collapsedTarget)) {
         throw new Error('拒收：内容含疑似密钥/凭据（红线：密钥原文绝不进库）。请脱敏后重试。');
       }
     }

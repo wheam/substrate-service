@@ -1,0 +1,37 @@
+# 本地单机 60 秒试用 —— 就这台机器，不上云。
+#
+# 用法（详见 run-local.md）：
+#   1) 起一个本地 bare repo 当实例远端：  ./instance-origin.git（run-local.md 教你 seed）
+#   2) 生成一把 token：                  openssl rand -hex 24  → 填进下面 TOKENS_JSON 的 <token>
+#   3) 启动：                            docker compose -f docker-compose.local.yml up --build
+#   4) 自验：  curl localhost:3000/healthz → {"ok":true,...}；接一个 MCP 客户端跑 search / save
+#
+# 诚实标注：库只活在【这台机器 + 本地 bare repo】，跨不了设备。手机 / 远程 fleet 要云形态
+# （README 顶部的 Deploy on Railway）。keeper 需 DEEPSEEK key，缺则只读降级：读工具照常，
+# 写入停在 inbox 不前进（keeper 不归档、recall 工具不注册）。
+services:
+  substrate:
+    build:
+      # Dockerfile 在 service/ 子目录，它的 COPY 相对 service/ —— build context 必须是 ./service。
+      context: ./service
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      # 本机目录当持久卷；实例会 clone 到 /data/instance（DATA_DIR 默认 /data）。
+      - ./data:/data
+      # 本地 bare repo 挂进容器，容器内用 file:///origin.git 当 REPO_URL（可读可写：keeper/写入要 push 回它）。
+      - ./instance-origin.git:/origin.git
+    environment:
+      # 必填 ①：实例 git URL。本地试用指上面挂进来的 bare repo。
+      REPO_URL: "file:///origin.git"
+      # 必填 ②：客户端 token 表（内联）。把 <token> 换成 openssl rand -hex 24 的真值。
+      # trust:high = 读写全量 + get_context + digest；channel:primary = 主频道（待裁件浮出）。
+      TOKENS_JSON: '{"<token>":{"client":"cc-local","trust":"high","channel":"primary"}}'
+      # DATA_DIR / PORT 与 server 默认一致，显式写出以便对照。
+      DATA_DIR: "/data"
+      PORT: "3000"
+      # 可选：keeper / recall 的 LLM key。取消注释并填真值即可让 keeper 归档、recall 上线。
+      # DEEPSEEK_API_KEY: "sk-..."
+      # 可选：审计另存到卷上文件（缺则只进 stdout / docker logs）。
+      # AUDIT_FILE: "/data/audit.jsonl"
