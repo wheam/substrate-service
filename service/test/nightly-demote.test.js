@@ -410,6 +410,9 @@ test('G1 displaySafePath：换行/制表/控制字符去除（强制单行），
   assert.match(safe, /&lt;.*&gt;/, '尖括号 → 实体'); assert.match(safe, /&#35;/, '井号 → 实体');
   assert.equal(displaySafePath('knowledge/coffee-brewing.md'), 'knowledge/coffee-brewing.md', '干净路径原样（零副作用）');
   assert.ok(displaySafePath('x'.repeat(500)).length <= 200, '长度上限截断');
+  // Unicode 行/段分隔符（U+2028/U+2029）：不属 Cc/Cf，却被多数渲染当换行——必须一并单行化，否则注入可另起行。
+  const uSep = displaySafePath('x\u2028- inject\u2029text');
+  assert.ok(!/[\u2028\u2029]/.test(uSep), 'U+2028/U+2029 已删除（强制单行不被 Unicode 分隔符破坏）');
 });
 
 test('G2（Finding3 digest 复现）formatNightlyDigest 页路径带换行+## 注入 → 无新行首 heading、注入被单行化+实体化', () => {

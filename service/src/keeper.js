@@ -111,7 +111,9 @@ export function caseLogSafe(s) {
 //   ③ 长度上限防灌长。幂等（实体化后不再含被匹配的裸字符）、ASCII 安全。
 export function displaySafePath(p) {
   return String(p ?? '')
-    .replace(/[\p{Cc}\p{Cf}]+/gu, '')                  // 控制字符（\r\n\t 等）+ 格式字符（零宽/BOM）→ 删，强制单行
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, '')      // 控制字符（\r\n\t 等）+ 格式字符（零宽/BOM）+ 行/段分隔符
+                                                       // （U+2028/U+2029：不属 Cc/Cf，却被多数渲染当换行 → 会破坏「强制
+                                                       // 单行」不变量、在 digest/日志里另起注入行）→ 一并删，强制单行
     .replace(/#/g, '&#35;')                            // 井号先编码（防注入 heading）——必须早于下方数字实体替换，
                                                        // 否则会把随后引入的 `&#96;`/`&#91;` 里的 # 二次编码成 &&#35;96;
     .replace(/`/g, '&#96;')                            // 反引号 → 实体（防行内码/围栏）
