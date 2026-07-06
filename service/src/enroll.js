@@ -19,7 +19,9 @@ const fail = (message, reason) => { const e = new Error(message); if (reason) e.
 // 兑换方可控输入的规范化（Codex Blocker#2）：ip 在 server 侧来自 x-forwarded-for，攻击者可放任意
 // 字节（包括码明文）——原样入账 = 状态文件被灌可控内容、还可能经 list() 出面。只收合法 IP 字面量：
 // XFF 取第一段、trim、node:net.isIP 验过才存，否则一律 null；45 = IPv6（含 IPv4-mapped）最大长度。
-const sanitizeIp = (raw) => {
+// export（Task 2 双审 Blocker#1）：server 层 /enroll 端点也要用这【同一实现】把 raw XFF 收口后再进 audit——
+// raw XFF 是兑换方可控，能塞 code/token 明文或换行注入污染审计行。单一实现避免两处漂移。
+export const sanitizeIp = (raw) => {
   const first = String(raw ?? '').split(',')[0].trim();
   return first.length <= 45 && net.isIP(first) ? first : null;
 };
@@ -87,8 +89,12 @@ export function createEnrollment({ statePath, now = Date.now, codeTtlMs = 900_00
       if (reserved.has(client)) throw fail(`client 名已被静态 TOKENS_JSON 占用：${client}`);
       if (nameTaken(client)) throw fail(`client 名已被占用：${client}（吊销后可复用）`);
       if (pending().length >= maxPendingCodes) throw fail(`未决 enrollment 码已达上限 ${maxPendingCodes}，先 enroll_revoke 清理`);
+      // 写读约束一致（Task 2 双审 Minor#4）：validState reload 时要求 note≤500 / created_by≤200，
+      // 落盘前就截断——否则超长 note 写得进、下次加载 validState 判不过 → enrolled token 全体 degraded 失效。
+      const safeNote = note == null ? null : String(note).slice(0, 500);
+      const safeCreatedBy = createdBy == null ? null : String(createdBy).slice(0, 200);
       const code = 'sbe_' + crypto.randomBytes(16).toString('hex');
-      const rec = { hash: sha256(code), client, trust, note: note ?? null, created_at: now(), created_by: createdBy ?? null, expires_at: now() + codeTtlMs, status: 'pending' };
+      const rec = { hash: sha256(code), client, trust, note: safeNote, created_at: now(), created_by: safeCreatedBy, expires_at: now() + codeTtlMs, status: 'pending' };
       state.codes.push(rec); persist();
       return { code, expiresAt: rec.expires_at, hash8: rec.hash.slice(0, 8) };
     },

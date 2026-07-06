@@ -16,6 +16,17 @@ test('mintCode 返回 sbe_ 码，账本只存 hash、无明文', () => {
   assert.ok(!raw.includes(code) && !raw.includes('sbe_'));
 });
 
+test('note/createdBy 写读约束一致：超长在 mintCode 落盘前截断，重启（重新 create）不 degraded', () => {
+  const e = createEnrollment({ statePath });
+  e.mintCode({ client: 'a', trust: 'low', note: 'x'.repeat(501), createdBy: 'y'.repeat(201) });
+  const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+  assert.ok(persisted.codes[0].note.length <= 500, 'note 落盘前截断到 ≤500');
+  assert.ok(persisted.codes[0].created_by.length <= 200, 'created_by 落盘前截断到 ≤200');
+  // 重启：同 statePath 重新 create → validState 通过、账本可用（不因超长 note 判 degraded）
+  const e2 = createEnrollment({ statePath });
+  assert.equal(e2.degraded, false, '写读约束一致 → reload 不 degraded');
+});
+
 test('trust 白名单：primary/任意值拒发', () => {
   const e = createEnrollment({ statePath });
   for (const trust of ['primary', 'admin', '', undefined]) {

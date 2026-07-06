@@ -7,7 +7,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createApp } from '../src/server.js';
-import { createEnrollment } from '../src/enroll.js';
+import { createEnrollment, sanitizeIp } from '../src/enroll.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -44,10 +44,10 @@ async function startApp(opts = {}) {
   return { baseUrl: `http://127.0.0.1:${server.address().port}`, audit, notify, enrollment, server };
 }
 
-async function mcpClient(baseUrl, token) {
+async function mcpClient(baseUrl, token, extraHeaders = {}) {
   const client = new Client({ name: 'test-client', version: '0.0.1' });
   await client.connect(new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}` } },
+    requestInit: { headers: { Authorization: `Bearer ${token}`, ...extraHeaders } },
   }));
   return client;
 }
@@ -221,6 +221,83 @@ test('限速全局桶：跨 IP 轮换伪造 XFF 绕过 per-IP，合计 30 次失
   }
   assert.equal(last.status, 429);
   assert.ok(audit.some((e) => e.event === 'enroll_rejected' && e.reason === 'rate_limited'), 'audit 应记 rate_limited（全局桶）');
+});
+
+// —— 双审修复 1（Blocker）：/enroll 审计的 ip 必须先过 sanitizeIp，raw XFF 明文/换行注入绝不进 audit ——
+test('审计不落 XFF 明文：把 code 塞进 X-Forwarded-For，audit 的 ip 不含 code 明文、换行注入清成 null', async () => {
+  const { baseUrl, audit } = await startApp();
+  const primary = await mcpClient(baseUrl, 'test-token-primary');
+  const code = await mintCode(baseUrl, primary, { client: 'xff', trust: 'high' });
+  await primary.close();
+
+  // 兑换成功，但 XFF 放 code 明文——sanitizeIp 应把非法 IP 落 null，绝不把 code 明文写进 audit。
+  const res = await fetch(`${baseUrl}/enroll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': code },
+    body: JSON.stringify({ code }),
+  });
+  assert.equal(res.status, 200);
+  assert.ok(!JSON.stringify(audit).includes(code), 'audit 不得含 XFF 里塞的 code 明文');
+  const redeemed = audit.find((e) => e.event === 'enroll_redeemed');
+  assert.equal(redeemed.ip, null, 'code 明文非合法 IP → ip 落 null');
+
+  // 兑换方可控的非法 IP（fetch 允许发送的 header 值）→ 落 null，不进 audit
+  const { baseUrl: b2, audit: a2 } = await startApp();
+  await fetch(`${b2}/enroll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': 'attacker-not-an-ip' },
+    body: JSON.stringify({ code: 'sbe_bogus' }),
+  });
+  const rej = a2.find((e) => e.event === 'enroll_rejected');
+  assert.equal(rej.ip, null, '非法 IP 的 XFF → ip 落 null');
+  assert.ok(!JSON.stringify(a2).includes('attacker-not-an-ip'), 'audit 不得含 XFF 里的非法值');
+
+  // 换行注入的收口在 sanitizeIp（server 用的【同一实现】）——fetch 客户端不让塞裸换行，故直接对函数断言：
+  // 换行/含码明文/垃圾 → null；合法 IP 列表取首段。这就是进 audit 前的唯一闸门。
+  assert.equal(sanitizeIp('1.2.3.4\ninjected'), null, '换行注入 → null');
+  assert.equal(sanitizeIp(code), null, 'code 明文 → null');
+  assert.equal(sanitizeIp('9.9.9.9, evil'), '9.9.9.9', '合法 IP 列表取首段');
+});
+
+// —— 双审修复 2（Major）：Host/XFH 注入污染铸码 prompt 的 baseUrl ——
+test('铸码 prompt 防钓鱼：无 PUBLIC_URL + XFH 注入 → prompt 含警告；配 publicUrl → 无警告、用配置值、忽略 XFH', async () => {
+  // 无 publicUrl（header-fallback）+ 伪造 x-forwarded-host
+  const { baseUrl } = await startApp();
+  const primary = await mcpClient(baseUrl, 'test-token-primary', { 'x-forwarded-host': 'evil.example', 'x-forwarded-proto': 'https' });
+  const created = await primary.callTool({ name: 'enroll_create', arguments: { client: 'phish-a', trust: 'high' } });
+  const text = created.content[0].text;
+  assert.match(text, /未配置 PUBLIC_URL|人工核对/, '无 PUBLIC_URL 时铸码 prompt 应有警告行');
+  await primary.close();
+
+  // 配了 publicUrl → 无警告、用配置值、忽略 XFH
+  const { baseUrl: b2 } = await startApp({ publicUrl: 'https://kb.example.com' });
+  const p2 = await mcpClient(b2, 'test-token-primary', { 'x-forwarded-host': 'evil.example' });
+  const c2 = await p2.callTool({ name: 'enroll_create', arguments: { client: 'phish-b', trust: 'high' } });
+  const t2 = c2.content[0].text;
+  assert.doesNotMatch(t2, /未配置 PUBLIC_URL/, '配了 publicUrl 应无警告');
+  assert.match(t2, /kb\.example\.com/, '应使用配置的 publicUrl');
+  assert.doesNotMatch(t2, /evil\.example/, '应忽略伪造的 x-forwarded-host');
+  await p2.close();
+});
+
+// —— 双审修复 3（Major）：缺 code / malformed JSON 的失败也要计限速 + 审计 ——
+test('缺 code / malformed 也计失败：连发空 body 触发 429，malformed 记 reason:malformed', async () => {
+  const { baseUrl, audit } = await startApp();
+  let saw400 = false, saw429 = false;
+  for (let i = 0; i < 10; i++) {
+    const r = await postEnroll(baseUrl, undefined); // body {}
+    if (r.status === 400) saw400 = true;
+    if (r.status === 429) saw429 = true;
+  }
+  assert.ok(saw400, '缺参先 400');
+  assert.ok(saw429, '缺参累计后触发 429（说明计入了限速）');
+  assert.ok(audit.some((e) => e.event === 'enroll_rejected' && e.reason === 'missing_code'), '缺参记 reason:missing_code');
+  assert.ok(audit.some((e) => e.event === 'enroll_rejected' && e.reason === 'rate_limited'), '累计后记 rate_limited');
+
+  const { baseUrl: b2, audit: a2 } = await startApp();
+  const res = await fetch(`${b2}/enroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{ not json' });
+  assert.equal(res.status, 400);
+  assert.ok(a2.some((e) => e.event === 'enroll_rejected' && e.reason === 'malformed'), 'malformed JSON 记 reason:malformed');
 });
 
 test('静态优先/零回归：静态 high token handshake instructions 正常 + search 读通', async () => {
