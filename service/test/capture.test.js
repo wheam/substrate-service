@@ -122,3 +122,66 @@ test('eventStore：重启后从文件恢复', async () => {
   assert.equal(s2.list().length, 1);
   assert.equal(s2.list()[0].id, 'a');
 });
+
+// ==================== D2（M4.6）：裁定面按通道收窄（服务端强制）====================
+// 直接往 work/inbox 写一个 maintenance/schema 件（模拟遗留/结构提案）。放最后跑，不扰前面按序的用例。
+async function seedInboxFile(id, kind) {
+  const fs = await import('node:fs');
+  const dir = path.join(work, 'inbox');
+  fs.mkdirSync(dir, { recursive: true });
+  const rel = `inbox/_2026-01-01-${id}.md`;
+  fs.writeFileSync(path.join(work, rel), [
+    '---', `title: 收件 ${id}`, 'created: 2026-01-01', 'updated: 2026-01-01', 'type: inbox',
+    `id: ${id}`, 'received_at: 2026-01-01T00:00:00.000Z', 'client: nightly', `kind: ${kind}`,
+    'keeper_held_at: 2026-01-01T00:00:00.000Z', 'status: held', '---', '', '一条治理提案正文\n',
+  ].join('\n'));
+  return { id, rel };
+}
+const statusJson = (token) =>
+  fetch(`${baseUrl}/capture/status`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json());
+
+test('D2 /capture/status：capture 通道不列 maintenance/schema（无权兑现的件不出现在待定夺列表）；高信任全见', async () => {
+  const mnt = await seedInboxFile('mnt00001-aa11', 'maintenance');
+  const sch = await seedInboxFile('sch00001-bb22', 'schema');
+  const cap = await statusJson('cap-token');
+  assert.ok(!cap.pending.some((p) => p.id === mnt.id), 'capture 不列 maintenance 件');
+  assert.ok(!cap.pending.some((p) => p.id === sch.id), 'capture 不列 schema 件');
+  // 但普通 capture/save 件照常可见（不误伤）
+  const posted = await (await post('/capture', 'cap-token', { text: 'D2 普通件仍可见' })).json();
+  assert.ok((await statusJson('cap-token')).pending.some((p) => p.id === posted.id), 'capture 件照常在列');
+  // 高信任 CC/Hermes 全见（它们有权裁这类件）
+  const hi = await statusJson('high-token');
+  assert.ok(hi.pending.some((p) => p.id === mnt.id), '高信任仍见 maintenance 件');
+  assert.ok(hi.pending.some((p) => p.id === sch.id), '高信任仍见 schema 件');
+});
+
+test('D2（Finding4 kind 归一）大小写/空白变体的 maintenance 件同样被 D2 挡住——展示面与执行面不再因变体失配', async () => {
+  // 伪造件 git pull 进来时 frontmatter 的 kind 是任意文本：`Maintenance`（大写）、` maintenance `（首尾空白）。
+  // 归一前它们绕过 CAPTURE_UNRULABLE_KINDS.has('maintenance') → 泄进 App 待定夺列表（无权兑现的按钮）。
+  const up = await seedInboxFile('mntup001-aa11', 'Maintenance');
+  const sp = await seedInboxFile('mntsp001-bb22', '  maintenance  ');
+  const cap = await statusJson('cap-token');
+  assert.ok(!cap.pending.some((p) => p.id === up.id), '大写 Maintenance 变体件不列（归一后被 D2 挡）');
+  assert.ok(!cap.pending.some((p) => p.id === sp.id), '带空白 maintenance 变体件不列');
+  // 入口裁定同样 403（listEntries 归一后 hit.kind 命中 CAPTURE_UNRULABLE_KINDS）
+  const res = await post('/capture/resolve', 'cap-token', { id: up.id, ruling: '批准' });
+  assert.equal(res.status, 403, '大写变体件裁定入口即 403');
+  assert.ok(!/owner_ruling:/.test(readFileSync(path.join(work, up.rel), 'utf8')), '未落 owner_ruling');
+});
+
+test('D2 /capture/resolve：capture 通道裁 maintenance/schema 在入口即 403（不再走到 keeper 才弹回）', async () => {
+  const mnt = await seedInboxFile('mnt00002-cc33', 'maintenance');
+  const res = await post('/capture/resolve', 'cap-token', { id: mnt.id, ruling: '批准删除' });
+  assert.equal(res.status, 403, '入口处拒（403），不落 owner_ruling');
+  assert.match((await res.json()).error, /不经手机裁定/);
+  // 入口拒 = 件未被改写（没有 owner_ruling 落盘 → 主人不会「判了→不算→重来」）
+  const raw = readFileSync(path.join(work, mnt.rel), 'utf8');
+  assert.ok(!/owner_ruling:/.test(raw), 'maintenance 件未落 owner_ruling（入口拦下，未触达 resolveEntry）');
+  // schema 件同样入口拒
+  const sch = await seedInboxFile('sch00002-dd44', 'schema');
+  assert.equal((await post('/capture/resolve', 'cap-token', { id: sch.id, ruling: '建' })).status, 403);
+  // 高信任仍可裁 maintenance（它有权兑现）→ 200，落 owner_ruling
+  const okRes = await post('/capture/resolve', 'high-token', { id: mnt.id, ruling: '这条我来处理' });
+  assert.equal(okRes.status, 200, '高信任裁 maintenance 放行');
+  assert.match(readFileSync(path.join(work, mnt.rel), 'utf8'), /owner_ruling: 这条我来处理/);
+});

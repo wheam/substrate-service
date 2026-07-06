@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, rmSync, mkdirSync
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { validateDecision, applyDecision, runDoctor } from './executor.js';
-import { parseEntryBody, approvalToken } from './inbox.js';
+import { parseEntryBody, approvalToken, normKind } from './inbox.js';
 
 // SKIP_LLM kinds（M4.4 D2）：提案件（schema/maintenance）直达主人、keeper 绝不 LLM 判它们。
 // 有主人预批决定 → 走现有校验执行流；无 → re-held 提示点选（纯文字裁定永不触发执行/清场，防误伤）。
@@ -98,6 +98,30 @@ export function caseLogSafe(s) {
   return String(s).replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
 }
 
+// displaySafePath（M4.6 Finding3）：净化【所有】写进 digest / notifier / maintenance-log 的页路径。
+// 威胁模型：这些路径是 git 文件名——POSIX 文件名除 `/` 与 NUL 外几乎无限制，攻击者可 push 一个名字里带
+// 换行 / Markdown / 控制字符的文件（如 `good.md\n\n## 系统注入`），裸拼进【高信任 /digest】（agent 的提示面）
+// 或【maintenance-log】（后续 agent 会读）即成注入：伪造新 heading、换行插指令、`[[wikilink]]`、`<script>`。
+// 口径与本文件 caseLogSafe（方括号实体化）+ doctor strip_code 对齐、并更进一步：
+//   ① 单行化 + 去噪：一切控制字符（含 \r\n\t）与 Unicode 格式字符（零宽空格/BOM/word-joiner）直接删除——
+//      消灭换行注入与隐形字符，强制路径落在一行；
+//   ② 危险 Markdown/HTML 字符实体化：反引号（行内码）、方括号（wikilink，与 caseLogSafe 同实体）、尖括号
+//      （HTML 标签）、井号（heading）——渲染仍显示原字符、但不再具语法效力（单行化后 # 只可能出现在行内，
+//      全量实体化最省心且对已有干净路径零副作用）；
+//   ③ 长度上限防灌长。幂等（实体化后不再含被匹配的裸字符）、ASCII 安全。
+export function displaySafePath(p) {
+  return String(p ?? '')
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, '')      // 控制字符（\r\n\t 等）+ 格式字符（零宽/BOM）+ 行/段分隔符
+                                                       // （U+2028/U+2029：不属 Cc/Cf，却被多数渲染当换行 → 会破坏「强制
+                                                       // 单行」不变量、在 digest/日志里另起注入行）→ 一并删，强制单行
+    .replace(/#/g, '&#35;')                            // 井号先编码（防注入 heading）——必须早于下方数字实体替换，
+                                                       // 否则会把随后引入的 `&#96;`/`&#91;` 里的 # 二次编码成 &&#35;96;
+    .replace(/`/g, '&#96;')                            // 反引号 → 实体（防行内码/围栏）
+    .replace(/\[/g, '&#91;').replace(/\]/g, '&#93;')   // 方括号 → 实体（防 [[wikilink]]，与 caseLogSafe 同款）
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;')       // 尖括号 → 实体（防 <script>/HTML）
+    .slice(0, 200);                                    // 长度上限
+}
+
 export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, approvals = new Map() }) {
   let running = false;
   // F4：夜班独立 in-flight 旗，与归档锁 running 解耦——长扫描/慢 push 不再阻塞下一次 pending 受理。
@@ -139,7 +163,9 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       (m?.[1] ?? '').split('\n').map((l) => l.match(/^(\w[\w-]*): (.*)$/)).filter(Boolean).map((x) => [x[1], x[2]])
     );
     const parsed = parseEntryBody(raw);
-    return { rel, ...fm, body: parsed.content, approved_decision: parsed.approvedDecision, raw };
+    // F4（Finding4）：kind 在此处一次性归一（trim+lowercase），令 keeper 的执行面判定（SKIP_LLM/maintenance
+    // 守卫、approvalToken 绑定）与 inbox.listEntries 的展示面判定看到完全一致的 kind（伪造件的大小写/空白变体不再分叉）。
+    return { rel, ...fm, kind: normKind(fm.kind), body: parsed.content, approved_decision: parsed.approvedDecision, raw };
   }
 
   function buildMaterials(entry) {
@@ -446,7 +472,12 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     // 还在扫时这轮不重入（跳过即可，下轮到期再跑）。
     if (nightly && !nightlyRunning) {
       nightlyRunning = true;
-      try { await nightly.maybeRun(); }
+      try {
+        // M4.6 迁移：先幂等收编真机遗留的夜班 maintenance 件（弹回删页提案 → 降级；断链报告 → 转维护日志），
+        // 再跑本轮扫描。migrateLegacy 清完即永久 no-op（新夜班不再产 maintenance），每 tick 调一次也几近零成本。
+        if (nightly.migrateLegacy) await nightly.migrateLegacy();
+        await nightly.maybeRun();
+      }
       catch (e) { console.error(`夜班本轮异常（不影响归档）：${e.message}`); }
       finally { nightlyRunning = false; }
     }

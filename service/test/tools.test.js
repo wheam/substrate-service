@@ -10,6 +10,15 @@ const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url))
 let instanceDir;
 let tools;
 
+// 在临时实例里现造一个收藏 CSV（M4.7 大表/字节预算/翻页用例需要比 fixture 更大的表）。
+// 沿用 tier 用例「往 temp 实例 writeFileSync 注入」的风格，不污染仓库 fixture。
+function writeCollection(name, header, rows) {
+  const dir = path.join(instanceDir, 'collections', name);
+  mkdirSync(dir, { recursive: true });
+  const csv = [header.join(','), ...rows.map((r) => r.join(','))].join('\n') + '\n';
+  writeFileSync(path.join(dir, 'data.csv'), csv);
+}
+
 before(() => {
   // 拷到临时目录，以便注入 .git/ 等 fixture 里没法提交的东西
   instanceDir = mkdtempSync(path.join(tmpdir(), 'substrate-instance-'));
@@ -113,6 +122,115 @@ test('collections_search：空 query 返回全部行；未知收藏名报可读�
   const { rows } = await tools.collectionsSearch({ name: 'restaurants', query: '' });
   assert.equal(rows.length, 2);
   await assert.rejects(() => tools.collectionsSearch({ name: 'nope', query: 'x' }), /restaurants/);
+});
+
+// ==== M4.7 collections_search v2：按列过滤 / 列投影 / 分页 / 字节预算 / truncated 契约 ====
+
+test('M4.7 向后兼容：{name,query} 旧形态返回形状与语义不变（含 total=收藏总行数，无 truncated）', async () => {
+  const r = await tools.collectionsSearch({ name: 'restaurants', query: '' });
+  assert.deepEqual(r.columns, ['id', 'name', 'city', 'cuisine', 'status', 'notes']);
+  assert.equal(r.total, 2);          // total 仍是收藏总行数（不因过滤改语义）
+  assert.equal(r.rows.length, 2);
+  assert.ok(!('truncated' in r), '未截断不带 truncated（与 search 风格一致）');
+  // 旧 query 仍是全字段大小写不敏感 contains
+  const q = await tools.collectionsSearch({ name: 'restaurants', query: '川菜' });
+  assert.equal(q.rows.length, 1);
+  assert.equal(q.rows[0].name, '样例川菜馆');
+});
+
+test('M4.7 where：按列子串过滤（大小写不敏感）；未知列报错并列出可用列，不回显行数据', async () => {
+  const hit = await tools.collectionsSearch({ name: 'restaurants', where: { cuisine: '日料' } });
+  assert.equal(hit.rows.length, 1);
+  assert.equal(hit.rows[0].name, 'Demo Ramen');
+  // 大小写不敏感
+  const ci = await tools.collectionsSearch({ name: 'restaurants', where: { name: 'demo ramen' } });
+  assert.equal(ci.rows.length, 1);
+  // 未知列：报错列出可用列、且不出现任何行数据
+  await assert.rejects(
+    () => tools.collectionsSearch({ name: 'restaurants', where: { nosuchcol: 'x' } }),
+    (e) => /nosuchcol/.test(e.message) && /cuisine/.test(e.message) && !/样例川菜馆/.test(e.message)
+  );
+  // 原型污染防御：__proto__/constructor 作为列名 = 未知列被拒（绝不当对象键索引）。
+  // 用 JSON.parse 造出真实的 own key '__proto__'（对象字面量 { __proto__: } 会走原型设置器，测不到）。
+  await assert.rejects(
+    () => tools.collectionsSearch({ name: 'restaurants', where: JSON.parse('{"__proto__":"x"}') }),
+    /没有这些列|__proto__/
+  );
+});
+
+test('M4.7 columns：列投影只返所选列；未知列报错', async () => {
+  const r = await tools.collectionsSearch({ name: 'restaurants', columns: ['name', 'city'] });
+  assert.equal(r.rows.length, 2);
+  assert.deepEqual(Object.keys(r.rows[0]), ['name', 'city']);
+  assert.deepEqual(r.columns, ['name', 'city']);
+  await assert.rejects(
+    () => tools.collectionsSearch({ name: 'restaurants', columns: ['name', 'bogus'] }),
+    (e) => /bogus/.test(e.message) && /name/.test(e.message)
+  );
+});
+
+test('M4.7 query + where 同时给 = AND', async () => {
+  // query 命中两行（空=全部），where 再收窄到 cuisine=川菜
+  const r = await tools.collectionsSearch({ name: 'restaurants', query: 'demo', where: { cuisine: '日料' } });
+  // 'demo' 全字段模糊命中 Demo Ramen 与 demo-sichuan(id) 两行；where cuisine=日料 只留 Demo Ramen
+  assert.equal(r.rows.length, 1);
+  assert.equal(r.rows[0].name, 'Demo Ramen');
+});
+
+test('M4.7 limit/offset 分页 + truncated 四件套 + offset 越界空返回', async () => {
+  const header = ['id', 'name'];
+  const rows = Array.from({ length: 120 }, (_, i) => [`c${i}`, `row-${i}`]);
+  writeCollection('cities', header, rows);
+
+  // 默认 limit=50，第一页：truncated 四件套齐备
+  const p1 = await tools.collectionsSearch({ name: 'cities' });
+  assert.equal(p1.rows.length, 50);
+  assert.equal(p1.total, 120);
+  assert.equal(p1.truncated, true);
+  assert.equal(p1.returned, 50);
+  assert.equal(p1.next_offset, 50);
+  assert.match(p1.hint, /where|columns|limit|翻页|offset/);
+
+  // 翻到末页：offset=100,limit=50 → 20 行，且不再 truncated
+  const last = await tools.collectionsSearch({ name: 'cities', offset: 100, limit: 50 });
+  assert.equal(last.rows.length, 20);
+  assert.ok(!last.truncated, '末页不再 truncated');
+  assert.equal(last.rows[0].name, 'row-100');
+
+  // offset 越界：空 rows 而非报错
+  const over = await tools.collectionsSearch({ name: 'cities', offset: 999 });
+  assert.equal(over.rows.length, 0);
+  assert.ok(!over.truncated);
+
+  // limit 非法（0/负/非整）报友好错误；offset 负数同理
+  await assert.rejects(() => tools.collectionsSearch({ name: 'cities', limit: 0 }), /limit/);
+  await assert.rejects(() => tools.collectionsSearch({ name: 'cities', limit: -3 }), /limit/);
+  await assert.rejects(() => tools.collectionsSearch({ name: 'cities', offset: -1 }), /offset/);
+});
+
+test('M4.7 limit 超上限被夹到 MAX_LIMIT（配合 truncated 仍可翻页，而非硬报错）', async () => {
+  const header = ['id', 'name'];
+  const rows = Array.from({ length: 300 }, (_, i) => [`c${i}`, `row-${i}`]);
+  writeCollection('big', header, rows);
+  const r = await tools.collectionsSearch({ name: 'big', limit: 100000 });
+  assert.equal(r.rows.length, 200, 'limit 夹到 MAX_LIMIT=200');
+  assert.equal(r.truncated, true);
+  assert.equal(r.next_offset, 200);
+});
+
+test('M4.7 字节预算：rows 序列化超预算从尾部裁行并标 truncated（next_offset 反映实裁行数）', async () => {
+  const header = ['id', 'a', 'b', 'c', 'd', 'e'];
+  const fat = 'x'.repeat(400); // 每字段 400 字符（= MAX_FIELD 满格）→ 每行约 2KB
+  const rows = Array.from({ length: 40 }, (_, i) => [`c${i}`, fat, fat, fat, fat, fat]);
+  writeCollection('fat', header, rows);
+
+  const r = await tools.collectionsSearch({ name: 'fat' }); // 默认 limit=50 > 40，故必由字节预算裁
+  assert.ok(r.rows.length >= 1 && r.rows.length < 40, '被字节预算从尾部裁掉一部分行');
+  assert.equal(r.truncated, true);
+  assert.equal(r.returned, r.rows.length);
+  assert.equal(r.next_offset, r.rows.length, 'offset=0 时 next_offset=实返行数');
+  // 如实标注：序列化后的 rows 确在预算内（40KB）
+  assert.ok(Buffer.byteLength(JSON.stringify(r.rows)) <= 40 * 1024);
 });
 
 test('M4.2 search 分层：默认只返 canonical；include=candidate 现候选页；rejected 隔离件仅高信任+include 可见', async () => {

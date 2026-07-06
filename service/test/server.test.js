@@ -60,13 +60,13 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   await client.close();
 });
 
-test('tools/list：高信任 = 5 读 + 6 写（含 schema_propose/apply）；低信任只有读且无 sensitive 通路', async () => {
+test('tools/list：高信任 = 5 读 + 7 写（含 schema_propose/apply、page_set_tier）；低信任只有读且无 sensitive 通路', async () => {
   const client = await mcpClient('test-token-high');
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
     'collections_search', 'collections_upsert', 'get_context', 'inbox_list', 'inbox_resolve',
-    'read_page', 'remember', 'remove', 'save', 'schema_apply', 'schema_propose', 'search',
+    'page_set_tier', 'read_page', 'remember', 'remove', 'save', 'schema_apply', 'schema_propose', 'search',
     'todo_add', 'todo_done', 'todo_list',
   ]);
   await client.close();
@@ -118,6 +118,50 @@ test('审计：search 的 include 字段——用了非默认档才记（默认�
     // 旧字段仍在（只加不改）
     assert.equal(typeof searchAudits[1].result_count, 'number');
     assert.equal(typeof searchAudits[1].hit, 'boolean');
+  } finally { srv.close(); }
+});
+
+test('M4.7 collections_search v2 端到端：where/columns/limit 经 zod 生效', async () => {
+  const client = await mcpClient('test-token-high');
+  // where 按列过滤 + columns 列投影
+  const wc = await client.callTool({ name: 'collections_search', arguments: { name: 'restaurants', where: { cuisine: '川菜' }, columns: ['name', 'city'] } });
+  const r = JSON.parse(wc.content[0].text);
+  assert.equal(r.rows.length, 1);
+  assert.deepEqual(Object.keys(r.rows[0]), ['name', 'city']);
+  // limit=1 触发 truncated 契约四件套
+  const lim = await client.callTool({ name: 'collections_search', arguments: { name: 'restaurants', limit: 1 } });
+  const l = JSON.parse(lim.content[0].text);
+  assert.equal(l.rows.length, 1);
+  assert.equal(l.truncated, true);
+  assert.equal(l.returned, 1);
+  assert.equal(l.next_offset, 1);
+  assert.ok(l.hint);
+  await client.close();
+});
+
+test('M4.7 审计：collections_search 记 result_count/total/truncated', async () => {
+  const auditLog = [];
+  const app2 = createApp({ instanceDir, tokens: TOKENS, audit: (e) => auditLog.push(e) });
+  const srv = await new Promise((res) => { const s = app2.listen(0, '127.0.0.1', () => res(s)); });
+  try {
+    const url = `http://127.0.0.1:${srv.address().port}/mcp`;
+    const client = new Client({ name: 'audit-client', version: '0.0.1' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { Authorization: 'Bearer test-token-high' } },
+    }));
+    await client.callTool({ name: 'collections_search', arguments: { name: 'restaurants' } });
+    await client.callTool({ name: 'collections_search', arguments: { name: 'restaurants', limit: 1 } });
+    await client.close();
+    const cs = auditLog.filter((e) => e.tool === 'collections_search');
+    assert.equal(cs.length, 2);
+    // 全量：2 行、total 2、未截断
+    assert.equal(cs[0].result_count, 2);
+    assert.equal(cs[0].total, 2);
+    assert.equal(cs[0].truncated, false);
+    // limit=1：1 行、total 2、截断
+    assert.equal(cs[1].result_count, 1);
+    assert.equal(cs[1].total, 2);
+    assert.equal(cs[1].truncated, true);
   } finally { srv.close(); }
 });
 
