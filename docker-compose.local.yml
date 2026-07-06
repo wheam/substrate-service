@@ -1,4 +1,4 @@
-# 本地单机 60 秒试用 —— 就这台机器，不上云。
+# 本地单机一条命令起（约 60 秒跑起来，无时限）—— 就这台机器，不上云。
 #
 # 用法（详见 run-local.md）：
 #   1) 起一个本地 bare repo 当实例远端：  ./instance-origin.git（run-local.md 教你 seed）

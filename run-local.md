@@ -2,7 +2,7 @@
 
 把整套 substrate 服务跑在**一台常开机器上**：keeper 本地跑、数据落本地 git。适合「就我自己 / 一台小服务器」先摸清它是什么，再决定要不要上云。
 
-> **诚实标注 —— 跨不了设备。** 本地形态里知识库只活在**这台机器 + 它的 git 远端**。手机捕获、远程 fleet（多台 CC / Hermes）要「够得着」，需要**云形态**（见 [README 顶部的 Deploy on Railway](README.md) / [INSTALL_FOR_AGENTS.md §4](INSTALL_FOR_AGENTS.md)）。本地试用的定位是「60 秒看懂它怎么工作」，不是终态。
+> **诚实标注 —— 跨不了设备。** 本地形态里知识库只活在**这台机器 + 它的 git 远端**。手机捕获、远程 fleet（多台 CC / Hermes）要「够得着」，需要**云形态**（见 [README 顶部的 Deploy on Railway](README.md) / [INSTALL_FOR_AGENTS.md §4](INSTALL_FOR_AGENTS.md)）。本地形态的定位是「约 60 秒跑起来、看懂它怎么工作」的入门与单机自用（跑起来就是完整服务，没有时限），只是不是跨设备的终态。
 >
 > **keeper 需要 DEEPSEEK key。** 不填 `DEEPSEEK_API_KEY` 也能起——但会**只读降级**：读工具（search / read_page / …）照常，写入（save / todo_add / …）会停在 `inbox/` 隔离区不前进（keeper 不归档、`recall` 工具不注册）。想看到「keeper 自动归档」，填一把 DeepSeek key 再起。
 

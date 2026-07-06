@@ -20,7 +20,7 @@
 ## 两条装法
 
 - **上云（完整形态，够得着手机 + 远程 fleet）** —— 把 [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md) 交给你已有的 agent（CC / Codex / Hermes），它按协议帮你在 Railway 搭；或照 [INSTALL_FOR_AGENTS.md §4](INSTALL_FOR_AGENTS.md) 自己手动建。约 $5/月起。（真·一键 button 待 owner 发布 Railway 模板后再上，见本文件顶部 TODO。）
-- **本地单机试用（无云，就这台机器）** —— 一台常开机器上 `node` 或 `docker compose` 起一份，60 秒看懂它怎么工作。见 **[run-local.md](run-local.md)**。诚实标注：本地形态跨不了设备（手机/远程 fleet 要上云）。
+- **本地单机（无云，就这台机器）** —— 一台常开机器上 `node` 或 `docker compose` 一条命令起一份，**约 60 秒就能跑起来**、看懂它怎么工作（跑起来就是完整服务，没有任何时限）。见 **[run-local.md](run-local.md)**。诚实标注：本地形态跨不了设备（手机/远程 fleet 要上云）。
 
 ### 部署到 Railway
 
@@ -52,7 +52,7 @@
 INSTALL_FOR_AGENTS.md  给 agent 的一段安装协议（交给你的 agent，它把服务搭起来）
 run-local.md           本地单机试用（无云）走查
 railway.json           Railway 部署契约（Dockerfile 构建 + /healthz 健康检查）
-docker-compose.local.yml  本地 60 秒试用（docker compose 路径）
+docker-compose.local.yml  本地单机一条命令起（docker compose 路径，约 60 秒跑起来）
 docs/       方案文档（含决策记录 + docs/05 模式对外版）
 service/    MCP server（Node 22 + 官方 SDK，service/Dockerfile 部署 Railway；npm test 跑全部测试）
 app/        iOS 捕获 App（/capture 投递端 + 分享扩展，实验件）
