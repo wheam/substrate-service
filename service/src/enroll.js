@@ -23,6 +23,11 @@ export function createEnrollment({ statePath, now = Date.now, codeTtlMs = 900_00
     writeFileSync(tmp, JSON.stringify(state, null, 2));
     renameSync(tmp, statePath);
   };
+  // identify 落盘节流的进程内账（hash → last_used_at 上次真正写盘的时间，本身不落盘）：
+  // 节流基准必须是「上次写盘时间」而非「上次内存值」——按内存 prev 比较的话，高频（间隔 <1h）
+  // token 每次都把 prev 推新、永远差不满 1h，磁盘 last_used_at 会冻结在重启后第一次使用。
+  // load 时用磁盘 last_used_at 打底；运行期兑换出的新 token 不在账上（?? 0 → 首次 identify 即写）。
+  const persistedAt = new Map(state.tokens.map((t) => [t.hash, t.last_used_at ?? 0]));
   const guard = () => { if (degraded) throw fail('enrollment 账本损坏，已降级只读——请人工检查 enroll-state.json'); };
   const liveTokens = () => state.tokens.filter((t) => !t.revoked_at);
   const pending = () => state.codes.filter((c) => c.status === 'pending');
@@ -54,19 +59,23 @@ export function createEnrollment({ statePath, now = Date.now, codeTtlMs = 900_00
       if (rec.status === 'redeemed') throw fail('enrollment 码已被使用（若你是合法接入方，这可能意味着码被抢注——请让主人立即吊销）', 'used');
       if (rec.status === 'expired' || now() > rec.expires_at) { rec.status = 'expired'; persist(); throw fail('enrollment 码已过期，请让主人重新铸一枚', 'expired'); }
       const token = 'sbk_' + crypto.randomBytes(24).toString('hex');
+      const tokenHash = sha256(token);
       rec.status = 'redeemed'; rec.redeemed_at = now(); rec.redeemed_ip = ip ?? null;
-      state.tokens.push({ hash: sha256(token), client: rec.client, trust: rec.trust, note: rec.note, created_at: now(), created_by: rec.created_by, redeemed_ip: ip ?? null, last_used_at: null, revoked_at: null });
+      state.tokens.push({ hash: tokenHash, client: rec.client, trust: rec.trust, note: rec.note, created_at: now(), created_by: rec.created_by, redeemed_ip: ip ?? null, last_used_at: null, revoked_at: null });
       persist();   // 先持久化再返回：返回过的 token 绝不能因崩溃变成「服务不认的孤儿」
-      return { token, client: rec.client, trust: rec.trust, hash8: rec.hash.slice(0, 8) };
+      // hash8 = 码的 hash（与 mint 事件链路对账）；token_hash8 = 新 token 的 hash（与 list() 的 token 对上）
+      return { token, client: rec.client, trust: rec.trust, hash8: rec.hash.slice(0, 8), token_hash8: tokenHash.slice(0, 8) };
     },
     identify(token) {
       if (degraded) return null;
       const t = liveTokens().find((x) => x.hash === sha256(String(token ?? '')));
       if (!t) return null;
-      const prev = t.last_used_at;
-      t.last_used_at = now();
+      t.last_used_at = now();   // 内存值每次照常更新，落盘与否只看 persistedAt
       // 落盘节流：每 token 至多每小时写一次（identify 在每个请求热路径上，不能每次都写盘）
-      if (!prev || t.last_used_at - prev >= 3_600_000) { try { persist(); } catch { /* 记账写失败不拦认证 */ } }
+      if (t.last_used_at - (persistedAt.get(t.hash) ?? 0) >= 3_600_000) {
+        try { persist(); persistedAt.set(t.hash, t.last_used_at); }
+        catch (e) { console.error(`enroll 账本 last_used_at 落盘失败（不拦认证，持续出现说明磁盘有恙）：${e.message}`); }
+      }
       return { client: t.client, trust: t.trust };
     },
     list() {

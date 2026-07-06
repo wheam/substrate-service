@@ -139,6 +139,33 @@ test('总量封顶 200：超出后删最旧的非 pending 码，token 不裁剪'
   assert.ok(codeClients.has(`c${N - 1}`), '最新的码应保留');
 });
 
+// ── Review 修复用例 ─────────────────────────────────────────────────────────
+
+test('identify 落盘节流：高频使用磁盘 last_used_at 至多滞后 1h，不冻结在首次', () => {
+  let t = 10 * 3_600_000;                       // 起点远大于 1h，保证首次 identify 即落盘
+  const e = createEnrollment({ statePath, now: () => t });
+  const { code } = e.mintCode({ client: 'hot', trust: 'low', createdBy: 'cc' });
+  const { token } = e.redeemCode({ code, ip: 'x' });
+  const diskLastUsed = () => JSON.parse(readFileSync(statePath, 'utf8')).tokens.find((x) => x.client === 'hot').last_used_at;
+  const t1 = t;
+  e.identify(token);                             // #1：落盘
+  assert.equal(diskLastUsed(), t1);
+  t += 1_800_000; e.identify(token);             // #2（+30min）：节流窗内，不写盘
+  assert.equal(diskLastUsed(), t1);
+  t += 1_800_000; e.identify(token);             // #3（+60min）：距上次【落盘】满 1h → 必须再写
+  // 旧实现按内存 prev（上次 identify 时间）比较，间隔恒 30min < 1h → 磁盘值永远冻结在 t1
+  assert.equal(diskLastUsed(), t1 + 3_600_000);
+});
+
+test('redeemCode 返回 token_hash8：与 list() 里该 token 的 hash8 一致；hash8 仍是码 hash（对账 mint）', () => {
+  const e = createEnrollment({ statePath });
+  const minted = e.mintCode({ client: 'audit', trust: 'low', createdBy: 'cc' });
+  const r = e.redeemCode({ code: minted.code, ip: 'x' });
+  assert.match(r.token_hash8, /^[0-9a-f]{8}$/);
+  assert.equal(r.hash8, minted.hash8);           // 码 hash 保留，供与 mint 事件链路对账
+  assert.equal(e.list().tokens.find((x) => x.client === 'audit').hash8, r.token_hash8);
+});
+
 test('revoke：返回吊销计数、对不存在对象抛错', () => {
   const e = createEnrollment({ statePath });
   const { code } = e.mintCode({ client: 'r1', trust: 'low', createdBy: 'cc' });
