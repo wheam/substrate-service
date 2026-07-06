@@ -335,12 +335,26 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
 
   server.registerTool('collections_search', {
     title: '查收藏',
-    description: '查主人的结构化收藏（行式主表），如 restaurants。name=收藏名，query=关键词（空=全部行）。主人问「我收藏过哪些 X / 我存的餐厅」时用。',
+    description:
+      '查主人的结构化收藏（行式主表），如 restaurants。name=收藏名，query=关键词全字段模糊（空=全部行）。' +
+      '主人问「我收藏过哪些 X / 我存的餐厅」时用。' +
+      '大表要先收窄再查，别一把全拉：用 where={列:子串} 按列过滤（与 query 是 AND）、columns=[列…] 只取需要的列做投影；' +
+      '要看全量用 limit+offset 翻页（默认每页 50）。返回里出现 truncated:true 就是结果被裁——照 hint 用 where/columns 收窄，' +
+      '或用 next_offset 作为下一页 offset 继续翻，别退化成反复小查询逐条核对。',
     inputSchema: {
       name: z.string().describe('收藏名（collections/ 下的目录名）'),
-      query: z.string().optional().describe('关键词，空=全部'),
+      query: z.string().optional().describe('关键词全字段模糊（大小写不敏感），空=全部'),
+      where: z.record(z.string(), z.string()).optional().describe('按列过滤 {列名: 子串}（大小写不敏感 contains，多列为 AND，与 query 也 AND）；未知列名会报错并列出可用列'),
+      columns: z.array(z.string()).optional().describe('列投影：只返回这些列（收窄响应体积的首选）；未知列名会报错'),
+      limit: z.number().int().min(1).optional().describe('每页行数，默认 50，上限 200（超则夹到上限）'),
+      offset: z.number().int().min(0).optional().describe('翻页起点行号，默认 0；配合 truncated 返回的 next_offset 翻页；越界返回空'),
     },
-  }, wrap('collections_search', tools.collectionsSearch, asJson));
+    // M4.7 埋点：result_count（实返行数）+ total（收藏总行数）+ truncated，供 M4.0 仪表把收藏查询纳入落空/截断口径。
+  }, wrap('collections_search', tools.collectionsSearch, asJson, (r) => ({
+    result_count: Array.isArray(r?.rows) ? r.rows.length : 0,
+    total: r?.total,
+    truncated: r?.truncated ?? false,
+  })));
 
   // ==== 写工具（高信任客户端）：全部只落 inbox 隔离区，keeper 审核后才入库 ====
   if (trust === 'high') {

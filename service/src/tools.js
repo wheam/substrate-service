@@ -9,6 +9,14 @@ const SEARCH_EXTS = new Set(['.md', '.csv', '.txt']);
 const MAX_RESULTS = 50;
 const MAX_SNIPPET = 200;
 const MAX_FIELD = 400;
+// M4.7 collections_search v2：
+// - MAX_LIMIT：limit 硬上限。为什么要有——防 agent 一把要求超大页绕过分页把整表拉进单次响应（真机事故根因）。
+//   为什么是 200 而非报错——超上限「夹到 200」比硬报错宽容：agent 拿到 200 行 + truncated + next_offset 能自己翻页
+//   补齐，不必因一个参数越界而整次失败。200 行足够密、又远低于会撑爆宿主的量级。
+// - MAX_ROWS_BYTES：rows 序列化后的字节预算（约 40KB）。为什么这个量级——对齐 Hermes 这类工具宿主「几十 KB」档，
+//   且给外层 JSON 包裹 + 主频道 nudge 尾注留余量。只预算 rows（列名/total 等元字段极小，不入账）。超预算从尾部裁行。
+const MAX_LIMIT = 200;
+const MAX_ROWS_BYTES = 40 * 1024;
 
 export function createTools({ instanceDir }) {
   const zones = () => parseZones(instanceDir); // 每次现读：git pull 可能更新 zones.md
@@ -124,7 +132,10 @@ export function createTools({ instanceDir }) {
     };
   }
 
-  async function collectionsSearch({ name, query }) {
+  // M4.7 collections_search v2：向后兼容 {name,query}，新增 where（按列过滤）/columns（列投影）/limit+offset（翻页）
+  // + 字节预算裁行 + truncated 契约（agent 自救）。约束：列名一律走 header 白名单比对（防原型污染、防回显行数据），
+  // 路径穿越防护（name 的 / 与 ..）不削弱。
+  async function collectionsSearch({ name, query, where, columns, limit, offset }) {
     const csvPath = path.join(instanceDir, 'collections', name ?? '', 'data.csv');
     if (!name || name.includes('/') || name.includes('..') || !existsSync(csvPath)) {
       const available = existsSync(path.join(instanceDir, 'collections'))
@@ -135,15 +146,78 @@ export function createTools({ instanceDir }) {
     }
     const records = parseCsv(readFileSync(csvPath, 'utf8'));
     const [header, ...dataRows] = records;
+
+    // 列名白名单校验：where 的键、columns 的每一项都必须是真实列名。只拿 header.includes 比对，绝不拿用户输入
+    // 当对象键去索引——__proto__/constructor 等自然落进「未知列」被拒。错误信息可列可用列名，但不回显任何行数据。
+    const whereObj = (where && typeof where === 'object' && !Array.isArray(where)) ? where : null;
+    const unknownIn = (names) => names.filter((c) => !header.includes(c));
+    if (whereObj) {
+      const bad = unknownIn(Object.keys(whereObj));
+      if (bad.length) throw new Error(`收藏「${name}」没有这些列：${bad.join('、')}，可用列：${header.join('、')}`);
+    }
+    if (columns) {
+      const bad = unknownIn(columns);
+      if (bad.length) throw new Error(`收藏「${name}」没有这些列：${bad.join('、')}，可用列：${header.join('、')}`);
+    }
+
+    // 分页参数：limit 正整数、超上限夹到 MAX_LIMIT（宽容，配合 truncated 仍可翻页）；offset 非负整数、越界返空。
+    const lim = Math.min(normPageArg(limit, MAX_RESULTS, 1, 'limit'), MAX_LIMIT);
+    const off = normPageArg(offset, 0, 0, 'offset');
+
+    // 过滤：query（全字段模糊，旧语义不变）与 where（按列模糊）AND；两者都大小写不敏感 contains。
     const needle = (query ?? '').trim().toLowerCase();
-    const rows = dataRows
-      .filter((r) => !needle || r.some((v) => v.toLowerCase().includes(needle)))
-      .slice(0, MAX_RESULTS)
-      .map((r) => Object.fromEntries(header.map((h, i) => [h, (r[i] ?? '').slice(0, MAX_FIELD)])));
-    return { name, columns: header, rows, total: dataRows.length };
+    const whereChecks = whereObj
+      ? Object.entries(whereObj).map(([col, sub]) => [header.indexOf(col), String(sub).toLowerCase()])
+      : [];
+    const matched = dataRows.filter((r) =>
+      (!needle || r.some((v) => v.toLowerCase().includes(needle))) &&
+      whereChecks.every(([i, sub]) => (r[i] ?? '').toLowerCase().includes(sub)));
+
+    // 列投影（未给=全列）+ 字段级 MAX_FIELD 截断（字段级截断不计入 truncated 契约）。
+    const project = columns ?? header;
+    const idxOf = project.map((h) => header.indexOf(h));
+    const toObj = (r) => Object.fromEntries(project.map((h, k) => [h, (r[idxOf[k]] ?? '').slice(0, MAX_FIELD)]));
+
+    const page = matched.slice(off, off + lim).map(toObj);
+    const limitCut = off + lim < matched.length; // 本页之后还有匹配行 = 被 limit 裁
+
+    // 字节预算：从尾部丢行直到 rows 序列化 ≤ MAX_ROWS_BYTES（至少保 1 行，避免整表空返）。
+    const { rows, byteCut } = trimToByteBudget(page, MAX_ROWS_BYTES);
+
+    const out = { name, columns: project, rows, total: dataRows.length };
+    // truncated 契约（关键，agent 要能自救）：凡被 limit 或字节预算裁，带四件套；未截断时省略（与 search 风格一致）。
+    if (limitCut || byteCut) {
+      out.truncated = true;
+      out.returned = rows.length;
+      out.next_offset = off + rows.length; // 下一页起点 = 本次 offset + 实返行数（字节裁少于 limit 时也对）
+      out.hint = '结果被截断：用 where 按列过滤、columns 只取需要的列来收窄，或用 limit+offset 翻页（next_offset 是下一页起点）。';
+    }
+    return out;
   }
 
   return { search, readPage, getContext, todoList, collectionsSearch };
+}
+
+// 分页入参校验：null=默认；否则必须是 ≥ min 的整数，非法即报友好错误（direct 调用防御——MCP 侧 zod 亦先挡一道）。
+function normPageArg(v, dflt, min, label) {
+  if (v == null) return dflt;
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < min) {
+    throw new Error(`${label} 必须是 ≥ ${min} 的整数`);
+  }
+  return v;
+}
+
+// 字节预算裁行：增量累加每行序列化字节（行 JSON + 分隔符，估值偏大更保守），超预算即从尾部截断。
+// 至少保 1 行：单行经 MAX_FIELD 限幅后仅几 KB，不会单行超 40KB 预算，保 1 行只是防御性兜底。
+function trimToByteBudget(rows, budget) {
+  const kept = [];
+  let used = 2; // "[]"
+  for (const row of rows) {
+    const b = Buffer.byteLength(JSON.stringify(row)) + 1; // +1 ≈ 逗号
+    if (kept.length && used + b > budget) return { rows: kept, byteCut: true };
+    kept.push(row); used += b;
+  }
+  return { rows: kept, byteCut: false };
 }
 
 // 最小 RFC4180 解析：引号字段、双引号转义、引号内换行
