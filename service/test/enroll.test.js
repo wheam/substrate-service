@@ -175,3 +175,80 @@ test('revoke：返回吊销计数、对不存在对象抛错', () => {
   assert.deepEqual(e.revoke({ client: 'r2' }), { revokedTokens: 0, cancelledCodes: 1 });
   assert.throws(() => e.revoke({ client: '查无此名' }));
 });
+
+// ── Codex 对抗 review 修复用例 ──────────────────────────────────────────────
+
+test('cancelled 码不可兑换：revoke 掉的码报 invalid；同名重铸后旧码仍 invalid、新码可兑且只产一把 token', () => {
+  const e = createEnrollment({ statePath });
+  const { code: old } = e.mintCode({ client: 'dup', trust: 'low', createdBy: 'cc' });
+  assert.deepEqual(e.revoke({ client: 'dup' }), { revokedTokens: 0, cancelledCodes: 1 });
+  // Blocker：旧实现只拒 redeemed/expired，cancelled 会落进发 token 分支
+  try { e.redeemCode({ code: old, ip: 'x' }); assert.fail('cancelled 码不应兑换成功'); }
+  catch (err) { assert.equal(err.reason, 'invalid'); }             // 按 invalid 拒，不泄露它曾存在
+  const { code: fresh } = e.mintCode({ client: 'dup', trust: 'low', createdBy: 'cc' });  // 吊销后同名重铸
+  try { e.redeemCode({ code: old, ip: 'x' }); assert.fail(); }
+  catch (err) { assert.equal(err.reason, 'invalid'); }             // 旧码依然 invalid
+  const r = e.redeemCode({ code: fresh, ip: 'x' });                // 新码正常兑换
+  assert.equal(r.client, 'dup');
+  assert.equal(e.list().tokens.length, 1);                         // 只产生一把 token
+});
+
+test('ip 是对抗输入：码明文当 ip 传入不落盘；XFF 取首段；垃圾存 null；IPv6 可存；list() 白名单不透传审计字段', () => {
+  const e = createEnrollment({ statePath });
+  const { code } = e.mintCode({ client: 'evil-ip', trust: 'low', createdBy: 'cc' });
+  e.redeemCode({ code, ip: code });                                // 攻击：把码明文塞进 ip（Task 2 里 ip 来自 x-forwarded-for）
+  const raw = readFileSync(statePath, 'utf8');
+  assert.ok(!raw.includes(code) && !raw.includes('sbe_'), '状态文件不得含码明文');
+  assert.ok(!JSON.stringify(e.list()).includes('sbe_'), 'list() 输出不得含码明文');
+  assert.ok(!('redeemed_ip' in e.list().tokens[0]), 'list() 白名单：redeemed_ip 留盘不出面');
+  const diskIp = (client) => JSON.parse(readFileSync(statePath, 'utf8')).tokens.find((t) => t.client === client).redeemed_ip;
+  const { code: c2 } = e.mintCode({ client: 'xff', trust: 'low', createdBy: 'cc' });
+  e.redeemCode({ code: c2, ip: '1.2.3.4, 10.0.0.1' });             // XFF 多跳：只取第一段
+  assert.equal(diskIp('xff'), '1.2.3.4');
+  const { code: c3 } = e.mintCode({ client: 'junk', trust: 'low', createdBy: 'cc' });
+  e.redeemCode({ code: c3, ip: 'not-an-ip' });
+  assert.equal(diskIp('junk'), null);                              // 非法字面量一律 null
+  const { code: c4 } = e.mintCode({ client: 'v6', trust: 'low', createdBy: 'cc' });
+  e.redeemCode({ code: c4, ip: '::1' });
+  assert.equal(diskIp('v6'), '::1');                               // 合法 IPv6 照存
+});
+
+test('合法 JSON 但结构损坏 → degraded 不崩：tokens 非数组 / trust 越白名单 / hash 非 hex / status 越白名单', () => {
+  const cases = [
+    JSON.stringify({ tokens: {}, codes: [] }),                     // 顶层结构坏（旧实现在 persistedAt 构造处 TypeError）
+    JSON.stringify({ tokens: [{ hash: 'a'.repeat(64), client: 'x', trust: 'admin', revoked_at: null }], codes: [] }),
+    JSON.stringify({ tokens: [{ hash: 'Z'.repeat(64), client: 'x', trust: 'low', revoked_at: null }], codes: [] }),
+    JSON.stringify({ tokens: [], codes: [{ hash: 'b'.repeat(64), client: 'x', trust: 'low', status: 'weird', expires_at: 0 }] }),
+  ];
+  for (const [i, content] of cases.entries()) {
+    const p = path.join(dir, `bad-${i}.json`);
+    writeFileSync(p, content);
+    const orig = console.error; console.error = () => {};          // 静音预期内的降级日志
+    let bad;
+    try { bad = createEnrollment({ statePath: p }); } finally { console.error = orig; }
+    assert.equal(bad.degraded, true, `case ${i} 应 degraded`);
+    assert.equal(bad.identify('sbk_' + 'a'.repeat(48)), null, `case ${i} identify 应全 null`);
+    assert.throws(() => bad.mintCode({ client: 'z', trust: 'low', createdBy: 'cc' }), undefined, `case ${i} 变更应抛错`);
+    assert.equal(readFileSync(p, 'utf8'), content, `case ${i} 损坏文件不得被覆盖`);
+  }
+});
+
+test('损坏日志不回显文件内容（JSON.parse 的 message 会带输入前缀，可能含 sbe_ 片段）', () => {
+  writeFileSync(statePath, 'sbe_' + 'f'.repeat(32) + ' not json'); // 明显假码明文开头的损坏内容
+  const logs = [];
+  const orig = console.error;
+  console.error = (...a) => logs.push(a.map(String).join(' '));
+  let bad;
+  try { bad = createEnrollment({ statePath }); } finally { console.error = orig; }
+  assert.equal(bad.degraded, true);
+  assert.ok(logs.length >= 1, '降级要有日志信号');
+  assert.ok(!logs.join('\n').includes('sbe_'), '日志不得回显文件内容');
+});
+
+test('reservedClients：静态 TOKENS_JSON 占用的名字拒发，大小写原样比对', () => {
+  const e = createEnrollment({ statePath, reservedClients: ['static-cc', 'Hermes'] });
+  assert.throws(() => e.mintCode({ client: 'static-cc', trust: 'low', createdBy: 'cc' }), /静态|TOKENS_JSON/);
+  assert.throws(() => e.mintCode({ client: 'Hermes', trust: 'low', createdBy: 'cc' }), /静态|TOKENS_JSON/);
+  e.mintCode({ client: 'hermes', trust: 'low', createdBy: 'cc' }); // 原样比对：hermes ≠ Hermes，可发
+  assert.ok(e.list().codes.some((c) => c.client === 'hermes'));
+});
