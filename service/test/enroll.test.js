@@ -252,3 +252,47 @@ test('reservedClients：静态 TOKENS_JSON 占用的名字拒发，大小写原�
   e.mintCode({ client: 'hermes', trust: 'low', createdBy: 'cc' }); // 原样比对：hermes ≠ Hermes，可发
   assert.ok(e.list().codes.some((c) => c.client === 'hermes'));
 });
+
+// ── Codex 复验补漏：validState 字段级校验 ──────────────────────────────────
+
+test('validState 字段级：缺 expires_at 的 pending 码 → degraded（否则 now()>undefined 恒 false = 永不过期码）', () => {
+  const content = JSON.stringify({ tokens: [], codes: [{ hash: 'c'.repeat(64), client: 'no-expiry', trust: 'low', status: 'pending', created_at: 1 }] });
+  writeFileSync(statePath, content);
+  const orig = console.error; console.error = () => {};
+  let bad;
+  try { bad = createEnrollment({ statePath }); } finally { console.error = orig; }
+  assert.equal(bad.degraded, true, '缺 expires_at 应 degraded');
+  assert.throws(() => bad.redeemCode({ code: 'sbe_' + 'f'.repeat(32), ip: 'x' }), /损坏/);
+  assert.equal(readFileSync(statePath, 'utf8'), content, '文件字节不得变');
+});
+
+test('validState 字段级：code 的 client 为对象 → degraded（否则可兑换并流进 list()）', () => {
+  const content = JSON.stringify({ tokens: [], codes: [{ hash: 'c'.repeat(64), client: { evil: 1 }, trust: 'low', status: 'pending', created_at: 1, expires_at: 9_000_000_000_000 }] });
+  writeFileSync(statePath, content);
+  const orig = console.error; console.error = () => {};
+  let bad;
+  try { bad = createEnrollment({ statePath }); } finally { console.error = orig; }
+  assert.equal(bad.degraded, true, 'client 非法类型应 degraded');
+  assert.equal(readFileSync(statePath, 'utf8'), content);
+});
+
+test('validState 向前兼容：真实写路径产的账本与缺可选键的老账本都不误伤', () => {
+  // 真实写路径样本：覆盖 redeemed_ip/redeemed_at、note:null 与 string、created_by 字符串、last_used_at
+  const e = createEnrollment({ statePath });
+  const { code } = e.mintCode({ client: 'compat', trust: 'high', note: '备注', createdBy: 'cc-static' });
+  const { token } = e.redeemCode({ code, ip: '1.2.3.4' });
+  e.identify(token);                                               // 写入 last_used_at
+  e.mintCode({ client: 'compat2', trust: 'low', createdBy: 'cc' });// 留一枚 pending（note 缺省 null）
+  const e2 = createEnrollment({ statePath });
+  assert.equal(e2.degraded, false, '自己写的账本不得被误伤');
+  assert.deepEqual(e2.identify(token), { client: 'compat', trust: 'high' });
+  // 缺可选键（无 redeemed_at/redeemed_ip/last_used_at/note/created_by）的最小老记录：只验类型/值域，不要求字段集
+  const p2 = path.join(dir, 'legacy.json');
+  writeFileSync(p2, JSON.stringify({
+    tokens: [{ hash: 'a'.repeat(64), client: 'legacy-tok', trust: 'low', created_at: 1, revoked_at: null }],
+    codes: [{ hash: 'b'.repeat(64), client: 'legacy-code', trust: 'low', status: 'expired', created_at: 1, expires_at: 2 }],
+  }));
+  const e3 = createEnrollment({ statePath: p2 });
+  assert.equal(e3.degraded, false, '缺可选键的老账本不得被误伤');
+  assert.equal(e3.list().tokens[0].client, 'legacy-tok');
+});

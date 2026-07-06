@@ -24,12 +24,22 @@ const sanitizeIp = (raw) => {
   return first.length <= 45 && net.isIP(first) ? first : null;
 };
 
-// 结构校验（Codex Major#3）：JSON.parse 过了不等于账本可用——{"tokens":{}} 这类「合法 JSON 但结构坏」
-// 会在后续数组操作处炸掉进程。任何一条不合格与 parse 失败同路径：degraded、不覆盖文件、服务不倒。
+// 结构校验（Codex Major#3 + 复验补漏）：JSON.parse 过了不等于账本可用——{"tokens":{}} 这类「合法
+// JSON 但结构坏」会在后续数组操作处炸掉进程；字段级坏值同样危险：缺 expires_at 的 pending 码令
+// now() > undefined 恒 false = 永不过期码，client 塞对象能一路流进 list()。任何一条不合格与 parse
+// 失败同路径：degraded、不覆盖文件、服务不倒。
+// 向前兼容原则：只验类型/值域、不要求字段集白名单——缺可选键（JSON 缺键读出 undefined）的老账本不误伤。
+const optInt = (v) => v == null || Number.isSafeInteger(v);                      // 可选时间戳：null/缺键 或 safe int
+const optStr = (v, max) => v == null || (typeof v === 'string' && v.length <= max);
+// created_by 是铸码方 client 名，静态 TOKENS_JSON 的名字不受 CLIENT_RE 约束——只验 string 类型+长度
 const validState = (s) =>
   Array.isArray(s?.tokens) && Array.isArray(s?.codes)
-  && s.tokens.every((t) => t && HASH_RE.test(t.hash ?? '') && TRUSTS.has(t.trust) && CLIENT_RE.test(t.client ?? ''))
-  && s.codes.every((c) => c && HASH_RE.test(c.hash ?? '') && TRUSTS.has(c.trust) && CODE_STATUSES.has(c.status));
+  && s.tokens.every((t) => t && HASH_RE.test(t.hash ?? '') && TRUSTS.has(t.trust) && CLIENT_RE.test(t.client ?? '')
+    && Number.isSafeInteger(t.created_at) && optInt(t.last_used_at) && optInt(t.revoked_at)
+    && optStr(t.note, 500) && optStr(t.created_by, 200) && optStr(t.redeemed_ip, 45))
+  && s.codes.every((c) => c && HASH_RE.test(c.hash ?? '') && TRUSTS.has(c.trust) && CODE_STATUSES.has(c.status)
+    && CLIENT_RE.test(c.client ?? '') && Number.isSafeInteger(c.created_at) && Number.isSafeInteger(c.expires_at)
+    && optStr(c.note, 500) && optStr(c.created_by, 200) && optInt(c.redeemed_at) && optStr(c.redeemed_ip, 45));
 
 export function createEnrollment({ statePath, now = Date.now, codeTtlMs = 900_000, maxPendingCodes = 10, reservedClients = [] } = {}) {
   let state = { tokens: [], codes: [] };
@@ -87,6 +97,8 @@ export function createEnrollment({ statePath, now = Date.now, codeTtlMs = 900_00
       const rec = state.codes.find((c) => c.hash === sha256(String(code ?? '')));
       if (!rec) throw fail('enrollment 码无效', 'invalid');
       if (rec.status === 'redeemed') throw fail('enrollment 码已被使用（若你是合法接入方，这可能意味着码被抢注——请让主人立即吊销）', 'used');
+      // 刻意冗余：sweep() 刚扫过一遍过期，这里对命中记录再测一次——两处各取样一次 now()，防两次取样
+      // 之间时钟跳变/翻页边界让过期码溜进发 token 分支。别当重复代码清理（Claude reviewer 备忘#4）。
       if (rec.status === 'pending' && now() > rec.expires_at) rec.status = 'expired';
       if (rec.status === 'expired') { persist(); throw fail('enrollment 码已过期，请让主人重新铸一枚', 'expired'); }
       // 只有 pending 且未过期才发 token（Codex Blocker#1）：cancelled 及任何未知 status 一律按
