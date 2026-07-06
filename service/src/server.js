@@ -9,7 +9,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createTools } from './tools.js';
 import { createAudit } from './audit.js';
-import { PRIMARY_RULES, instructionsFor } from './instructions.js';
+import { PRIMARY_RULES, instructionsFor, enrollProtocol } from './instructions.js';
+import { createEnrollment, sanitizeIp } from './enroll.js';
 import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
 import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
@@ -34,7 +35,12 @@ const NUDGE_EXEMPT = new Set(['inbox_list', 'inbox_resolve']);
 // （原则=不给人无权兑现的按钮）。keeper 层的通道限权守卫保留作纵深防御，本层只是把拦截前移到入口。
 const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema']);
 
-export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000, nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json') }) {
+export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000, nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json'),
+  // M4.8 enrollment 面：notify = 单向播报函数（接文本；来自 createNotifier().notify，enrollment 通知不依赖 provider）；
+  // enrollCodeTtlMs = 铸码有效期（进渲染文本/通知的「N 分钟」）；publicUrl = 对外基址（拼 curl/mcp add，来自 env）；
+  // enrollment = 账本实例（默认落 volume、实例 git 之外；reservedClients 传静态表的 client 名，enrollment 铸码不得撞名）。
+  notify = null, enrollCodeTtlMs = 900_000, publicUrl = null,
+  enrollment = createEnrollment({ statePath: path.resolve(instanceDir, '..', 'enroll-state.json'), codeTtlMs: enrollCodeTtlMs, reservedClients: Object.values(tokens).map((t) => t.client) }) }) {
   // 配置健全性：channel:primary 只在 high 客户端生效（主频道房规/nudge 依赖 inbox 工具，而 inbox 是 high-only）。
   // 标了 primary 却非 high = 无声失效的误配 —— 启动即告警点名，而不是运行期静默丢行为。
   for (const t of Object.values(tokens)) {
@@ -56,10 +62,14 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
   app.locals.approvals = approvals; // F1：keeper（isMain）经此拿到与 inbox 同一个批准登记表
 
+  // 两源合并，静态优先（M4.8 要点 1）：静态 TOKENS_JSON 命中就短路（行为零变化、连账本都不查）；
+  // 未命中再问 enrollment 账本（自助接入的 token）。enrollment.identify 返回 { client, trust }（无 channel——
+  // channel:primary 不经 enrollment 发出，故自助 token 永不进主频道分支）。账本降级时 identify 内部返回 null。
   const identify = (req) => {
     const auth = req.headers.authorization ?? '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-    return (token && tokens[token]) || null;
+    if (!token) return null;
+    return tokens[token] || enrollment.identify(token) || null;
   };
   app.use(express.json({ limit: '1mb' }));
 
@@ -106,6 +116,115 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
 
   app.get('/healthz', (_req, res) => res.json({ ok: true, ...state }));
 
+  // ==== M4.8 enrollment 面：/enroll（兑换）+ 主频道 MCP 工具的服务端支撑 ====
+  // 对外基址推导（要点 4 + 双审 Major#2）：返回 { url, source }。source 供铸码 prompt 判断是否要挂钓鱼警告。
+  //  · configured：来自 createApp 的 publicUrl（env PUBLIC_URL / RAILWAY_PUBLIC_DOMAIN）——可信，外部碰不到。
+  //  · header-fallback：无配置时按反代头 x-forwarded-proto/host 拼——XFH 是兑换方可控，可能被伪造成钓鱼域，
+  //    enroll_create 会在 prompt 顶部显式警告让主人人工核对（见 enrollCreateText）。
+  const publicUrlFor = (req) => publicUrl
+    ? { url: publicUrl, source: 'configured' }
+    : { url: `${req.headers['x-forwarded-proto'] ?? req.protocol}://${req.headers['x-forwarded-host'] ?? req.get('host')}`, source: 'header-fallback' };
+
+  // notify 单向播报：可能是异步（真飞书 webhook）也可能同步（测试收集数组）。一律 fire-and-forget——
+  // 兑换/铸码响应绝不该阻塞在 webhook 上；同步收集数组的 push 在 notify(text) 调用点即完成，测试可即时断言。
+  const fireNotify = (text) => {
+    if (!notify) return;
+    try { Promise.resolve(notify(text)).catch((e) => console.error(`enroll notify 失败：${e.message}`)); }
+    catch (e) { console.error(`enroll notify 失败：${e.message}`); }
+  };
+
+  // /enroll 兑换限速（要点 2 + review 硬化）：只计【失败】的固定窗计数。
+  //  · per-IP 桶：5 次失败/15 分钟/IP → 429。key = x-forwarded-for ?? req.ip（与审计同源）。
+  //    但 XFF 首段是兑换方可控、可轮换伪造绕过 per-IP 桶，故——
+  //  · 全局失败桶：任意来源合计 30 次失败/15 分钟 → 一律 429。码是 128-bit 熵、暴力不可行，
+  //    这只是审计噪音/资源的兜底闸，不是安全边界（安全边界是码的熵本身）。
+  const ENROLL_WINDOW_MS = 900_000, ENROLL_MAX_PER_IP = 5, ENROLL_MAX_GLOBAL = 30;
+  const enrollFails = new Map(); // ip -> { count, windowStart }（进程内、重启即清；丢的只是限速计数）
+  let enrollGlobal = { count: 0, windowStart: 0 };
+  const winCount = (bucket, now) => (bucket && now - bucket.windowStart < ENROLL_WINDOW_MS ? bucket.count : 0);
+  const enrollRateLimited = (ip) => {
+    const now = Date.now();
+    if (enrollFails.size > 1000) { // Map 封顶：超 1000 项时清掉已过窗的条目（防内存无限膨胀）
+      for (const [k, b] of enrollFails) if (now - b.windowStart >= ENROLL_WINDOW_MS) enrollFails.delete(k);
+    }
+    return winCount(enrollFails.get(ip), now) >= ENROLL_MAX_PER_IP || winCount(enrollGlobal, now) >= ENROLL_MAX_GLOBAL;
+  };
+  const recordEnrollFail = (ip) => {
+    const now = Date.now();
+    let b = enrollFails.get(ip);
+    if (!b || now - b.windowStart >= ENROLL_WINDOW_MS) { b = { count: 0, windowStart: now }; enrollFails.set(ip, b); }
+    b.count++;
+    if (now - enrollGlobal.windowStart >= ENROLL_WINDOW_MS) enrollGlobal = { count: 0, windowStart: now };
+    enrollGlobal.count++;
+  };
+
+  // GET /enroll：公开协议文本（要点 3，同 /healthz 档，无认证）。纯文本、无任何秘密/库内容。
+  app.get('/enroll', (req, res) => {
+    res.type('text/plain; charset=utf-8').send(enrollProtocol(publicUrlFor(req).url));
+  });
+
+  // POST /enroll：拿一次性码换专属 token（要点 2）。状态码：200 / 400 缺参|malformed / 401 invalid / 410 used|expired / 429 限速。
+  // ip 收口（双审 Blocker#1）：raw XFF 兑换方可控（能塞 code 明文/换行注入），一进函数就 sanitizeIp——
+  // 之后限速 key、audit 的 ip 字段、传给 redeemCode 的 ip 全用 cleanIp，raw header 绝不进任何 audit/日志。
+  app.post('/enroll', (req, res) => {
+    const cleanIp = sanitizeIp(req.headers['x-forwarded-for'] ?? req.ip);
+    if (enrollRateLimited(cleanIp)) {
+      audit({ event: 'enroll_rejected', reason: 'rate_limited', ip: cleanIp });
+      return res.status(429).json({ ok: false, error: '兑换尝试过于频繁，请稍后再试' });
+    }
+    const { code } = req.body ?? {};
+    if (!code || typeof code !== 'string') {
+      // 缺参也计失败 + 审计（双审 Major#3）：否则是限速漏洞（可无限刷）+ 无审计的扫描面。
+      recordEnrollFail(cleanIp);
+      audit({ event: 'enroll_rejected', reason: 'missing_code', ip: cleanIp });
+      return res.status(400).json({ ok: false, error: '缺少 code' });
+    }
+    try {
+      const r = enrollment.redeemCode({ code, ip: cleanIp });
+      // 审计只带 hash8（码/token 的 sha256 前缀，单向、与明文无关）；绝不带 code/token 明文。
+      audit({ event: 'enroll_redeemed', client: r.client, trust: r.trust, ip: cleanIp, code_hash8: r.hash8, token_hash8: r.token_hash8 });
+      // 通知不含 token（只有 hash8）——新 agent 接入是主人该知道的一类事件。
+      fireNotify(`✅ 新 agent 自助接入：${r.client}（trust=${r.trust}）用一次性码兑换了专属 token（码 ${r.hash8}… → token ${r.token_hash8}…）`);
+      const base = publicUrlFor(req).url;
+      return res.json({
+        ok: true, token: r.token, client: r.client, trust: r.trust,
+        mcp_url: `${base}/mcp`, digest_url: `${base}/digest`,
+        next: `用这把 token 按 ${base}/enroll 第 2 步自配置你的宿主（claude/codex mcp add 或定期拉 /digest）`,
+      });
+    } catch (e) {
+      recordEnrollFail(cleanIp);
+      const reason = e.reason ?? 'invalid';
+      // 通知策略（要点 2）：仅 used（重放=可疑抢注证据）打扰主人；invalid 是扫描噪音、expired 是自然过期，都不通知。
+      // 通知文本不带任何码值——redeemCode 抛错前未回传 hash8，也不该猜。
+      audit({ event: 'enroll_rejected', reason, ip: cleanIp });
+      if (reason === 'used') {
+        fireNotify(`⚠️ 有人拿一枚【已被使用】的 enrollment 码重复兑换（可能是抢注/重放）。若不是你在接入新 agent，请立即在主频道 enroll_revoke 相关 client。`);
+      }
+      const status = reason === 'invalid' ? 401 : 410; // used/expired → 410
+      return res.status(status).json({ ok: false, error: e.message });
+    }
+  });
+
+  // malformed JSON body（双审 Major#3）：express.json() 解析失败会 next(err)、绕过上面的路由 → 既不计限速也不审计。
+  // 只收口 /enroll POST 的 body 解析错误：按失败计数 + 审计（reason:'malformed'），其它路径/其它错误照原样交默认处理。
+  // 已知边界：超过 express.json 1MB 上限的 body 抛 entity.too.large（非 parse.failed），走 413 不计入限速桶；
+  // 大 body 攻击成本自限，不构成放大面。
+  app.use((err, req, res, next) => {
+    if (err?.type === 'entity.parse.failed' && req.method === 'POST' && req.path === '/enroll') {
+      const cleanIp = sanitizeIp(req.headers['x-forwarded-for'] ?? req.ip);
+      // 与缺 code 分支同款顺序：先查限速——不变量「所有 /enroll 失败路径超阈值都返 429」不留例外，
+      // 否则纯 malformed 洪泛会一直返 400、只污染桶挡别人却挡不住自己（双审复验残留）。
+      if (enrollRateLimited(cleanIp)) {
+        audit({ event: 'enroll_rejected', reason: 'rate_limited', ip: cleanIp });
+        return res.status(429).json({ ok: false, error: '兑换尝试过于频繁，请稍后再试' });
+      }
+      recordEnrollFail(cleanIp);
+      audit({ event: 'enroll_rejected', reason: 'malformed', ip: cleanIp });
+      return res.status(400).json({ ok: false, error: 'body 不是合法 JSON' });
+    }
+    return next(err);
+  });
+
   app.all('/mcp', async (req, res) => {
     const identity = identify(req);
     if (!identity) {
@@ -119,7 +238,9 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
 
     const primary = identity.channel === 'primary' && identity.trust === 'high';
-    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, audit, nudge: primary ? nudgeFor : null });
+    // enrollment 工具（仅主频道注册）需要账本 + notify + 按本请求推导的 publicUrl（拼可粘贴 prompt 里的 <publicUrl>/enroll）。
+    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, audit, nudge: primary ? nudgeFor : null,
+      enrollment, notify: fireNotify, tokens, enrollPublicUrl: publicUrlFor(req), enrollCodeTtlMs });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -234,17 +355,21 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   return app;
 }
 
-function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, audit, nudge = null }) {
+function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, audit, nudge = null,
+  enrollment = null, notify = null, tokens = {}, enrollPublicUrl = null, enrollCodeTtlMs = 900_000 }) {
   const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity) });
   const { client, trust } = identity;
 
   // auditFields(result, args)：可选，从工具结果/入参里抽结构化埋点字段并入审计条目（如 search 的 result_count/hit/query）。
   // captureKind：可选，标记这是「捕获/写入意图」的工具——成功/失败都记 event:'capture_attempt'（带 kind+source，
   //   成功再带 inbox entry id），供 metrics 把 MCP 面的写入与 /capture 端点统一计入捕获放弃率的分母。
+  // fn 收到 { ...args, trust }：identity.trust 覆盖同名入参键——这是刻意的 ACL 硬保证（客户端不能靠入参
+  // 伪造自己的 trust）。第二个参数 rawArgs = 未被覆盖的原始入参，供【确实需要读同名工具参数】的工具用
+  // （目前仅 enroll_create：它的 trust 是「给新 agent 铸什么档」的工具参数，与调用者自己的 identity.trust 撞名）。
   const wrap = (name, fn, render, auditFields, captureKind) => async (args) => {
     const t0 = Date.now();
     try {
-      const result = await fn({ ...args, trust });
+      const result = await fn({ ...args, trust }, args);
       const extra = auditFields ? auditFields(result, args) : null;
       const cap = captureKind ? { event: 'capture_attempt', id: result?.id, kind: captureKind, source: client } : null;
       audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ...(cap ?? {}), ...(extra ?? {}), ms: Date.now() - t0 });
@@ -455,9 +580,84 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
     }, wrap('page_set_tier', async ({ path: pagePath, tier }) => pageSetTier({ instanceDir, writer, indexStore, page: pagePath, tier }),
       (r) => `✅ 已把 ${r.page} 从 ${r.from} 调为 ${r.to}${r.from === r.to ? '（本就是该档，无改动）' : ''}`,
       (r) => ({ event: 'set_tier', page: r?.page, from: r?.from, to: r?.to })));
+
+    // ==== M4.8 enrollment 工具（要点 5/6）：铸码权收窄到【主频道】——high 且 channel:primary 才注册 ====
+    // 只在 primary 客户端可见：接入第 N 个 agent 是主人级治理动作（等价发新凭据），收敛到主人已在用的主对话。
+    // enrollment 账本降级时（enroll = null 不会发生，但 degraded 时）各方法内部 guard() 抛错 → wrap 走 isError。
+    if (identity.channel === 'primary' && enrollment) {
+      const ttlMin = Math.max(1, Math.round(enrollCodeTtlMs / 60_000));
+
+      server.registerTool('enroll_create', {
+        title: '铸一枚 enrollment 码（自助接入新 agent）',
+        description: '给一个新 agent 铸一枚一次性 enrollment 码——把响应里的整段 prompt 发给它，它读 /enroll 自助接入即可，无需你手工配 token。client=新 agent 的唯一名字；trust=high（读写全权）/low（只读）/capture（只投递，不能连 MCP）；note 可选备注。码单次有效、限时过期。',
+        inputSchema: {
+          client: z.string().describe('新 agent 的名字（唯一标识，A-Za-z0-9._-，1-64 位）'),
+          trust: z.enum(['high', 'low', 'capture']).describe('信任档：high=读写全权 / low=只读 / capture=只投递（channel:primary 不经此发出）'),
+          note: z.string().max(500).optional().describe('备注（可选，≤500 字），如用途/归属'),
+        },
+      }, wrap('enroll_create',
+        // 从 rawArgs 读工具参数：wrap 会用 identity.trust（恒 high）覆盖 merged.trust，故铸码的 trust/client/note
+        // 一律取原始入参。render 出的【码明文】只进本工具响应文本（给主频道 agent 转发那一次），绝不进审计/通知。
+        async (_merged, { client: enrollClient, trust: enrollTrust, note }) => {
+          const minted = enrollment.mintCode({ client: enrollClient, trust: enrollTrust, note, createdBy: client });
+          if (notify) notify(`🎫 已为新 agent「${enrollClient}」铸一枚 enrollment 码（trust=${enrollTrust}），${ttlMin} 分钟内单次有效；码只交给主频道 agent 转发，不入日志/通知。`);
+          return { code: minted.code, expiresAt: minted.expiresAt, hash8: minted.hash8, client: enrollClient, trust: enrollTrust };
+        },
+        (r) => enrollCreateText(r, enrollPublicUrl, ttlMin),
+        (r) => ({ event: 'enroll_code_created', enroll_client: r?.client, enroll_trust: r?.trust, code_hash8: r?.hash8 })));
+
+      server.registerTool('enroll_list', {
+        title: '查 enrollment 账本（谁有权接入）',
+        description: '列出静态配置 token（来自 TOKENS_JSON）与经 enrollment 自助接入的 token / 未决码。用于核对谁有权接入、谁的码还没兑、该吊销谁。',
+        inputSchema: {},
+      }, wrap('enroll_list', async () => enrollListView({ tokens, enrollment }), asJson));
+
+      server.registerTool('enroll_revoke', {
+        title: '吊销一个自助接入的 client',
+        description: '吊销经 enrollment 接入的某个 client：其 token 立即失效、未决码作废。token 泄漏或不再需要时用。注意：静态 TOKENS_JSON 里的 token 不在此列（那些去 Railway 变量面板删）。',
+        inputSchema: { client: z.string().describe('要吊销的 client 名（enroll_list 可查）') },
+      }, wrap('enroll_revoke', async ({ client: revokeClient }) => {
+          const r = enrollment.revoke({ client: revokeClient });
+          if (notify) notify(`🚫 已吊销自助接入 client「${revokeClient}」：${r.revokedTokens} 个 token 失效、${r.cancelledCodes} 枚未决码作废。`);
+          return { ...r, client: revokeClient };
+        },
+        (r) => `✅ 已吊销「${r.client}」：${r.revokedTokens} 个 token 失效、${r.cancelledCodes} 枚未决码作废。`,
+        (r) => ({ event: 'enroll_revoke', enroll_client: r?.client, revoked_tokens: r?.revokedTokens, cancelled_codes: r?.cancelledCodes })));
+    }
   }
 
   return server;
+}
+
+// enroll_create 响应文本（要点 6）：人话摘要 + 可粘贴 prompt 块。<code> 明文只在此出现一次（给主频道
+// agent 转发），是「明文绝不进审计/通知/日志」红线的唯一例外（响应体给兑换方那一次）。
+// publicUrl = { url, source }：source==='header-fallback'（服务端没配 PUBLIC_URL、baseUrl 来自可伪造的
+// 请求头）时，顶部挂钓鱼警告让主人人工核对域名（双审 Major#2）；configured 时无警告。
+function enrollCreateText(r, publicUrl, ttlMin) {
+  const base = publicUrl?.url ?? '<本服务地址>';
+  const lines = [];
+  if (publicUrl?.source === 'header-fallback') {
+    lines.push(`⚠️ 服务端未配置 PUBLIC_URL，下面链接的域名来自请求头、可能被伪造——请人工核对它确实是 <你的真实服务地址> 后再转发。`, ``);
+  }
+  lines.push(
+    `✅ 已铸 enrollment 码：${r.client}（trust=${r.trust}），${ttlMin} 分钟内单次有效。`,
+    `把下面整段发给新 agent：`,
+    `---`,
+    `你要接入主人的 substrate 知识库（受治理的 agent 记忆）。`,
+    `读 ${base}/enroll 按协议自助接入；你的一次性 enrollment 码：`,
+    r.code,
+    `（${ttlMin} 分钟内单次有效；换到的 token 是你的专属凭据，展示给主人时打码中段。）`,
+    `---`,
+  );
+  return lines.join('\n');
+}
+
+// enroll_list 视图（要点 5）：静态表【只出 value 的 client/trust/channel + source】——对象 key 是 token 明文，
+// 绝不出面（用 Object.values，永不 Object.keys）。enrolled/pending 走账本 list()（内部已是 hash8 白名单）。
+function enrollListView({ tokens, enrollment }) {
+  const staticTokens = Object.values(tokens).map((t) => ({ client: t.client, trust: t.trust, channel: t.channel ?? null, source: 'static' }));
+  const ledger = enrollment.list();
+  return { static_tokens: staticTokens, enrolled_tokens: ledger.tokens, pending_codes: ledger.codes };
 }
 
 // page_set_tier 工具入口：直连 executor.setPageTier（同一硬校验），writer.transact 内落盘+提交，之后刷新派生索引。
@@ -549,6 +749,9 @@ if (isMain) {
     KEEPER_NOTIFY_LEVEL = 'all',
     NUDGE_TTL_MS = 14_400_000,
     NIGHTLY_INTERVAL_MS = 604_800_000, // 夜班默认 7 天一轮；0=禁用
+    PUBLIC_URL,                        // M4.8：对外基址（拼 /enroll 里的 curl / mcp add 示例）
+    RAILWAY_PUBLIC_DOMAIN,             // Railway 注入的域名（无 scheme）——PUBLIC_URL 缺省时回落它
+    ENROLL_CODE_TTL_MS = 900_000,      // M4.8：enrollment 码有效期（默认 15 分钟）
   } = process.env;
   if (!REPO_URL || !TOKENS_JSON) {
     console.error('缺少 REPO_URL / TOKENS_JSON 环境变量');
@@ -574,8 +777,20 @@ if (isMain) {
     ? createDeepSeekProvider({ apiKey: DEEPSEEK_API_KEY, model: DEEPSEEK_MODEL, escalationModel: DEEPSEEK_ESCALATION_MODEL })
     : null;
 
+  // notifier 提前到 createApp 之前（M4.8 要点 7）：enrollment 通知（铸码/兑换/吊销）不依赖 provider——
+  // 降级模式（无 DEEPSEEK_API_KEY）下 keeper/夜班不跑，但 /enroll 仍要能通知主人。keeper/夜班复用【同一实例】。
+  const notifier = createNotifier({ webhookUrl: FEISHU_WEBHOOK_URL, secret: FEISHU_WEBHOOK_SECRET });
+  // 对外基址：PUBLIC_URL 优先；否则用 Railway 注入的域名补 https://（RAILWAY_PUBLIC_DOMAIN 无 scheme）；都无则 null（按反代头推导）。
+  const publicUrl = PUBLIC_URL ?? (RAILWAY_PUBLIC_DOMAIN ? `https://${RAILWAY_PUBLIC_DOMAIN}` : null);
+  // 双审 Major#2：都没配 → 铸码 prompt 的接入链接会依赖可伪造的请求头。不拒启（本地 dev 无配置也要能跑），
+  // 但启动即点名告警——生产环境务必配 PUBLIC_URL，否则 enroll_create 生成的链接有被导向钓鱼域的风险。
+  if (!publicUrl) {
+    console.warn('未配置 PUBLIC_URL（也无 RAILWAY_PUBLIC_DOMAIN）：enroll_create 生成的接入链接将依赖请求头、可被伪造，生产环境务必配置 PUBLIC_URL');
+  }
+
   // recall 复用 keeper 单写口增量刷新的【同一个】 indexStore，读到的是最新归档结果。
-  const app = createApp({ instanceDir, tokens, audit, eventStore, provider, indexStore, nudgeTtlMs: Number(NUDGE_TTL_MS) });
+  const app = createApp({ instanceDir, tokens, audit, eventStore, provider, indexStore, nudgeTtlMs: Number(NUDGE_TTL_MS),
+    notify: notifier.notify, publicUrl, enrollCodeTtlMs: Number(ENROLL_CODE_TTL_MS) });
   const state = app.locals.state;
 
   state.lastPull = await pullOnce(instanceDir);
@@ -591,7 +806,7 @@ if (isMain) {
   }, Number(PULL_INTERVAL_MS)).unref?.();
 
   if (provider) {
-    const notifier = createNotifier({ webhookUrl: FEISHU_WEBHOOK_URL, secret: FEISHU_WEBHOOK_SECRET });
+    // notifier 已在 createApp 之前建好（enrollment 通知复用同一实例）；keeper/夜班共用它。
     // 夜班（M4.4 D3）只在 provider 在场时挂：它的提案执行依赖 keeper 循环（tick 里勾 maybeRun），
     // 降级模式（无 key）下 keeper 不跑、夜班也不跑——文档口径不变。inbox 是无状态门面，另开一个实例
     // 安全（与写工具共用同一个单写者 writer，串行不打架；createApp 不动）。
