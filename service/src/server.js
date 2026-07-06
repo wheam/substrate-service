@@ -210,6 +210,12 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.use((err, req, res, next) => {
     if (err?.type === 'entity.parse.failed' && req.method === 'POST' && req.path === '/enroll') {
       const cleanIp = sanitizeIp(req.headers['x-forwarded-for'] ?? req.ip);
+      // 与缺 code 分支同款顺序：先查限速——不变量「所有 /enroll 失败路径超阈值都返 429」不留例外，
+      // 否则纯 malformed 洪泛会一直返 400、只污染桶挡别人却挡不住自己（双审复验残留）。
+      if (enrollRateLimited(cleanIp)) {
+        audit({ event: 'enroll_rejected', reason: 'rate_limited', ip: cleanIp });
+        return res.status(429).json({ ok: false, error: '兑换尝试过于频繁，请稍后再试' });
+      }
       recordEnrollFail(cleanIp);
       audit({ event: 'enroll_rejected', reason: 'malformed', ip: cleanIp });
       return res.status(400).json({ ok: false, error: 'body 不是合法 JSON' });

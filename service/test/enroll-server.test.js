@@ -300,6 +300,21 @@ test('缺 code / malformed 也计失败：连发空 body 触发 429，malformed 
   assert.ok(a2.some((e) => e.event === 'enroll_rejected' && e.reason === 'malformed'), 'malformed JSON 记 reason:malformed');
 });
 
+// —— 双审复验残留：malformed 洪泛自身也要走限速（所有 /enroll 失败路径超阈值都返 429，无例外）——
+test('malformed 洪泛也返 429：连发 malformed body → 第 6 次起 429（而非一直 400），audit 转 rate_limited', async () => {
+  const { baseUrl, audit } = await startApp();
+  const statuses = [];
+  for (let i = 0; i < 8; i++) {
+    const r = await fetch(`${baseUrl}/enroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{ not json' });
+    statuses.push(r.status);
+  }
+  // 前 5 次计失败返 400，第 6 次起限速返 429
+  assert.deepEqual(statuses.slice(0, 5), [400, 400, 400, 400, 400], '前 5 次 malformed 返 400（计失败）');
+  assert.ok(statuses.slice(5).every((s) => s === 429), '第 6 次起 malformed 洪泛返 429（不再一直 400）');
+  assert.ok(audit.some((e) => e.event === 'enroll_rejected' && e.reason === 'malformed'), 'malformed 计数');
+  assert.ok(audit.some((e) => e.event === 'enroll_rejected' && e.reason === 'rate_limited'), '到阈值后转 rate_limited');
+});
+
 test('静态优先/零回归：静态 high token handshake instructions 正常 + search 读通', async () => {
   const { baseUrl } = await startApp();
   const client = await mcpClient(baseUrl, 'test-token-high');
