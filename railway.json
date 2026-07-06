@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "//": "部署契约（完整说明见 README「部署到 Railway」与 INSTALL_FOR_AGENTS.md §4）：本文件在仓库根，Railway 无论 Root Directory 设成什么都从仓库根读它 —— 所以这里声明的 Dockerfile 构建 + healthcheck + 重启策略确实生效。① Root Directory 必须设为 service —— 本仓库的 Dockerfile 在 service/ 子目录，它的 COPY 相对 service/，Root Directory 不指到 service 则 build 会失败；注意 Root Directory 本身是面板/向导里的操作性设置，无法在本文件里声明，须手动设。② 加一个 mount path = /data 的持久卷 —— DATA_DIR 默认 /data，实例会 clone 到 /data/instance。③ 必填环境变量：REPO_URL（实例私有 repo 的 git URL）、TOKENS_JSON（客户端 token 表 JSON）；其余变量都有安全默认，全表见 INSTALL §4。DEEPSEEK_API_KEY 可选，缺则 keeper 不归档、recall 不注册（只读降级）。",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "service/Dockerfile"
+  },
+  "deploy": {
+    "healthcheckPath": "/healthz",
+    "healthcheckTimeout": 100,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
