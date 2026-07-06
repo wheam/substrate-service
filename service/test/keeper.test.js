@@ -7,10 +7,35 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
-import { createKeeper } from '../src/keeper.js';
+import { createKeeper, caseLogSafe } from '../src/keeper.js';
 import { readTier } from '../src/tier.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
+
+test('caseLogSafe：写进 _cases.md 的方括号全实体化，doctor 任何 strip 都拼不回 [[..]]（含对抗输入）', () => {
+  // 复刻 doctor 的链接抽取：先剥 ```围栏```/~~~/行内`码`，再抽 [[..]]
+  const extract = (t) =>
+    [...t.replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '').replace(/`[^`]*`/g, '').matchAll(/\[\[([^\]]+)\]\]/g)].map((m) => m[1]);
+  const attacks = [
+    '夜班发现断链：foo.md 里引用的 [[链接]] 与 [[wikilink]] 在全库没有对应页', // 原始 CI 误红文本
+    '[`x`[ghost]`y`]',              // 单括号隔行内码 → doctor strip 后拼回（Codex 抓的绕过）
+    '[```x```[fenced]```y```]',     // 隔围栏码
+    '[~~~x~~~[tilde]~~~y~~~]',      // 隔 ~~~ 码
+    '[[[[a]]]]',                    // 奇偶嵌套
+    '{"target":"[`x`[g]`y`]"}',     // 执行结果 JSON 里的 target poison
+  ];
+  // 防假绿：先证这些裸文本确实会被 doctor（strip 后）抽到链——否则测试是空的
+  assert.ok(extract('[`x`[ghost]`y`]').includes('ghost'), '前提：单括号隔码裸文本会被 doctor 拼回链');
+  assert.ok(extract('[[链接]]').includes('链接'), '前提：裸 [[..]] 会被抽到链');
+  for (const a of attacks) {
+    const safe = caseLogSafe(a);
+    assert.equal(/[[\]]/.test(safe), false, `不变量：输出零方括号 — ${a}`);
+    assert.deepEqual(extract(safe), [], `doctor 抽不到任何链 — ${a}`);
+  }
+  // 幂等 + 保形（无方括号文本原样）
+  assert.equal(caseLogSafe(caseLogSafe('[[a]]')), caseLogSafe('[[a]]'), '幂等');
+  assert.equal(caseLogSafe('普通文本无括号'), '普通文本无括号');
+});
 
 function git(cwd, ...args) {
   return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });

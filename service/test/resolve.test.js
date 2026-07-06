@@ -95,6 +95,29 @@ test('keeper：主人裁定进 prompt、按裁定执行、判例自动落 _cases
   assert.match(git(origin, 'log', '--oneline', '-2'), /keeper/);
 });
 
+test('注入防御 e2e：capture 正文/裁定里的 [[..]] 及绕过构造，归档进 _cases.md 后 doctor 抽不到任何断链', async () => {
+  const { work } = makeInstance();
+  const writer = createWriter({ instanceDir: work });
+  const approvals = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const keeper = createKeeper({
+    instanceDir: work, writer, approvals,
+    provider: { judge: async () => ({ json: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '进待办', confidence: 0.99 }, model: 'flash', usage: {} }) },
+    notifier: { notify: async () => ({ ok: true }) }, doctor: false,
+  });
+  // capture 正文含「单括号隔行内码」绕过构造 + 裸 [[..]]；裁定也塞一个 [[..]]
+  const r = inbox.addEntry({ kind: 'save', content: '记一条：[`x`[ghost-e2e]`y`] 以及 [[naked]]', client: 'cc-test' });
+  await r.synced;
+  const resolved = inbox.resolveEntry({ id: r.id, ruling: '进 todo，注意 [[wikilink]] 示例' });
+  await resolved.synced;
+  await keeper.processPending();
+  const cases = readFileSync(path.join(work, 'keeper-feedback', '_cases.md'), 'utf8');
+  // 硬不变量：归档后一个裸方括号都不剩 → doctor 无论怎么 strip 都拼不回 [[..]]
+  assert.equal(/[[\]]/.test(cases), false, `_cases.md 不得含裸方括号：\n${cases}`);
+  const extract = (t) => [...t.replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '').replace(/`[^`]*`/g, '').matchAll(/\[\[([^\]]+)\]\]/g)].map((m) => m[1]);
+  assert.deepEqual(extract(cases), [], 'doctor 在 _cases.md 抽不到任何链');
+});
+
 test('capture 通道的裁定无权触发删页：remove_page 校验直接不过', async () => {
   const { work } = makeInstance();
   const { validateDecision } = await import('../src/executor.js');

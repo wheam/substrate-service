@@ -37,6 +37,39 @@ function similarity(p, q) {
   return Math.max(jaccard(p.titleSet, q.titleSet), jaccard(p.bigramSet, q.bigramSet));
 }
 
+// 缩进代码块剥离——faithful port 自 doctor.py strip_indented_code：≥4 空格/tab 缩进、且前有空行（或文首）
+// 的连续行块（块内可夹空行）。保守：只剥前有空行的缩进块，避免吞掉真实链接（宁漏剥不误吞）。
+function stripIndentedCode(t) {
+  const lines = String(t).split('\n');
+  const out = [];
+  const ind = (s) => s.startsWith('    ') || s.startsWith('\t');
+  let prevBlank = true, i = 0;
+  const n = lines.length;
+  while (i < n) {
+    if (prevBlank && ind(lines[i]) && lines[i].trim()) {
+      while (i < n && ((ind(lines[i]) && lines[i].trim())
+                    || (lines[i].trim() === '' && i + 1 < n && ind(lines[i + 1]) && lines[i + 1].trim()))) i++;
+      prevBlank = false;
+      continue;
+    }
+    out.push(lines[i]);
+    prevBlank = lines[i].trim() === '';
+    i++;
+  }
+  return out.join('\n');
+}
+
+// 断链检测前剥代码，与 doctor.py strip_code 同款同序（```围栏``` → ~~~ → 缩进码块 → 行内`码`）：文档页里
+// `[[wikilink]]` 这类语法示例 doctor 不当实链，夜班也不该误判成断链去打扰主人。残余不一致再由 keeper 侧
+// caseLogSafe 兜底（归档零方括号，doctor 恒不误红）。
+function stripCode(s) {
+  return stripIndentedCode(
+    String(s)
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/~~~[\s\S]*?~~~/g, ''),
+  ).replace(/`[^`]*`/g, '');
+}
+
 export function createNightly({
   instanceDir, inbox, notifier, audit = () => {},
   intervalMs = 604_800_000, // 默认 7 天；0=禁用
@@ -123,11 +156,11 @@ export function createNightly({
     }
 
     // 断链：[[stem]]（管道/锚点后缀剥掉、带路径取末段）在全库无 <stem>.md。v0 只报告不修
-    // （executor 无文本编辑动作，自动改正文的风险大于收益）。
+    // （executor 无文本编辑动作，自动改正文的风险大于收益）。先 stripCode 对齐 doctor：代码里的示例链不算断链。
     const stems = allStems();
     for (const p of pages) {
       const seen = new Set();
-      for (const m of p.body.matchAll(/\[\[([^\]\n]+?)\]\]/g)) {
+      for (const m of stripCode(p.body).matchAll(/\[\[([^\]\n]+?)\]\]/g)) {
         const stem = m[1].split(/[|#]/)[0].trim().split('/').pop();
         if (!stem || stems.has(stem) || seen.has(stem)) continue;
         seen.add(stem);

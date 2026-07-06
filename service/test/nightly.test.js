@@ -341,6 +341,21 @@ test('2d scan 断链：[[stem]] 全库无对应 .md 才报；存在的不报', (
   assert.ok(!brokenLinks.some((b) => b.stem === 'coffee-brewing'), '存在的 [[coffee-brewing]] 不算断链');
 });
 
+test('2d-剥码 scan 断链：围栏/行内/缩进代码块里的 [[..]] 示例不误报（对齐 doctor），裸链仍报', () => {
+  const dir = makeDir();
+  padFixture(dir);
+  writePage(dir, 'knowledge/linker-code.md', {
+    title: '讲 wikilink 语法的页',
+    body: `${LONG_A}\n\n行内示例：\`[[inline-ghost]]\`。\n\n\`\`\`\n[[fenced-ghost]]\n\`\`\`\n\n缩进码块示例：\n\n    [[indented-ghost]]\n\n真正的裸链：[[naked-ghost]]`,
+  });
+  const stems = scanOnly(dir).scan().brokenLinks
+    .filter((b) => b.page === 'knowledge/linker-code.md').map((b) => b.stem);
+  assert.ok(stems.includes('naked-ghost'), `裸链 [[naked-ghost]] 仍应报：${JSON.stringify(stems)}`);
+  assert.ok(!stems.includes('inline-ghost'), '行内代码里的示例不应误判断链');
+  assert.ok(!stems.includes('fenced-ghost'), '代码围栏里的示例不应误判断链');
+  assert.ok(!stems.includes('indented-ghost'), '缩进代码块里的示例不应误判断链（对齐 doctor）');
+});
+
 test('2e scan 范围裁剪：README/_ 前缀/inbox/governance/keeper-feedback 一律不进扫描', () => {
   const dir = makeDir();
   padFixture(dir);

@@ -89,6 +89,15 @@ function maintenancePayloadMismatch(entry, decision) {
   return null;
 }
 
+// _cases.md（判例日志）引用任意 capture 内容（不可信），其中的 [[..]] 一旦落进日志会被 doctor 判实链 →
+// 断链（曾致 CI 误红，并连累 schema_apply 的 doctor 门控）。中和 = 把方括号全部 HTML 实体化（&#91;/&#93;）。
+// 为什么不「打断 [[ 邻接」：doctor 先 strip_code 再抽 [[..]]，`[`x`[g]`y`]` 这类「单括号隔着行内/围栏码」
+// 在 strip 后会拼回 [[g]] 绕过（Codex 对抗 review 实测）。唯有文本里根本不留 [ ]，才对任何 strip 行为免疫。
+// ASCII、幂等（&#91; 内无 [）、markdown 仍渲染为 [ ]。用在写进 _cases.md 的整段 block 上，字段无遗漏。
+export function caseLogSafe(s) {
+  return String(s).replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+}
+
 export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, approvals = new Map() }) {
   let running = false;
   // F4：夜班独立 in-flight 旗，与归档锁 running 解耦——长扫描/慢 push 不再阻塞下一次 pending 受理。
@@ -216,14 +225,16 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     const head = existsSync(abs)
       ? readFileSync(abs, 'utf8')
       : `---\ntitle: keeper 判例集\ntype: keeper-feedback\ncreated: ${d}\nupdated: ${d}\n---\n\n# keeper 判例集\n\n## 判例\n`;
-    const block = [
+    // 整段 block 过 caseLogSafe：输入/裁定/detail/JSON 里的 target 等任一不可信字段的 [ ] 全实体化，
+    // 无字段遗漏（Codex 抓到过 target 漏中和 + 单括号隔码绕过）。模板本身无结构性方括号，编码零副作用。
+    const block = caseLogSafe([
       '',
       `### ${d} ${entry.id}`,
       `- 输入：${entry.body.slice(0, 80).replace(/\n/g, ' ')}（kind=${entry.kind}${entry.hint ? `, hint=${entry.hint}` : ''}）`,
       `- 主人裁定：${entry.owner_ruling}`,
       `- 执行结果：${JSON.stringify({ zone: decision.zone, action: decision.action, target: decision.target })} → ${detail}`,
       '',
-    ].join('\n');
+    ].join('\n'));
     writeFileSync(abs, head.replace(/^updated: .*$/m, `updated: ${d}`) + block);
     return rel;
   }
