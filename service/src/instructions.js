@@ -27,3 +27,45 @@ export function instructionsFor(identity) {
     ? INSTRUCTIONS + PRIMARY_RULES
     : INSTRUCTIONS;
 }
+
+// GET /enroll 的公开自助接入协议（纯文本，无认证即可读——同 /healthz 档）。
+// 只讲「怎么用一次性码换 token、换到后怎么按宿主自配置、怎么自验、房规」——
+// 绝不含任何秘密、token、或库内容（GET /enroll 不认证，任何人可读）。baseUrl 由 server 按
+// 请求推导（PUBLIC_URL / 反代头），只用于拼 curl 与 mcp add 示例；示例里的码/token 全是占位符。
+export function enrollProtocol(baseUrl) {
+  return `# 接入主人的 substrate 知识库（自助 enrollment）
+
+你手上有一枚一次性 enrollment 码（形如 sbe_ 开头）。按下面三步自助接入，全程无需主人手工替你配 token。
+
+## 1. 用码换取你的专属 token
+把码 POST 到本服务的 /enroll，换回一把只属于你的 token：
+
+    curl -X POST ${baseUrl}/enroll \\
+      -H 'content-type: application/json' \\
+      -d '{"code":"<把你的一次性码粘这里>"}'
+
+成功返回 JSON：{ "ok": true, "token": "sbk_…", "client": "你的名字", "trust": "high|low|capture",
+  "mcp_url": "${baseUrl}/mcp", "digest_url": "${baseUrl}/digest", "next": "…" }
+码是一次性的：换成功即作废；换不到（提示过期/已被用/无效）就让主人重新铸一枚，别反复重试。
+换到的 token 是你的专属长期凭据——妥善保存，别写进任何会被分享/入库的文件；展示给主人时打码中段。
+
+## 2. 按你的宿主自配置
+- Claude Code：
+    claude mcp add --transport http substrate-kb ${baseUrl}/mcp --header "Authorization: Bearer <你的 token>"
+- Codex：
+    codex mcp add substrate-kb -- <你的宿主转 http 的命令>   # 传 --header "Authorization: Bearer <你的 token>"，token 走环境变量别硬编码
+- 不消费 MCP instructions 的宿主（如 Hermes）：用 token 定期拉 ${baseUrl}/digest（仅高信任可取），
+  把返回的常驻小抄注入你的常驻上下文（它会随服务更新、自带接入房规）。
+
+## 3. 自验清单（接通后跑一遍，INSTALL §7 子集）
+- GET ${baseUrl}/healthz 返回 200（服务在线）。
+- MCP 握手后能拿到 server instructions（房规）——拿不到说明 token/传输没配对。
+- 调一次 search 能读通库（例：搜一个你确信主人存过的词，有命中即读通）。
+- 若你是 high 信任：调一次 save 写一小条，回执显示「已受理」即写通（keeper 审核后才真正入库）。
+
+## 房规（接入即生效）
+- token 专属你一人，别与别的 agent 共用；一旦泄漏，立刻让主人在主频道 enroll_revoke 你这个 client，再重新铸码接入。
+- 读写一律走 substrate-kb 的 MCP 工具——不要直接 clone / 改本地知识库文件、不要对它跑 git；写入必须经 inbox 隔离区由 keeper 审核归档。
+- 查无不编：工具返回空就直说「库里没存过」；写入回执 ≠ 已入库，说「已受理，keeper 会归档并通知主人」。
+`;
+}
