@@ -23,13 +23,13 @@ function makeDir() {
   return dir;
 }
 
-function writePage(root, rel, { title, body, tier = null }) {
+function writePage(root, rel, { title, body, tier = null, created = '2026-01-01' }) {
   mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
   const fm = [
     '---',
     `title: ${title}`,
     ...(tier ? [`tier: ${tier}`] : []),
-    'created: 2026-01-01',
+    `created: ${created}`,
     'updated: 2026-01-01',
     'type: knowledge',
     '---',
@@ -279,16 +279,17 @@ function scanOnly(dir) {
 // >200 字符的「厚页」正文样板（薄页阈值以上）
 const LONG_A = '冲煮参数的完整记录：水温九十二度，粉水比一比十五，研磨度中细，闷蒸三十秒注水六十克，第二段注水到一百八十克，第三段收尾到二百二十五克，总时长两分三十秒。浅烘豆整体提高两度水温，深烘豆降低三度并放粗研磨。出品偏酸就升温或磨细，出品偏苦就降温或放粗。滤杯用锥形单孔，滤纸提前润湿去纸味，分享壶预热。豆子养豆七到十四天风味最稳定，开封后两周内用完为佳。手冲之外偶尔做法压，粉水比放宽到一比十二，浸泡四分钟压杆，口感更厚重。周末待客用虹吸壶，仪式感强但清洗麻烦。';
 
-test('2a scan 去重：正文前 500 字符 bigram 相似 ≥0.6 检出，正文较长者为保留侧 a', () => {
+test('2a scan 去重：bigram 相似 ≥0.6 检出，created 更早者为保留侧 a（不用正文长度——反诱饵）', () => {
   const dir = makeDir();
   padFixture(dir);
-  writePage(dir, 'knowledge/dup-a.md', { title: '萃取笔记副本', body: LONG_A });
-  writePage(dir, 'knowledge/dup-b.md', { title: '冲煮手记存档', body: LONG_A + '补充：夏天冷萃比例一比十二，冷藏十二小时后过滤，稀释后再喝。' });
+  // dup-a 更早创建（保留侧），dup-b 更晚且更长（若按旧「长者留」它会挤降 a，正是诱饵手法）→ 新规按 created 保留 a、降 b。
+  writePage(dir, 'knowledge/dup-a.md', { title: '萃取笔记副本', body: LONG_A, created: '2026-01-01' });
+  writePage(dir, 'knowledge/dup-b.md', { title: '冲煮手记存档', body: LONG_A + '补充：夏天冷萃比例一比十二，冷藏十二小时后过滤，稀释后再喝。', created: '2026-03-01' });
   const { duplicates } = scanOnly(dir).scan();
-  const hit = duplicates.find((d) => d.b === 'knowledge/dup-a.md' || d.a === 'knowledge/dup-a.md');
+  const hit = duplicates.find((d) => d.b === 'knowledge/dup-b.md' || d.a === 'knowledge/dup-a.md');
   assert.ok(hit, `应检出 dup-a/dup-b 相似对：${JSON.stringify(duplicates)}`);
-  assert.equal(hit.a, 'knowledge/dup-b.md', '正文较长者为保留侧 a');
-  assert.equal(hit.b, 'knowledge/dup-a.md', '较短者为并入侧 b');
+  assert.equal(hit.a, 'knowledge/dup-a.md', 'created 更早者为保留侧 a（即便更短）');
+  assert.equal(hit.b, 'knowledge/dup-b.md', 'created 更晚者为被降级侧 b（即便更长）');
   assert.equal(hit.zone, 'knowledge');
   assert.ok(hit.score >= 0.6 && hit.score <= 1, `score 应在 [0.6,1]：${hit.score}`);
 });
@@ -296,9 +297,9 @@ test('2a scan 去重：正文前 500 字符 bigram 相似 ≥0.6 检出，正文
 test('2b scan 去重：标题词集 Jaccard 命中同样算重复；相异页对不误报', () => {
   const dir = makeDir();
   padFixture(dir);
-  // 同题异文：标题完全一致（titleJ=1）、正文互不相似 → 仍应检出
-  writePage(dir, 'knowledge/gear-x.md', { title: '旅行装备清单', body: '出门必带护照与充电器，相机备两块电池，境外通行的实体卡放钱包夹层，雨衣折叠伞看目的地气候决定，转换插头选全球通用型号，登机箱控制在七公斤以内。'.repeat(3) });
-  writePage(dir, 'knowledge/gear-y.md', { title: '旅行装备清单', body: '徒步路线的装备另算：登山杖一对，速干衣两套，水袋两升，能量胶按每小时一支备货，头灯带备用电池，急救包放最外侧口袋，鞋子务必提前磨合两周以上再上长线。'.repeat(3) });
+  // 同题异文：标题完全一致（titleJ=1）、正文互不相似 → 仍应检出。distinct created 使其进 duplicates（同 created 会保守转建议）。
+  writePage(dir, 'knowledge/gear-x.md', { title: '旅行装备清单', body: '出门必带护照与充电器，相机备两块电池，境外通行的实体卡放钱包夹层，雨衣折叠伞看目的地气候决定，转换插头选全球通用型号，登机箱控制在七公斤以内。'.repeat(3), created: '2026-01-01' });
+  writePage(dir, 'knowledge/gear-y.md', { title: '旅行装备清单', body: '徒步路线的装备另算：登山杖一对，速干衣两套，水袋两升，能量胶按每小时一支备货，头灯带备用电池，急救包放最外侧口袋，鞋子务必提前磨合两周以上再上长线。'.repeat(3), created: '2026-02-01' });
   const { duplicates } = scanOnly(dir).scan();
   assert.ok(duplicates.some((d) => [d.a, d.b].includes('knowledge/gear-x.md') && [d.a, d.b].includes('knowledge/gear-y.md')),
     `同题页对应被检出：${JSON.stringify(duplicates)}`);
@@ -374,6 +375,61 @@ test('2e scan 范围裁剪：README/_ 前缀/inbox/governance/keeper-feedback �
       `骨架/流水区不得进扫描：${p}`);
     assert.ok(path.basename(p) !== 'README.md' && !path.basename(p).startsWith('_'), `结构页不得进扫描：${p}`);
   }
+});
+
+// ==================== 组 2b：Finding2 反诱饵 / 入链保护 ====================
+
+test('2f（Finding2 反诱饵复现）canonical 正典页 + 更长更相似但 created 更晚的诱饵 → 正典页保持 canonical、被降级的是诱饵', async () => {
+  const { work } = makeGitInstance();
+  seedCommit(work, (w) => {
+    padFixture(w);
+    // a-original：真页，created 早、正文较短。z-bait：诱饵，created 晚、正文更长且前 500 字高相似（Codex 复现）。
+    writePage(w, 'knowledge/a-original.md', { title: '手冲要点原稿', body: LONG_A, created: '2026-01-01' });
+    writePage(w, 'knowledge/z-bait.md', { title: '手冲要点搬运', body: LONG_A + '附赠一段无关紧要的加长内容，只为把诱饵页撑得比原稿更长以骗过旧「长者留」规则。'.repeat(3), created: '2026-06-01' });
+  });
+  const { nightly } = nightlySetup(work, { statePath: path.join(work, '..', 'ns-2f.json') });
+  // scan：重复对以 created 更早的 a-original 为保留侧、z-bait 为被降级侧（不再被更长的诱饵挤降）
+  const { duplicates } = nightly.scan();
+  const hit = duplicates.find((d) => [d.a, d.b].includes('knowledge/a-original.md') && [d.a, d.b].includes('knowledge/z-bait.md'));
+  assert.ok(hit, `应检出 original/bait 相似对：${JSON.stringify(duplicates)}`);
+  assert.equal(hit.a, 'knowledge/a-original.md', '真页（created 早）为保留侧');
+  assert.equal(hit.b, 'knowledge/z-bait.md', '诱饵页（created 晚）为被降级侧');
+  await nightly.maybeRun();
+  assert.equal(tierOf(work, 'knowledge/a-original.md'), 'canonical', '正典真页绝不被更长诱饵挤降');
+  assert.equal(tierOf(work, 'knowledge/z-bait.md'), 'candidate', '诱饵页被降级');
+
+  // 且诱饵【预置 candidate】也挤不降 original——candidate 页被排除出扫描、根本不与 original 成对（旧码仍能挤降）。
+  const dir = makeDir();
+  padFixture(dir);
+  writePage(dir, 'knowledge/a-original.md', { title: '手冲要点原稿', body: LONG_A, created: '2026-01-01' });
+  writePage(dir, 'knowledge/z-bait.md', { title: '手冲要点搬运', body: LONG_A + '预置 candidate 的诱饵。'.repeat(3), tier: 'candidate', created: '2026-06-01' });
+  const dups2 = scanOnly(dir).scan().duplicates;
+  assert.ok(!dups2.some((d) => [d.a, d.b].includes('knowledge/a-original.md')), 'candidate 诱饵被排除，不与 original 成对，original 不被降');
+});
+
+test('2g（Finding2 入链保护）被降级候选被别的页链入（被依赖）→ 不自动降级、转建议；薄页同理', async () => {
+  const { work } = makeGitInstance();
+  seedCommit(work, (w) => {
+    padFixture(w);
+    // 重复对：keep 早、redundant 晚（本应降 redundant），但 redundant 被第三方内容页 [[..]] 链入 → 转建议不降。
+    writePage(w, 'knowledge/keep-early.md', { title: '骑行整备清单', body: LONG_A, created: '2026-01-01' });
+    writePage(w, 'knowledge/redundant-late.md', { title: '骑行整备清单', body: LONG_A + '附加一段冗余内容。', created: '2026-06-01' });
+    writePage(w, 'knowledge/refers.md', { title: '甲引用页', body: `${'专门制造入链的引用页正文彼此独立，'.repeat(20)}相关：[[redundant-late]]` });
+    // 有入链的薄页：被第三方链入 → 不降。
+    writePage(w, 'knowledge/thin-linked.md', { title: '被链薄页', body: '短短一句薄页内容而已。' });
+    writePage(w, 'knowledge/refers2.md', { title: '乙引用页', body: `${'另一个引用页承载独立内容与单条链接，'.repeat(20)}相关：[[thin-linked]]` });
+  });
+  const { nightly } = nightlySetup(work, { statePath: path.join(work, '..', 'ns-2g.json') });
+  const found = nightly.scan();
+  // redundant-late 不进 duplicates（转 suggestions/duplicate-inlink）
+  assert.ok(!found.duplicates.some((d) => d.b === 'knowledge/redundant-late.md'), '有入链的冗余侧不进降级队列');
+  assert.ok(found.suggestions.some((s) => s.page === 'knowledge/redundant-late.md' && s.reason === 'duplicate-inlink'), '冗余侧转建议 duplicate-inlink');
+  // thin-linked 不进 thin（转 suggestions/thin-inlink）
+  assert.ok(!found.thin.some((t) => t.page === 'knowledge/thin-linked.md'), '有入链的薄页不进降级队列');
+  assert.ok(found.suggestions.some((s) => s.page === 'knowledge/thin-linked.md' && s.reason === 'thin-inlink'), '薄页转建议 thin-inlink');
+  await nightly.maybeRun();
+  assert.equal(tierOf(work, 'knowledge/redundant-late.md'), 'canonical', '有入链的冗余页不被自动降级（被依赖）');
+  assert.equal(tierOf(work, 'knowledge/thin-linked.md'), 'canonical', '有入链的薄页不被自动降级（被依赖）');
 });
 
 // ==================== 组 3：maybeRun 节流 / 落件 / 上限 / 去重 ====================
@@ -465,8 +521,9 @@ test('3b maybeRun 降级形状（M4.6 D1/D3）：薄页/重复页进程内降级
   const { work } = makeGitInstance();
   seedCommit(work, (w) => {
     padFixture(w);
-    writePage(w, 'knowledge/dup-a.md', { title: '萃取笔记副本', body: LONG_A });
-    writePage(w, 'knowledge/dup-b.md', { title: '冲煮手记存档', body: LONG_A + '补充：夏天冷萃比例一比十二，冷藏十二小时后过滤，稀释后再喝。' });
+    // dup-b 更早（保留侧）、dup-a 更晚（被降级侧）——保留侧按 created 更早者定（不用正文长度）。
+    writePage(w, 'knowledge/dup-a.md', { title: '萃取笔记副本', body: LONG_A, created: '2026-06-01' });
+    writePage(w, 'knowledge/dup-b.md', { title: '冲煮手记存档', body: LONG_A + '补充：夏天冷萃比例一比十二，冷藏十二小时后过滤，稀释后再喝。', created: '2026-01-01' });
     // 薄页
     writePage(w, 'knowledge/thin-alone.md', { title: '孤丁残稿', body: '丁'.repeat(60) });
     // 断链页（报告型；自身垫厚过薄页阈值，只贡献断链一类检出）
@@ -530,8 +587,9 @@ test('3c maybeRun 上限：单轮降级 ≤5，去重类优先、薄页其后', 
         '爬坡齿比要提前规划，补给点间距控制在四十公里内，防晒袖套和电解质片是夏季标配，夜骑必须前后灯全开。'],
     ];
     for (const [i, [title, x, y]] of pairs.entries()) {
-      writePage(w, `knowledge/pair-${i}-x.md`, { title, body: x.repeat(5) });
-      writePage(w, `knowledge/pair-${i}-y.md`, { title, body: y.repeat(5) });
+      // x 更早（保留侧）、y 更晚（被降级侧）——保留侧按 created 更早者定。
+      writePage(w, `knowledge/pair-${i}-x.md`, { title, body: x.repeat(5), created: '2026-01-01' });
+      writePage(w, `knowledge/pair-${i}-y.md`, { title, body: y.repeat(5), created: '2026-02-01' });
     }
     writePage(w, 'knowledge/lone-1.md', { title: '戊底稿', body: '戊'.repeat(50) });
     writePage(w, 'knowledge/lone-2.md', { title: '己散记', body: '己'.repeat(50) });
@@ -550,8 +608,9 @@ test('3d maybeRun 幂等：已 candidate 的页不再重复降级（跨轮零重
   const { work } = makeGitInstance();
   seedCommit(work, (w) => {
     padFixture(w);
-    writePage(w, 'knowledge/dup-a.md', { title: '萃取笔记副本', body: LONG_A });
-    writePage(w, 'knowledge/dup-b.md', { title: '冲煮手记存档', body: LONG_A + '补充：夏天冷萃比例一比十二。' });
+    // dup-b 更早（保留侧）、dup-a 更晚（被降级侧 → candidate）。
+    writePage(w, 'knowledge/dup-a.md', { title: '萃取笔记副本', body: LONG_A, created: '2026-06-01' });
+    writePage(w, 'knowledge/dup-b.md', { title: '冲煮手记存档', body: LONG_A + '补充：夏天冷萃比例一比十二。', created: '2026-01-01' });
     writePage(w, 'knowledge/lone-1.md', { title: '戊底稿', body: '戊'.repeat(50) });
   });
   const statePath = path.join(work, '..', 'ns-3d.json');

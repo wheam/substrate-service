@@ -3,14 +3,20 @@
 //   - 薄页/近似重复页不再产出 remove_page/merge_pages 维护提案件，改为【进程内确定性 set_tier 降级
 //     （canonical→candidate）】——可逆、零裁定、不经 inbox 文件往返（顺带消灭该路径的注入面：无提案文件可伪造）。
 //   - 断链等只报告类产物落 governance/maintenance-log.md（D3），不进主人收件箱（只有人能判断的件才进）。
-//   - 迁移：收编真机遗留的夜班来源 maintenance 件（弹回的删页提案 → 降级；断链报告 → 转维护日志），幂等清零。
-// 明确不做（v0 裁剪，理由入 docs §9）：孤儿检测、矛盾旗标、keeper 聚簇自动提 zone。
+//   - 迁移（M4.6 加固）：只【关闭】库里遗留的 client:nightly/kind:maintenance 死件——绝不读件正文、不据件内容
+//     改任何页（Finding1 blocker：旧 migrateLegacy 信件正文 JSON 调 setPageTier，成了 keeper 身份的「持续可逆
+//     软删除任意页」通道，git-pull 伪造件即可触发，违背「伪造件应 inert」核心边界）。遗留薄页/重复页/断链的
+//     处置交给下方新 scan 自然重扫（薄页会被重扫降级、断链会被重扫写维护日志），迁移只做行政性关件。
+// 抗诱饵（M4.6 Finding2）：薄页/重复判定只在 canonical 页里做，重复对的保留侧按 created 更早者定（不用可被
+//   诱饵页操纵的正文长度），有入链的页不自动降级（被依赖）——堵「更长的诱饵页反向挤降正典页」。
+// 抗注入（M4.6 Finding3）：一切进 digest/维护日志的页路径过 displaySafePath 单行化+实体化（路径=git 文件名，可含
+//   换行/Markdown/控制字符）。明确不做（v0 裁剪，理由入 docs §9）：孤儿检测、矛盾旗标、keeper 聚簇自动提 zone。
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { setPageTier } from './executor.js';
 import { readTier } from './tier.js';
-import { caseLogSafe } from './keeper.js';
+import { caseLogSafe, displaySafePath } from './keeper.js';
 
 // 骨架/流水区不进扫描：inbox 件与判例是流水、governance/skills 是骨架——它们不是「维护对象」，
 // 且 inbox 正文是对抗输入，绝不该被相似度算法搬运进提案面。
@@ -109,7 +115,11 @@ export function createNightly({
           const body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '').trim();
           const title = fm.match(/^title:\s*(.+)$/m)?.[1]?.trim() || name.replace(/\.md$/, '');
           const rel = path.relative(instanceDir, p).split(path.sep).join('/');
-          pages.push({ rel, zone: z.id, title, body, titleSet: titleTokens(title), bigramSet: bodyBigrams(body) });
+          // tier（Finding2）：只在 canonical 页里找薄页/重复——已 candidate/rejected 页不该再参与、更不该当降级依据。
+          // created（Finding2）：重复对的保留侧按它定（更早者留），比可被诱饵操纵的正文长度更难伪造；缺失/非法 → null。
+          const tier = readTier(raw);
+          const created = parseDate(fm.match(/^created:\s*(.+)$/m)?.[1]?.trim());
+          pages.push({ rel, stem: name.replace(/\.md$/, ''), zone: z.id, tier, created, title, body, titleSet: titleTokens(title), bigramSet: bodyBigrams(body) });
         }
       }
     }
@@ -133,30 +143,67 @@ export function createNightly({
     return stems;
   }
 
-  // 纯函数可测：三类确定性检出，不写任何文件
+  // 入链索引（Finding2）：stem → 引用它的内容页集合。只从【内容页】（listPages 的产物）取链——刻意【不】把
+  // zone README 索引/`_` 结构页当来源：curate reindex 会给 zone 里每一页自动补一条 `| [[page]] |` 索引行，
+  // 若把它算入链则库里每页都「被依赖」→ 薄页/重复降级永不触发。真正的「被依赖」= 别的内容页在正文里editorial 地
+  // `[[..]]` 引用它（如「相关：[[x]]」）。先 stripCode 对齐断链检测：代码示例里的 [[..]] 不算真链。
+  function backlinkIndex(pages) {
+    const idx = new Map();
+    for (const src of pages) {
+      for (const m of stripCode(src.body).matchAll(/\[\[([^\]\n]+?)\]\]/g)) {
+        const stem = m[1].split(/[|#]/)[0].trim().split('/').pop();
+        if (!stem) continue;
+        if (!idx.has(stem)) idx.set(stem, new Set());
+        idx.get(stem).add(src.rel);
+      }
+    }
+    return idx;
+  }
+
+  // 纯函数可测：确定性检出，不写任何文件。返回可自动降级的 duplicates/thin、只报告的 brokenLinks、
+  // 以及【转建议不落盘】的 suggestions（created 无法判定保留侧、或有入链被依赖的疑似页——需人工确认）。
   function scan() {
     const pages = listPages();
+    const backlinks = backlinkIndex(pages);
+    // 有其它内容页链入 = 被依赖 → 不自动降级（入链保护）。自链不算（source !== 自身 rel）。
+    const hasInlink = (p) => { const s = backlinks.get(p.stem); return !!s && [...s].some((r) => r !== p.rel); };
+    // 只在 canonical 页里找薄页/重复：已 candidate/rejected 页不再参与、更不该当降级依据（Finding2 反诱饵核心）。
+    const canonical = pages.filter((p) => p.tier === 'canonical');
     const duplicates = [];
     const thin = [];
     const brokenLinks = [];
+    const suggestions = [];
 
-    // 近似去重（同 zone 内两两比对）：a=保留侧（正文较长者，等长取 rel 字典序小者），b=并入侧
-    for (let i = 0; i < pages.length; i++) {
-      for (let j = i + 1; j < pages.length; j++) {
-        const p = pages[i], q = pages[j];
+    // 近似去重（同 zone 内两两比对，双方都 canonical）：保留侧 = created 更早者（诱饵页是新 push 进来的、created
+    // 晚 → 落为被降级方；真页 created 早 → 保留）。tiebreak 【不用正文长度】——那正是诱饵的操纵杠杆（更长的诱饵
+    // 反向挤降正典）。created 相同/缺失 → 无法判定保留侧 → 保守转建议、不自动降级。被降级方有入链 → 转建议。
+    for (let i = 0; i < canonical.length; i++) {
+      for (let j = i + 1; j < canonical.length; j++) {
+        const p = canonical[i], q = canonical[j];
         if (p.zone !== q.zone) continue;
         const score = similarity(p, q);
         if (score < DUP_THRESHOLD) continue;
-        const [keep, merge] = q.body.length > p.body.length ? [q, p] : [p, q];
-        duplicates.push({ a: keep.rel, b: merge.rel, zone: p.zone, score: Math.round(score * 100) / 100 });
+        const cmp = compareCreated(p.created, q.created);
+        if (cmp === 0) { // created 无法比较（相同/任一缺失）→ 保守，不自动降级
+          suggestions.push({ page: p.rel, peer: q.rel, reason: 'duplicate-tie', zone: p.zone });
+          continue;
+        }
+        const [keep, demote] = cmp < 0 ? [p, q] : [q, p]; // cmp<0：p 更早 → 留 p、降 q
+        if (hasInlink(demote)) { // 被降级方被别的页依赖 → 转建议、不自动降级
+          suggestions.push({ page: demote.rel, peer: keep.rel, reason: 'duplicate-inlink', zone: p.zone });
+          continue;
+        }
+        duplicates.push({ a: keep.rel, b: demote.rel, zone: p.zone, score: Math.round(score * 100) / 100 });
       }
     }
 
-    // 薄页：正文 <200 字符；合并候选=同 zone 最相似页（≥0.3 才算沾边），没有就 null（→ remove 提案）
-    for (const p of pages) {
+    // 薄页：canonical 页正文 <200 字符。有入链（被依赖）→ 转建议、不自动降级；否则降级。合并候选=同 zone 最相似的
+    // canonical 页（≥0.3 才算沾边），没有就 null（M4.6 降级不用它，scan 仍算它供回归）。
+    for (const p of canonical) {
       if (p.body.length >= THIN_CHARS) continue;
+      if (hasInlink(p)) { suggestions.push({ page: p.rel, reason: 'thin-inlink', chars: p.body.length, zone: p.zone }); continue; }
       let best = null, bestScore = 0;
-      for (const q of pages) {
+      for (const q of canonical) {
         if (q === p || q.zone !== p.zone) continue;
         const score = similarity(p, q);
         if (score > bestScore) { best = q; bestScore = score; }
@@ -166,6 +213,7 @@ export function createNightly({
 
     // 断链：[[stem]]（管道/锚点后缀剥掉、带路径取末段）在全库无 <stem>.md。v0 只报告不修
     // （executor 无文本编辑动作，自动改正文的风险大于收益）。先 stripCode 对齐 doctor：代码里的示例链不算断链。
+    // 断链检出仍覆盖全部内容页（含 candidate——报告无副作用，不涉降级）；目标存在性面用全库 stem。
     const stems = allStems();
     for (const p of pages) {
       const seen = new Set();
@@ -177,10 +225,10 @@ export function createNightly({
       }
     }
 
-    return { duplicates, thin, brokenLinks };
+    return { duplicates, thin, brokenLinks, suggestions };
   }
 
-  // 降级目标收集：近似重复对的冗余侧（b=较短者）+ 薄页（自身）。去重（一页只降一次）；去重类优先、薄页其后
+  // 降级目标收集：近似重复对的冗余侧（b=被降级方）+ 薄页（自身）。去重（一页只降一次）；去重类优先、薄页其后
   // （沿旧 MAX 上限「去重优先」意图）。mergeCandidate 不再用于降级——M4.6 不再合并、只降级；scan 仍算它供 Group 2 回归。
   function collectDemoteTargets({ duplicates, thin }) {
     const seen = new Set();
@@ -216,8 +264,13 @@ export function createNightly({
     let raw = existsSync(logAbs) ? readFileSync(logAbs, 'utf8') : maintenanceLogTemplate(d);
     const fresh = [];
     for (const b of brokenLinks) {
-      // page 是 listPages 产出的实例内 rel（服务端可控、无括号）；stem 是对抗输入 → 截断 + 整行实体化。
-      const line = caseLogSafe(`- ${b.page} → [[${String(b.stem).slice(0, 100)}]]（全库无对应页，v0 不自动改正文）`);
+      // Finding3：page 与 stem 都过 displaySafePath 单行化+实体化——page 是 git 文件名（可含换行/Markdown/控制
+      // 字符，非「服务端可控无括号」），stem 是页正文里的对抗输入；随后整行再过 caseLogSafe 把包裹 stem 的字面
+      // `[[..]]` 也实体化（对 doctor 的任何 strip 免疫）。两遍幂等：displaySafePath 已把内容里的 [ ] 变实体，
+      // caseLogSafe 只再中和我写的那对字面括号。
+      const safePage = displaySafePath(b.page);
+      const safeStem = displaySafePath(String(b.stem).slice(0, 100));
+      const line = caseLogSafe(`- ${safePage} → [[${safeStem}]]（全库无对应页，v0 不自动改正文）`);
       if (raw.includes(line)) continue;
       fresh.push(line);
     }
@@ -270,9 +323,11 @@ export function createNightly({
       const reported = await reportBrokenLinks(found.brokenLinks);
       out.brokenReported = reported.length;
       // digest「夜班上轮动作」摘要：只留页路径 + 动作 + 原因分类 + 计数，绝不带页面正文摘录（stem 是对抗输入，不入）。
+      // suggestions（Finding2）：created 无法判定保留侧 / 有入链被依赖的疑似页——未自动降级、转 digest 供人工确认（只带路径）。
       actions = {
         demoted,
-        broken: [...new Set(found.brokenLinks.map((b) => b.page))], // 仅页路径（服务端可控）
+        broken: [...new Set(found.brokenLinks.map((b) => b.page))], // 仅页路径
+        suggestions: found.suggestions.map((s) => ({ page: s.page, reason: s.reason, ...(s.peer ? { peer: s.peer } : {}) })),
         counts: { demoted: out.demoted, broken: out.brokenReported },
       };
       // 零动作不打扰主人——audit 的 nightly_run 已是心跳，通知只在真有事时发
@@ -289,67 +344,45 @@ export function createNightly({
     return out;
   }
 
-  // 迁移（M4.6）：收编真机遗留的夜班来源 maintenance 件（M4.5 及以前夜班产的提案，含被通道限权弹回 re-held 的）。
-  //   - 「薄页删除提案」(op:remove_page) / 合并提案(op:merge_pages) → 对涉及页执行 set_tier 降级（改删/合并为可逆降级）后关闭件；
-  //   - 「断链报告」(type:broken-link) → 转写 maintenance-log 后关闭件。
-  // 关闭 = rmSync 件 + commit（现有确定性通路），audited。幂等：件关闭后再跑扫不到（且降级已 candidate 会跳过）→ 零重复。
-  // 只认 client:nightly & kind:maintenance（schema 提案 kind:schema 不动；新夜班不再产 maintenance，故清完永远 no-op）。
+  // 迁移（M4.6 Finding1 加固）：只【关闭】库里遗留的 client:nightly/kind:maintenance 死件，绝不据件内容改任何页。
+  // 为什么彻底放弃「根据件内容改页」：旧 migrateLegacy 直接信件正文 JSON 的 op/page/source 去调 setPageTier 降级
+  // 引用的页——而 setPageTier 只拦骨架/结构/越界/不存在，不拦 sensitive/任意 zone。inbox 件活在 git 里、git pull
+  // 是对抗输入：攻击者 push 一个 client:nightly/kind:maintenance 件、正文 `{"op":"remove_page","page":"memory/…"}`，
+  // 每个 keeper tick 常驻跑的 migrateLegacy 就以 keeper 身份把该敏感页 canonical→candidate 软删除，全程无
+  // resolveEntry/批准登记表。这把「本应 inert 的伪造维护件」升级成「持续可逆软删除任意内容页」的通道，直接违背
+  // 「git-pulled 伪造件应 inert」的核心边界。故收窄为：筛选只按 client+kind（服务端行政筛选、零内容信任），命中即
+  // 关闭（走确定性关闭通路、留审计痕迹），完全不读件正文、不调 setPageTier、不碰任何内容页。真遗留薄页/重复页的
+  // 降级、断链的报告，全交给下方新 scan 自然重扫（它们本就是薄页/重复/断链，scan 会重新扫到并处置）。
+  // 结果：即便攻击者 push 伪造 nightly/maintenance 件，migrateLegacy 顶多关掉攻击者自己的伪造件（零收益）。
   async function migrateLegacy() {
     if (!writer || !inbox) return { migrated: 0 };
     let legacy;
     try {
+      // 只按行政字段筛（client + 归一后的 kind）——不解析、不信任件正文的任何字段。
       legacy = inbox.listEntries().entries.filter((e) => e.kind === 'maintenance' && e.client === 'nightly');
     } catch { return { migrated: 0 }; }
     if (!legacy.length) return { migrated: 0 };
     let migrated = 0;
     for (const e of legacy) {
       try {
-        const raw = readFileSync(path.join(instanceDir, e.path), 'utf8');
-        const block = firstJsonBlock(raw);
-        if (block && block.op === 'remove_page' && block.page) {
-          await migrateDemote(block.page, e.path, e.id, 'thin');
-        } else if (block && block.op === 'merge_pages' && block.source) {
-          await migrateDemote(block.source, e.path, e.id, 'duplicate');
-        } else {
-          // 断链报告或其它报告型：能取到 page 就转写维护日志，然后关闭件（无 op 的件不做任何页面改动）
-          if (block && block.type === 'broken-link' && block.page) {
-            await reportBrokenLinks([{ page: block.page, stem: block.stem ?? '' }]);
-          }
-          await closeEntry(e.path, e.id, 'report-migrated');
-        }
+        await closeEntry(e.path, e.id);
         migrated++;
       } catch (err) {
-        console.error(`夜班迁移单件失败（跳过，下轮再试）：${e.id} ${err.message}`);
+        console.error(`夜班关闭遗留件失败（跳过，下轮再试）：${e.id} ${err.message}`);
       }
     }
     if (migrated > 0) audit({ tool: 'nightly', event: 'migrate_run', migrated });
     return { migrated };
   }
 
-  // 遗留删/合并提案 → 改为可逆降级 + 关闭件（一个 transact 原子：页降级 + 件移除同提交）。页已 candidate/不存在则只关件。
-  async function migrateDemote(page, entryRel, entryId, reason) {
-    let res = null;
-    await writer.transact(async (commit) => {
-      const paths = [];
-      const abs = path.join(instanceDir, String(page).endsWith('.md') ? page : `${page}.md`);
-      if (existsSync(abs) && readTier(readFileSync(abs, 'utf8')) !== 'candidate') {
-        res = setPageTier({ instanceDir, page, tier: 'candidate' });
-        if (res.ok) paths.push(...res.changedPaths);
-      }
-      rmSync(path.join(instanceDir, entryRel));
-      paths.push(entryRel);
-      return commit({ paths, message: `nightly: 迁移收编遗留提案 ${entryId}（降级替代删除）` });
-    });
-    if (res?.ok && indexStore) { try { indexStore.updatePage(res.page); } catch { /* 索引刷新失败不影响迁移 */ } }
-    audit({ tool: 'nightly', event: 'migrate', entry: entryId, action: 'demote', page, reason, ...(res?.ok ? { from: res.from, to: res.to } : { note: 'already-candidate-or-missing' }) });
-  }
-
-  async function closeEntry(entryRel, entryId, note) {
+  // 关闭一件遗留 maintenance 死件：rmSync + commit（现有确定性关闭通路，git 历史留审计痕迹）+ audit。
+  // 只删这一个 inbox 件、不碰任何内容页；幂等（件关闭后再跑 listEntries 扫不到 → 零重复）。
+  async function closeEntry(entryRel, entryId) {
     await writer.transact(async (commit) => {
       rmSync(path.join(instanceDir, entryRel));
-      return commit({ paths: [entryRel], message: `nightly: 迁移收编遗留报告 ${entryId}（转维护日志后关闭）` });
+      return commit({ paths: [entryRel], message: `nightly: 关闭遗留维护死件 ${entryId}（不碰内容页）` });
     });
-    audit({ tool: 'nightly', event: 'migrate', entry: entryId, action: note });
+    audit({ tool: 'nightly', event: 'migrate', entry: entryId, action: 'closed' });
   }
 
   return { scan, maybeRun, migrateLegacy, readState };
@@ -357,30 +390,36 @@ export function createNightly({
 
 // digest「夜班上轮动作」段（spec §9 D1）：只含页路径、动作、原因分类、计数——绝不带页面正文摘录（正文=对抗
 // 输入，与 nudge/held 摘要红线同款）。断链只给页路径 + 计数（stem 是对抗输入，不进 digest 面），详情指向维护日志。
+// Finding3：所有页路径均过 displaySafePath——digest 是高信任 agent 的提示面，路径=git 文件名（可含换行/Markdown/
+// 控制字符），裸拼即注入（伪造 heading/换行插指令/wikilink/<script>）。
 export function formatNightlyDigest(state) {
   const a = state?.lastActions;
-  if (!a || (!a.demoted?.length && !(a.broken?.length))) return '';
+  if (!a || (!a.demoted?.length && !a.broken?.length && !a.suggestions?.length)) return '';
   const lines = ['', '---', '', '## 夜班上轮动作', ''];
   if (a.demoted?.length) {
     lines.push(`降级 ${a.demoted.length} 页（薄页/近似重复 → candidate；默认检索不含、git 仍可查；高信任 page_set_tier 可一句话恢复）：`);
     for (const d of a.demoted) {
       const why = d.reason === 'thin' ? `薄页${d.chars != null ? ` ${d.chars} 字符` : ''}` : d.reason === 'duplicate' ? '近似重复' : String(d.reason ?? '');
-      lines.push(`- ${d.page}（${why}）`);
+      lines.push(`- ${displaySafePath(d.page)}（${why}）`);
     }
   }
   if (a.broken?.length) {
     if (a.demoted?.length) lines.push('');
     lines.push(`报告断链 ${a.broken.length} 处（详见 governance/maintenance-log.md，无需裁定）：`);
-    for (const p of a.broken) lines.push(`- ${p}`);
+    for (const p of a.broken) lines.push(`- ${displaySafePath(p)}`);
+  }
+  // 建议（Finding2）：疑似重复/薄页但因 created 无法判定保留侧、或有入链被依赖 → 未自动降级，仅供人工确认。
+  if (a.suggestions?.length) {
+    if (a.demoted?.length || a.broken?.length) lines.push('');
+    lines.push(`另有 ${a.suggestions.length} 处疑似冗余/薄页未自动降级（需人工确认，可用 page_set_tier 处理）：`);
+    for (const s of a.suggestions) {
+      const why = s.reason === 'duplicate-tie' ? '疑似重复但创建时间无法判定保留侧'
+        : s.reason === 'duplicate-inlink' ? '疑似冗余但有其它页链入（被依赖）'
+        : s.reason === 'thin-inlink' ? '薄页但有其它页链入（被依赖）' : String(s.reason ?? '');
+      lines.push(`- ${displaySafePath(s.page)}${s.peer ? `（疑似与 ${displaySafePath(s.peer)} 重复）` : ''}（${why}）`);
+    }
   }
   return lines.join('\n');
-}
-
-// 取提案件正文首个 ```json 块（迁移解析遗留件的 op/page/source/type）。无块/非法 JSON → null。
-function firstJsonBlock(raw) {
-  const m = String(raw ?? '').match(/```json\n([\s\S]*?)\n```/);
-  if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
 }
 
 // 维护日志页 frontmatter 备齐实例契约必填键（title/created/updated/type），确保真 doctor 0 error。
@@ -396,4 +435,19 @@ function maintenanceLogTemplate(d) {
 // 日期串（YYYY-MM-DD）——降级/维护日志共用
 function today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// created 解析（Finding2 重复对保留侧判定用）：frontmatter 的 created 是 YYYY-MM-DD 形状；解析成毫秒时间戳，
+// 非法/缺失 → null。用 Date.parse（对 YYYY-MM-DD 稳定），只接受能解析成有限数的值。
+function parseDate(s) {
+  if (!s) return null;
+  const t = Date.parse(String(s).trim());
+  return Number.isFinite(t) ? t : null;
+}
+
+// created 比较：返回 -1（a 更早，留 a）/ 1（b 更早，留 b）/ 0（相同或任一缺失 → 无法判定保留侧，保守不自动降级）。
+// 威胁模型：诱饵页是新 push 进来的（created 晚）→ 落为被降级方；真页 created 早 → 保留。缺失/相同一律保守转建议。
+function compareCreated(a, b) {
+  if (a == null || b == null || a === b) return 0;
+  return a < b ? -1 : 1;
 }

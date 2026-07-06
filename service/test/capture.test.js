@@ -155,6 +155,20 @@ test('D2 /capture/status：capture 通道不列 maintenance/schema（无权兑�
   assert.ok(hi.pending.some((p) => p.id === sch.id), '高信任仍见 schema 件');
 });
 
+test('D2（Finding4 kind 归一）大小写/空白变体的 maintenance 件同样被 D2 挡住——展示面与执行面不再因变体失配', async () => {
+  // 伪造件 git pull 进来时 frontmatter 的 kind 是任意文本：`Maintenance`（大写）、` maintenance `（首尾空白）。
+  // 归一前它们绕过 CAPTURE_UNRULABLE_KINDS.has('maintenance') → 泄进 App 待定夺列表（无权兑现的按钮）。
+  const up = await seedInboxFile('mntup001-aa11', 'Maintenance');
+  const sp = await seedInboxFile('mntsp001-bb22', '  maintenance  ');
+  const cap = await statusJson('cap-token');
+  assert.ok(!cap.pending.some((p) => p.id === up.id), '大写 Maintenance 变体件不列（归一后被 D2 挡）');
+  assert.ok(!cap.pending.some((p) => p.id === sp.id), '带空白 maintenance 变体件不列');
+  // 入口裁定同样 403（listEntries 归一后 hit.kind 命中 CAPTURE_UNRULABLE_KINDS）
+  const res = await post('/capture/resolve', 'cap-token', { id: up.id, ruling: '批准' });
+  assert.equal(res.status, 403, '大写变体件裁定入口即 403');
+  assert.ok(!/owner_ruling:/.test(readFileSync(path.join(work, up.rel), 'utf8')), '未落 owner_ruling');
+});
+
 test('D2 /capture/resolve：capture 通道裁 maintenance/schema 在入口即 403（不再走到 keeper 才弹回）', async () => {
   const mnt = await seedInboxFile('mnt00002-cc33', 'maintenance');
   const res = await post('/capture/resolve', 'cap-token', { id: mnt.id, ruling: '批准删除' });

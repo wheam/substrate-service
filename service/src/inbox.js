@@ -8,6 +8,16 @@ import crypto from 'node:crypto';
 // 「kind 合法、id 是服务端生成的」只在写路径成立，任何要把 id/kind 拼进响应面的读方必须自己再验。
 // schema/maintenance = M4.4 提案件（D2）：创建即 held、直达主人，keeper 不 LLM 判它们（走点选预批通路）。
 export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture', 'schema', 'maintenance']);
+
+// F4（M4.6 Finding4）kind 规范化：inbox 件经 git pull 拉进来时 frontmatter 的 `kind:` 是任意文本——
+// 大小写/首尾空白变体（`Maintenance`、` maintenance `、`SCHEMA`）会让【展示面】（server.js 的 D2 过滤按
+// CAPTURE_UNRULABLE_KINDS.has(e.kind) 决定 App 是否列出）与【执行面】（keeper 的 SKIP_LLM/maintenance 守卫按
+// entry.kind 判定）对同一件得出不同结论 → 无权兑现的按钮泄进 App / 治理件被当普通件跑 LLM。统一在解析点
+// trim+lowercase 归一（listEntries 与 keeper.parseEntry 都过它），令两面看到的 kind 完全一致。approvalToken 也
+// 绑 kind——两处解析都归一后哈希口径仍一致（合法件本就是小写、归一是恒等；swap 到任意大小写变体仍失配 → re-held）。
+export function normKind(k) {
+  return String(k ?? '').trim().toLowerCase();
+}
 // 服务端生成 id 的形状（见 addEntry：Date.now 的 base36 + '-' + 2 字节 hex）。
 // 首段长度上限放到 12：只为防伪造件灌长文本，不过拟合当前时间戳位数（base36 毫秒到 2059 年也才 9 位）。
 export const ID_FORMAT = /^[a-z0-9]{1,12}-[a-f0-9]{4}$/;
@@ -136,7 +146,7 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
         const get = (k) => raw.match(new RegExp(`^${k}: (.*)$`, 'm'))?.[1] ?? '';
         const parsed = parseEntryBody(raw);
         return {
-          id: get('id'), path: `inbox/${f}`, kind: get('kind'), status: get('status'),
+          id: get('id'), path: `inbox/${f}`, kind: normKind(get('kind')), status: get('status'),
           received_at: get('received_at'), hint: get('hint') || undefined,
           client: get('client'), excerpt: parsed.content.slice(0, 120), content: parsed.content.slice(0, 2000),
           reason: parsed.reason, options: parsed.options.map((o, i) => ({ index: i, label: o.label })),
