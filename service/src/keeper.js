@@ -446,7 +446,12 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     // 还在扫时这轮不重入（跳过即可，下轮到期再跑）。
     if (nightly && !nightlyRunning) {
       nightlyRunning = true;
-      try { await nightly.maybeRun(); }
+      try {
+        // M4.6 迁移：先幂等收编真机遗留的夜班 maintenance 件（弹回删页提案 → 降级；断链报告 → 转维护日志），
+        // 再跑本轮扫描。migrateLegacy 清完即永久 no-op（新夜班不再产 maintenance），每 tick 调一次也几近零成本。
+        if (nightly.migrateLegacy) await nightly.migrateLegacy();
+        await nightly.maybeRun();
+      }
       catch (e) { console.error(`夜班本轮异常（不影响归档）：${e.message}`); }
       finally { nightlyRunning = false; }
     }

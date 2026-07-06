@@ -2,7 +2,7 @@
 // 每客户端一把 token（TOKENS_JSON），trust 决定 sensitive 区可见性。
 import express from 'express';
 import path from 'node:path';
-import { rmSync } from 'node:fs';
+import { rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -14,8 +14,8 @@ import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
 import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
 import { createKeeper } from './keeper.js';
-import { createNightly } from './nightly.js';
-import { applySchema, validateSchemaProposal } from './executor.js';
+import { createNightly, formatNightlyDigest } from './nightly.js';
+import { applySchema, validateSchemaProposal, setPageTier } from './executor.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
 import { createEventStore } from './events.js';
@@ -29,7 +29,12 @@ const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 // 给它们再尾附待裁提示是噪音（agent 已在裁决面里），故排除。
 const NUDGE_EXEMPT = new Set(['inbox_list', 'inbox_resolve']);
 
-export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000 }) {
+// D2（M4.6）：capture 通道无权兑现的件——maintenance（夜班/维护提案）与 schema（结构提案）是治理面，
+// 只能由高信任 CC/Hermes 裁定。服务端强制：这类件不进 App 的「待定夺（可裁）」列表、也不经 /capture/resolve 裁定
+// （原则=不给人无权兑现的按钮）。keeper 层的通道限权守卫保留作纵深防御，本层只是把拦截前移到入口。
+const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema']);
+
+export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000, nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json') }) {
   // 配置健全性：channel:primary 只在 high 客户端生效（主频道房规/nudge 依赖 inbox 工具，而 inbox 是 high-only）。
   // 标了 primary 却非 high = 无声失效的误配 —— 启动即告警点名，而不是运行期静默丢行为。
   for (const t of Object.values(tokens)) {
@@ -114,7 +119,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     if (req.method !== 'POST') return res.status(405).set('Allow', 'POST').end();
 
     const primary = identity.channel === 'primary' && identity.trust === 'high';
-    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, identity, audit, nudge: primary ? nudgeFor : null });
+    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, audit, nudge: primary ? nudgeFor : null });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
@@ -141,6 +146,10 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     try {
       const { content } = await tools.getContext({ trust: identity.trust });
       let out = content + DIGEST_RULES;
+      // 夜班「上轮动作」段（M4.6 D1）：digest 已 high-gated，且摘要只含页路径/动作/原因/计数（无正文、无 stem，
+      // 且夜班整体排除 sensitive 区 → 页路径均非敏感）。状态文件在 git 外、可能缺失/损坏 → try 包裹，省略即可。
+      try { out += formatNightlyDigest(JSON.parse(readFileSync(nightlyStatePath, 'utf8'))); }
+      catch { /* 无夜班状态文件/损坏 → 不带该段 */ }
       // 主频道客户端（channel:primary，上面已 high-gated）额外下发主频道房规 + 实时 held 摘要——与 MCP
       // instructions 的 primary 分支同源。digest 是拉取快照，故每次给全量现状（不走 piggyback 的防重复
       // state，防重复只属于 piggyback 通路）。held 摘要只带 id/kind/计数：件正文是对抗输入，绝不进 digest 面。
@@ -184,12 +193,16 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     }
   });
 
-  // App 状态页 = 收件审阅心脏界面：capture 与高信任 token 全见（含全文）；低信任仅见自己的
+  // App 状态页 = 收件审阅心脏界面：capture 与高信任 token 全见（含全文）；低信任仅见自己的。
+  // D2（M4.6）：非高信任通道只列它有权兑现的件——maintenance/schema（治理提案）整体不进「待定夺」列表
+  // （方案 = 整体不列，而非只读 rulable:false 区：对现有 iOS App 的 pending 数组解析零破坏、不引入新字段/新区，
+  // 也彻底消灭「给人无权兑现的按钮」）。高信任 CC/Hermes 仍全见（它们有权裁这类件）。见交付报告的 D2 说明。
   app.get('/capture/status', (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
     const mineOnly = identity.trust !== 'high' && identity.trust !== 'capture';
-    const pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
+    let pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
+    if (identity.trust !== 'high') pending = pending.filter((e) => !CAPTURE_UNRULABLE_KINDS.has(e.kind));
     const events = (eventStore?.list() ?? []).filter((e) => !mineOnly || e.client === identity.client).slice(-100).reverse();
     return res.json({ ok: true, pending, events });
   });
@@ -199,6 +212,15 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
     const { id, ruling, option } = req.body ?? {};
+    // D2（M4.6）入口限权：maintenance/schema 件不经手机裁定——在入口就拒（不再走到 keeper 层通道限权才弹回，
+    // 那样主人体验 = 「判了→不算→重来」，违反原则 B）。keeper 层通道限权守卫仍在，作纵深防御。高信任仍可裁。
+    if (identity.trust !== 'high') {
+      const hit = inbox.listEntries().entries.find((e) => e.id === id);
+      if (hit && CAPTURE_UNRULABLE_KINDS.has(hit.kind)) {
+        audit({ client: identity.client, tool: 'capture_resolve', args: { id }, ok: false, error: '该类件不经手机裁定' });
+        return res.status(403).json({ ok: false, error: '该类件（维护/结构提案）不经手机裁定，请在 CC / Hermes 等高信任客户端处理' });
+      }
+    }
     try {
       const r = inbox.resolveEntry({ id, ruling, option, via: identity.client, viaTrust: identity.trust });
       audit({ client: identity.client, tool: 'capture_resolve', args: { id, ruling }, ok: true, ...rulingAuditFields(r) });
@@ -212,7 +234,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   return app;
 }
 
-function buildMcpServer({ instanceDir, writer, tools, inbox, recall, identity, audit, nudge = null }) {
+function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, audit, nudge = null }) {
   const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity) });
   const { client, trust } = identity;
 
@@ -405,9 +427,36 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, identity, a
     }, wrap('schema_apply', async ({ id }) => schemaApply({ instanceDir, inbox, writer, id }),
       (r) => `✅ 已落地 zone「${r.zoneId}」→ ${r.changedPaths.join('、')}（提案件已移除，doctor 0 error）`,
       (r) => ({ event: 'schema_apply', zone_id: r?.zoneId })));
+
+    // page_set_tier（M4.6 D1 re-promote）：高信任才可见/可调的分层调整——夜班把薄页/重复页降级为 candidate 后，
+    // 主人一句话恢复。直连 executor.setPageTier（同一实现、同一硬校验），审计。capture/普通信任档不可见不可调
+    // （本工具在 trust==='high' 块内注册）。它是 set_tier 的第二个合法入口——keeper 的 LLM decision 仍被 validateDecision 挡死。
+    server.registerTool('page_set_tier', {
+      title: '调整某页的分层档位（恢复/旁置）',
+      description: '把某一页的 tier 在 canonical（默认检索可见）与 candidate（旁置、默认检索不含、仍可读）之间切换。主要用途：夜班把薄页/近似重复页降级为 candidate 后，主人想恢复某页时用它一句话把它升回 canonical。只作用于知识内容页；骨架区（governance/skills/inbox/keeper-feedback）与结构页（README/_）禁改；页不存在会报错。',
+      inputSchema: {
+        path: z.string().describe('页的实例内相对路径（如 knowledge/xxx.md）'),
+        tier: z.enum(['canonical', 'candidate']).describe('目标档位：canonical=恢复默认可见 / candidate=旁置'),
+      },
+    }, wrap('page_set_tier', async ({ path: pagePath, tier }) => pageSetTier({ instanceDir, writer, indexStore, page: pagePath, tier }),
+      (r) => `✅ 已把 ${r.page} 从 ${r.from} 调为 ${r.to}${r.from === r.to ? '（本就是该档，无改动）' : ''}`,
+      (r) => ({ event: 'set_tier', page: r?.page, from: r?.from, to: r?.to })));
   }
 
   return server;
+}
+
+// page_set_tier 工具入口：直连 executor.setPageTier（同一硬校验），writer.transact 内落盘+提交，之后刷新派生索引。
+// 与夜班降级共用 setPageTier——唯二合法的 set_tier 入口（keeper 的 LLM decision 被 validateDecision 挡死）。
+async function pageSetTier({ instanceDir, writer, indexStore, page, tier }) {
+  let res;
+  await writer.transact(async (commit) => {
+    res = setPageTier({ instanceDir, page, tier });
+    if (!res.ok) throw new Error(res.reason);
+    return commit({ paths: res.changedPaths, message: `page_set_tier: ${res.page} → ${res.to}` });
+  });
+  if (indexStore) { try { indexStore.updatePage(res.page); } catch { /* 索引刷新失败不影响本次调整 */ } }
+  return res;
 }
 
 // schema_propose 实现：冲突/形状校验（zod 已过 id 正则/privacy 枚举，这里查与现有 zones 的 id/path 冲突 + path 形状）
@@ -536,6 +585,8 @@ if (isMain) {
       instanceDir,
       inbox: createInbox({ instanceDir, writer: app.locals.writer, approvals: app.locals.approvals }),
       notifier, audit,
+      writer: app.locals.writer, // M4.6：降级/维护日志/迁移的写入走单写者队列（与归档写串行不打架）
+      indexStore,                // 降级翻 tier 后刷新同一派生索引（candidate 默认检索不含）
       intervalMs: Number(NIGHTLY_INTERVAL_MS),
     });
     const keeper = createKeeper({

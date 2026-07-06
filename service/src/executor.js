@@ -11,6 +11,10 @@ const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden
 // merge_pages（M4.4 D3）：夜班去重/薄页合并的确定性落点——现有 merge_into 并入的是 entry.body（收件正文），
 // 对夜班提案件那是「提案文案」，执行它语义全错；真语义 = 源页正文并入目标页 + 删源页清反链，须一个原子动作表达。
 const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page', 'todo_done', 'schema_apply', 'merge_pages']);
+// set_tier（M4.6 D1）刻意【不】进 ACTIONS：它是可逆降级/晋升，绝不能从 keeper 的 LLM decision 触达
+// （否则注入内容可诱导 keeper 把任意页降级=软删除，绕过 remove_page 的裁定保护）。它只有两个确定性入口——
+// ① 夜班进程内扫描后直执行降级；② 高信任 page_set_tier 工具 re-promote——均直调 setPageTier、不经 validateDecision。
+export const SET_TIER_TARGETS = new Set(['canonical', 'candidate']);
 // 缺陷3：只有落成页文件的 action（new_page/merge_into）能把 tier 写进 frontmatter 持久化。
 // upsert_row（.csv 行）/todo_add（清单行）/todo_done/remove_page 无 tier 粒度落点 → 见下方归一。
 const TIER_BEARING_ACTIONS = new Set(['new_page', 'merge_into']);
@@ -109,6 +113,12 @@ export function validateDecision({ instanceDir, decision, entry }) {
   if (!DISPOSITIONS.has(d.disposition)) return { ok: false, reason: `disposition 不合法：${d.disposition}` };
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
   if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无意义（无本地），需主人定夺' };
+  // D1（M4.6）安全边界：set_tier 绝不能从 LLM decision 触达——注入可诱导 keeper 把任意页降级=软删除，绕过
+  // remove_page 的裁定保护。降级只走两个确定性入口（夜班进程内 / 高信任 page_set_tier），均直调 setPageTier、
+  // 不经本校验。显式早拒（不只依赖「不在 ACTIONS 白名单」——防未来误把它并进白名单静默开洞）。
+  if (d.action === 'set_tier') {
+    return { ok: false, reason: 'set_tier 不是 keeper 可产出的动作（降级只在夜班进程内确定性执行；恢复请用高信任 page_set_tier 工具）' };
+  }
   if (!ACTIONS.has(d.action)) return { ok: false, reason: `action 不合法：${d.action}` };
   if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: '缺 confidence 或 summary' };
   // 分层白名单（spec §6.1）：模型只能产出 canonical|candidate；缺省视为 canonical（向后兼容）。
@@ -273,6 +283,40 @@ export async function applySchema({ instanceDir, entry }) {
     detail: `zone ${v.id} 已建（${v.path}）`,
     zoneId: v.id,
   };
+}
+
+// setPageTier（M4.6 D1）：非破坏性降级/晋升——把页 frontmatter 的 tier 在 canonical↔candidate 之间互翻。
+// 硬校验（测试必须覆盖）：① 目标档只认 canonical|candidate——rejected 相关一律拒（rejected 仍走既有裁定
+// 通路，删除/隔离要主人裁定，降级永不产 rejected）；② 骨架/流水区页拒（governance/skills/inbox/keeper-feedback
+// 无分层语义、且是删禁区）；③ 结构页（README/_ 前缀）与越界路径拒；④ 页不存在报错、不落地（不误改）。
+// 纯同步、不 commit：调用方（夜班 / page_set_tier 工具）在 writer.transact 内拿 changedPaths 提交。返回 from/to
+// 供审计如实记录降级前后档位（审计=落盘事实）。page 接受带/不带 .md 的实例内相对路径（与 remove_page 同族）。
+export function setPageTier({ instanceDir, page, tier }) {
+  const target = String(tier ?? '').trim().toLowerCase();
+  if (!SET_TIER_TARGETS.has(target)) {
+    return { ok: false, reason: `set_tier 目标档只认 canonical|candidate：${tier}（rejected 仍走裁定通路，不由 set_tier 产出）` };
+  }
+  if (badTarget(page)) return { ok: false, reason: `page 不合法：${page}` };
+  const rel = String(page).endsWith('.md') ? String(page) : `${page}.md`;
+  // 骨架/流水区（与 remove_page 同一 NO_DELETE_ZONES）：这些区不是分层对象，且是删禁区——不允许 set_tier
+  // 碰它们（否则 page_set_tier 高信任工具或夜班误传即可给 governance/inbox 页乱打 tier）。
+  if (NO_DELETE_ZONES.has(rel.split('/')[0])) {
+    return { ok: false, reason: `骨架/流水区页不参与分层：${rel}（${[...NO_DELETE_ZONES].join('/')} 不可 set_tier）` };
+  }
+  const base = path.basename(rel);
+  if (base === 'README.md' || base.startsWith('_')) {
+    return { ok: false, reason: `不允许对结构页 set_tier：${rel}` };
+  }
+  const abs = path.join(instanceDir, rel);
+  if (!existsSync(abs) || !statSync(abs).isFile()) {
+    return { ok: false, reason: `目标页不存在：${rel}（不误改，请确认路径）` };
+  }
+  const raw = readFileSync(abs, 'utf8');
+  const from = readTier(raw);
+  // 只翻 tier 行，不动 updated——降级是元数据操作、页内容未变；且降级恰恰针对陈旧/薄页，刷新 updated 会抹掉
+  // 「N 周未更新」的陈旧信号（recall gaps 依赖它）。setTierLine 严格限定改 frontmatter 块内的 tier 行。
+  writeFileSync(abs, setTierLine(raw, target));
+  return { ok: true, changedPaths: [rel], page: rel, from, to: target };
 }
 
 // merge_pages（M4.4 D3）：源页正文并入目标页 + 删源页清全库反链，一个原子动作。
