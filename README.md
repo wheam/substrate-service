@@ -39,7 +39,7 @@
 - **M4.5**（抗注入 + 开源打包）：✅ 已验收（编排验证：250 测试绿 + 考卷 45/45 + Codex xhigh 全批 + 两轮聚焦复核 merge-ready）——对抗金标 25→45（adversarial 5→19）；凭据红线四层加固（raw→白空格→`\p{Cf}`→`\p{Mn}/\p{Me}/\p{Cc}`，堵空白/换行/零宽/组合标记隐形拆分）；考卷 confidence 越权假绿修复；Railway 部署双真实路径（agent 驱动装 + 手动 §4，真·一键 button 待 owner 发布模板）、本地单机入口、模式 spec 对外版（docs/05）。详见 docs/03 §9。
 - **M4.6**（夜班去人化 + 裁定面按通道收窄）：✅ 已上真机（编排验证：283 测试绿 + 考卷 45/45 + Codex xhigh **两轮**对抗 review 收敛至 merge-ready；真机迁移验证：关闭 3 件遗留删页提案、零内容页误降、零错误）——夜班对薄页/重复页从删页提案改为**非破坏性降级**（`set_tier` canonical→candidate，确定性零裁定、进程内直执行；`set_tier` 被 LLM 决定显式早拒、恢复走高信任 `page_set_tier`）；裁定面按通道收窄（capture 通道只见有权兑现的件，服务端强制「不给人无权兑现的按钮」）；断链等报告落 `governance/maintenance-log.md` + digest 摘要（只带路径/计数、过 `displaySafePath` 单行化防注入）。源于夜班首跑真机复盘：主人被要求裁「做不了判断」的删页提案且裁了被弹回，违反原则 B。详见 docs/03 §9。
 - **M4.7**（`collections_search` 读侧修缮）：✅ 已上真机——收藏查询加分页（`limit`/`offset`）、列投影（`columns`）、按列过滤（`where`）、响应字节预算、`truncated` 契约（返回被裁时告知 `next_offset` + 收窄提示，让 agent 自救）；列名 header 白名单防原型污染；向后兼容零破坏。根治 Hermes 查收藏表一把全拉→MCP 返回过大被截断→退化成逐条核对小查询的真机事故。
-- **M4.8**（self-serve 接入）：📋 已立项（未开工）——把「接入第 N 个 agent」从手工发 token + 改配置 + 重启，收窄到趋近**一段 prompt / 一个链接**（自助 enrollment：一次性码换专属可吊销 token + 自配置自验证），同时保住 MCP 版的可吊销/可审计/权限分级/手机可达/治理。详见 docs/03 §8/§9。
+- **M4.8**（self-serve 接入）：✅ **已实现（待部署）**（编排验证：321 测试绿 + 考卷 45/45 + Codex 异源对抗多轮收敛）——把「接入第 N 个 agent」从手工发 token + 改配置 + 重启，收窄到趋近**一段 prompt / 一个链接**：主频道专属工具 `enroll_create` 铸一次性码 → 新 agent 拿码 `POST /enroll` 换一把专属可吊销 token + 按 `GET /enroll` 公开协议自配置自验证；`TOKENS_JSON` 降级为 bootstrap（起步一把 primary，其余走 enrollment），账本住 volume（git 外、只存 sha256）。可吊销/可审计/权限分级/手机可达/治理全保住。详见 docs/03 §8/§9。
 
 ## 文档
 

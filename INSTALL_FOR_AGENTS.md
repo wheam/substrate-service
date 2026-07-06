@@ -94,7 +94,7 @@
 
 ### 环境变量全表
 
-以 `service/src/server.js` 入口块为准（16 个）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
+以 `service/src/server.js` 入口块为准（18 个）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
 
 | 变量 | 必填 | 默认 | 说明 / 示例 |
 |---|---|---|---|
@@ -114,6 +114,8 @@
 | `FEISHU_WEBHOOK_URL` | | —（缺=只打日志） | 飞书自定义机器人 webhook，哑兜底通知。缺 → 通知只落服务日志。 |
 | `FEISHU_WEBHOOK_SECRET` | | — | 飞书 webhook 加签密钥（机器人开了「签名校验」才需要）。 |
 | `AUDIT_FILE` | | —（缺=只进 stdout） | 审计另存到卷上文件的路径。缺 → 审计只进 stdout（即 Railway 日志）。 |
+| `PUBLIC_URL` | | —（缺则回落 `RAILWAY_PUBLIC_DOMAIN`，再回落请求 Host 头） | M4.8 enrollment 用：写进铸码 prompt 与 `GET /enroll` 协议、给新 agent 的公网 base URL。**生产应显式配它**——既缺 `PUBLIC_URL` 又缺 `RAILWAY_PUBLIC_DOMAIN` 时回落到请求 Host 头（可被伪造 → 钓鱼面），此时铸码 prompt 顶部会自动挂一行钓鱼警告提示人工核对域名、服务启动也 `console.warn` 点名（不拒启，本地 dev 仍能跑）。 |
+| `ENROLL_CODE_TTL_MS` | | `900000`（15 分钟） | M4.8 enrollment 一次性码的有效期；码单次使用，超时即失效。 |
 
 **进阶 / 可选**（不在入口块里，但代码真实生效，按需用）：
 
@@ -123,6 +125,8 @@
 ---
 
 ## 5. TOKENS_JSON —— 每客户端一把 token
+
+> **M4.8 起，`TOKENS_JSON` 只是 bootstrap。** 起步只需**一把 primary**（主频道那把 high token，见下）——它解决「第一把 token 鸡生蛋」、承载 `channel: primary` 标记、并在账本损坏时作兜底通道。**其余 agent 不必再逐把手工写进这里**：由主频道铸一次性码走**自助 enrollment**（见 §6 末「接入第 N 个 agent」）。静态表与 enrollment 账本长期共存、`identify()` 静态优先。裁定见 docs/03 §9 D7。
 
 `TOKENS_JSON` 是一个 JSON 对象：**key = token 字符串，value = 该客户端的元信息**。每个客户端（每台 CC、每个 Hermes、手机 App）**各发一把独立 token**，可单独吊销、全量审计。
 
@@ -163,6 +167,16 @@
   Codex 同理用它的 `codex mcp add --url https://<domain>/mcp --bearer-token-env-var <环境变量名>`（token 走环境变量，别写进配置文件明文）。
 
 - **不消费 MCP instructions 的宿主（如 Hermes）**——它们收不到 server instructions，改走**拉取**：用**它自己那把** high token 定期 `GET https://<domain>/digest`（`Authorization: Bearer <token>`），把返回的纯文本注入常驻上下文（如 `.hermes.md`）。**不要让它复用别的客户端（如 CC）的 token**——每客户端一把是吊销与审计的底线（复用 = 撤谁都得连坐、审计里分不清谁干的、明文多放一处泄漏面）。若要 Hermes 也承担主频道职责（digest 附主频道房规 + 实时待裁摘要），就在 TOKENS_JSON 里给**它自己那把** token 标 `"channel": "primary"`——多把 primary 本就支持（§5）。
+
+### 接入第 N 个 agent（M4.8 self-serve enrollment）
+
+起步那把 primary 之后，再接**任何新 agent**（又一台 CC、又一个 Hermes、队友的只读 agent、又一部手机……）**不用再回 Railway 面板加 token / 改配置 / 重启**——走自助 enrollment，趋近「一段 prompt」：
+
+1. **主频道铸码**：在主频道 agent（primary 那把 high token）的对话里说一句，让它调 `enroll_create{client, trust, note?}`——`client` = 新 agent 的可读名（enrolled 内唯一、撞静态名会被拒）；`trust ∈ {high, low, capture}`，**档位铸码时锁死、兑换方零字段可指定 = 防提权；`channel: primary` 不可经 enrollment 发出**（治理面仍走静态 TOKENS_JSON）。工具返回一段**可直接粘贴的 prompt**（内含一次性码，默认 15 分钟单次有效）。
+2. **把 prompt 发给新 agent**：新 agent 读 prompt 里的 `GET https://<域>/enroll`（公开协议文本，同 healthz 档、无需认证）→ `POST /enroll {code}` 用码换一把**它专属、可吊销**的 token → 按协议自配置（`claude mcp add` / `codex mcp add` / Hermes 拉 `/digest`）并自跑自验（§7 子集）。全程零 Railway 面板操作、零重启。
+3. **记账与吊销**（同一主频道门）：`enroll_list` 查静态 + enrolled 全表（含 created / last_used / revoked）；`enroll_revoke{client}` 即刻吊销 enrolled token（下一请求 401；静态 token 仍回 Railway 面板删）。码 / token 明文全程不进审计、不进通知、不进日志（只记 hash 前缀）。
+
+> 机制细节（一次性码 vs 签名码 / OAuth 的取舍、铸币权窄于使用权、账本住 volume（git 外、只存 sha256）、码短时效单次 + 重放即证据、`POST /enroll` 失败限速等八条裁定）见 **docs/03 §9「M4.8 设计裁定」D1–D8**——这里只给操作口径，不复述。
 
 ---
 
