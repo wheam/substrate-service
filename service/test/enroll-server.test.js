@@ -359,3 +359,45 @@ test('重启持久化：同 statePath 新建 app，老 token 仍 MCP 读通', as
   assert.match(s.content[0].text, /coffee-brewing/);
   await reconnected.close();
 });
+
+// —— 终审收口：两源合并接缝——enrolled（经 /enroll 兑换出来的）token 走各 ACL 接缝的行为，
+// 必须与静态 token 完全同款（identify() 两源合并后喂给同一批 handler，接缝理应是同一份代码路径，
+// 但此前只有静态 token 的 ACL 覆盖，enrolled token 这条腿从没被集成测试踩过）——补三处：
+// /mcp 的 capture→403、/digest 的 low→403、/digest 的 high→200 且与静态 high 同内容。
+test('enrolled capture token 打 POST /mcp → 403（与静态 capture token 同款拦截，capture 只能投 /capture）', async () => {
+  const { baseUrl } = await startApp();
+  const primary = await mcpClient(baseUrl, 'test-token-primary');
+  const code = await mintCode(baseUrl, primary, { client: 'enrolled-capture', trust: 'capture' });
+  await primary.close();
+  const body = await (await postEnroll(baseUrl, code)).json();
+  assert.equal(body.trust, 'capture');
+
+  const res = await rawMcpInit(baseUrl, body.token);
+  assert.equal(res.status, 403);
+});
+
+test('enrolled low token 打 GET /digest → 403（digest 仅 high，enrolled 与静态 low 同款拒绝）', async () => {
+  const { baseUrl } = await startApp();
+  const primary = await mcpClient(baseUrl, 'test-token-primary');
+  const code = await mintCode(baseUrl, primary, { client: 'enrolled-low', trust: 'low' });
+  await primary.close();
+  const body = await (await postEnroll(baseUrl, code)).json();
+  assert.equal(body.trust, 'low');
+
+  const res = await fetch(`${baseUrl}/digest`, { headers: { Authorization: `Bearer ${body.token}` } });
+  assert.equal(res.status, 403);
+});
+
+test('enrolled high（非 primary）token 打 GET /digest → 200 且含接入房规（与静态 high 同款 digest）', async () => {
+  const { baseUrl } = await startApp();
+  const primary = await mcpClient(baseUrl, 'test-token-primary');
+  const code = await mintCode(baseUrl, primary, { client: 'enrolled-high', trust: 'high' });
+  await primary.close();
+  const body = await (await postEnroll(baseUrl, code)).json();
+  assert.equal(body.trust, 'high');
+
+  const res = await fetch(`${baseUrl}/digest`, { headers: { Authorization: `Bearer ${body.token}` } });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.match(text, /接入房规/, 'enrolled high 应拿到与静态 high 同款 digest（含接入房规段）');
+});

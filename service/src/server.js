@@ -207,6 +207,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
 
   // malformed JSON body（双审 Major#3）：express.json() 解析失败会 next(err)、绕过上面的路由 → 既不计限速也不审计。
   // 只收口 /enroll POST 的 body 解析错误：按失败计数 + 审计（reason:'malformed'），其它路径/其它错误照原样交默认处理。
+  // 已知边界：超过 express.json 1MB 上限的 body 抛 entity.too.large（非 parse.failed），走 413 不计入限速桶；
+  // 大 body 攻击成本自限，不构成放大面。
   app.use((err, req, res, next) => {
     if (err?.type === 'entity.parse.failed' && req.method === 'POST' && req.path === '/enroll') {
       const cleanIp = sanitizeIp(req.headers['x-forwarded-for'] ?? req.ip);
