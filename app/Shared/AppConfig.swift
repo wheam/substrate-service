@@ -11,7 +11,7 @@ enum AppConfig {
     }
 
     static var serverURL: String {
-        get { defaults.string(forKey: "serverURL") ?? "https://redacted.example.com" }
+        get { defaults.string(forKey: "serverURL") ?? "" }
         set { defaults.set(newValue, forKey: "serverURL") }
     }
 
@@ -20,7 +20,7 @@ enum AppConfig {
         set { defaults.set(newValue, forKey: "captureToken") }
     }
 
-    static var isConfigured: Bool { !token.isEmpty }
+    static var isConfigured: Bool { !token.isEmpty && !serverURL.isEmpty }
 
     static var queueFileURL: URL {
         let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)

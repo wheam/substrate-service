@@ -95,7 +95,7 @@ test('backfill CLI：dry-run 入口可跑，退出码 0', () => {
 });
 
 // ==== doctor/curate 宽容性（M4.1 前提：引擎零改动，未知 frontmatter 键不报 error）====
-// 说明：真实 vendored doctor.py 不在本服务仓库（在真实例 redacted-instance）；fixture 只 vendored 了
+// 说明：真实 vendored doctor.py 不在本服务仓库（在真实例私库）；fixture 只 vendored 了
 // curate.py / collections.py / render-context.py 三个 stub。这里验证——服务运行时【实际会调用】的
 // 那个 vendored 脚本（curate.py reindex）对带未知键（content_id/tier/source_agent/epistemic_type）
 // 的页宽容不报错；且服务自己的 frontmatter 解析（parseZones 等）同样宽容。

@@ -3,7 +3,7 @@
 > 状态：PLANNED（2026-07-03，设计已收敛，未动工）
 > 分两步：**[01-个人版（我的）](01-personal-alpha.md)** → **[02-长期产品化](02-productization.md)**
 > 本文件夹只放方案；代码将来放**新仓库**（暂名 `substrate-service`），与引擎仓库 `substrate` 分离。
-> 本方案不改动引擎仓库，也不改动个人实例（redacted-instance）——动工前它们保持现状运转。
+> 本方案不改动引擎仓库，也不改动个人实例（私有实例库）——动工前它们保持现状运转。
 
 ## 一句话
 
@@ -52,7 +52,7 @@
 |---|---|---|---|
 | `substrate`（现有） | 引擎：格式、governance、schemas、参考 skill、迁移 | 公开 | **不动**。继续作为 open-core 的"core"：格式与治理规则的事实源、自托管入口、信任背书 |
 | `substrate-service`（新建） | MCP server、keeper、capture 端点、（后续）手机 App、（产品期）账号/多租户 | 先私有 | 本方案的全部代码落这里 |
-| `redacted-instance`（现有） | 个人实例（数据） | 私有 | **不动**。将来被服务端 clone 为工作副本 |
+| 个人实例私库（现有） | 个人实例（数据） | 私有 | **不动**。将来被服务端 clone 为工作副本 |
 
 **依赖方向**：service 操作"实例"，而实例是自包含的（vendored 了 curate/collections/doctor 等零依赖脚本）——所以 **keeper 的执行器直接用实例内的脚本**，service 运行时不需要引擎在场；引擎只在版本升级（--refresh / migrate）时出现，与今天的模式一致。service 对引擎只有一个弱依赖：契约（schemas、zones 格式）按引擎版本号 pin。
 
@@ -72,7 +72,7 @@
 ## 动工前的现状快照（2026-07-03，给接手的 session）
 
 - **引擎仓库**：`~/Downloads/personalwiki-v2-design/substrate`（公开，github.com/wheam/substrate）。153 测试全绿，已推送（HEAD `b4021f0`），CI 绿。**本方案不改它**。
-- **实例仓库**：`~/redacted-instance`（私有，github.com/wheam/redacted-instance）。已补齐实例 CI / .gitattributes / 撞车协议，vendored skill 为引擎 `b4021f0` 版。**本方案动工前不改它**；M1 起服务端从 GitHub clone 它作工作副本。
+- **实例仓库**：`~/<instance-repo>`（私有）。已补齐实例 CI / .gitattributes / 撞车协议，vendored skill 为引擎 `b4021f0` 版。**本方案动工前不改它**；M1 起服务端从 GitHub clone 它作工作副本。
 - **现有 fleet**（MBP + Mac mini/OpenWrt/Railway 的 Hermes）：照常运转，**不再投入**（不追加同步/接线工作），等 M2 后按 01 的切换表逐台迁移。
 - **本机 CC/Codex 里的 substrate skill 停在 6-27 版是有意冻结**——不要"好心补齐同步"；切 MCP 后它们会被整体卸载。
 

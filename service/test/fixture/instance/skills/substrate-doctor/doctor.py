@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # fixture stub：最小 doctor——只校验 governance/zones.md 的 yaml 块可解析 + 每个注册 zone 的目录存在。
-# 真实 doctor 归引擎测试管（在真实例 redacted-instance）；这里只求「schema_apply 落地 doctor 0 error」端到端可真验。
+# 真实 doctor 归引擎测试管（在真实例私库）；这里只求「schema_apply 落地 doctor 0 error」端到端可真验。
 # 末行固定输出 `→ N error(s)`（keeper/executor 的 runDoctor 用正则 `→ (\d+) error` 抽 N）。
 import sys, re, pathlib
 

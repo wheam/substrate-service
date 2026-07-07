@@ -54,7 +54,7 @@
 
 服务操作的「实例」是一个**私有 GitHub repo**（markdown + git + governance）。两种情况：
 
-- **主人已有 substrate 实例**（如 `redacted-instance`）→ 直接用它，记下它的 git URL 作 `REPO_URL`。
+- **主人已有 substrate 实例**（如 `<your-instance>`）→ 直接用它，记下它的 git URL 作 `REPO_URL`。
 - **没有** → 按**附录 A** 起一个最小实例（能跑通全链的最小形状）。它日后可以整体换成 [substrate 引擎](https://github.com/wheam/substrate)的完整 vendored 版，不用推翻重来。
 
 ### 实例契约（服务对实例的**全部**依赖，逐行来自代码）
