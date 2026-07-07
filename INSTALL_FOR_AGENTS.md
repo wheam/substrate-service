@@ -80,7 +80,7 @@
 
 ## 4. 部署到 Railway（你来执行）
 
-> ⚠️ **本仓库的 Dockerfile 在 `service/` 子目录里，不在仓库根**（`service/Dockerfile`）。它的 `COPY package.json src docker-entrypoint.sh` 全是相对 `service/` 的路径，入口是 `docker-entrypoint.sh → node src/server.js`。所以 **build context 必须是 `service/`**——在 Railway 里把服务的 **Root Directory 设成 `service`**，否则 Railway 在仓库根找不到 Dockerfile、或 `COPY` 路径对不上，build 会失败。基础镜像已装 `git` / `python3` / `openssh-client`，所以实例的 `.py` 脚本在容器里能跑、私库能拉。
+> ⚠️ **本仓库的 Dockerfile 在 `service/` 子目录里，不在仓库根**（`service/Dockerfile`）。它的 `COPY package.json package-lock.json src docker-entrypoint.sh` 全是相对 `service/` 的路径，入口是 `docker-entrypoint.sh → node src/server.js`。所以 **build context 必须是 `service/`**——在 Railway 里把服务的 **Root Directory 设成 `service`**，否则 Railway 在仓库根找不到 Dockerfile、或 `COPY` 路径对不上，build 会失败。基础镜像已装 `git` / `python3` / `openssh-client`，所以实例的 `.py` 脚本在容器里能跑、私库能拉。
 
 按硬规矩 2，下面每一步开跑前先跟主人对一遍。顺序：
 
@@ -94,7 +94,7 @@
 
 ### 环境变量全表
 
-以 `service/src/server.js` 入口块为准（18 个）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
+以 `service/src/server.js` 入口块为准（19 个，含 `RAILWAY_PUBLIC_DOMAIN`）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
 
 | 变量 | 必填 | 默认 | 说明 / 示例 |
 |---|---|---|---|

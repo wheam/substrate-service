@@ -71,7 +71,7 @@
 
 ## 动工前的现状快照（2026-07-03，给接手的 session）
 
-- **引擎仓库**：`~/Downloads/personalwiki-v2-design/substrate`（公开，github.com/wheam/substrate）。153 测试全绿，已推送（HEAD `b4021f0`），CI 绿。**本方案不改它**。
+- **引擎仓库**：`<workspace>/substrate`（公开，github.com/wheam/substrate）。153 测试全绿，已推送（HEAD `b4021f0`），CI 绿。**本方案不改它**。
 - **实例仓库**：`~/<instance-repo>`（私有）。已补齐实例 CI / .gitattributes / 撞车协议，vendored skill 为引擎 `b4021f0` 版。**本方案动工前不改它**；M1 起服务端从 GitHub clone 它作工作副本。
 - **现有 fleet**（MBP + Mac mini/OpenWrt/Railway 的 Hermes）：照常运转，**不再投入**（不追加同步/接线工作），等 M2 后按 01 的切换表逐台迁移。
 - **本机 CC/Codex 里的 substrate skill 停在 6-27 版是有意冻结**——不要"好心补齐同步"；切 MCP 后它们会被整体卸载。
