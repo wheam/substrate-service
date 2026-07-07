@@ -3,3 +3,9 @@ node_modules/
 .env.*
 *.log
 .DS_Store
+
+# 本地保留、不进公开库（2026-07-07 开源暴露面处置）
+CLAUDE.md
+TempContext.md
+AUDIT-2026-07-06.md
+.claude/
