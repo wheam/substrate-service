@@ -35,10 +35,14 @@ function makeInstance() {
 test('remove_page：keeper 按主人删除意图删页、播报、可从 git 历史找回', async () => {
   const { origin, work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  // SEC-2（审计 B §4 + 二轮加固）：kind=remove 旁路现【额外】要求件是服务端亲生【且未被篡改】（entry.__native，按内容
+  // 绑定 token 复算）——inbox 与 keeper 须共享同一个 nativeReg Map（生产 createApp 经 app.locals 同款接线），合法
+  // remove 工具经 addEntry 造件才被 keeper 认作 native remove 予以删除。缺此共享则 keeper 看不见 inbox 亲生登记 → 安全失败（held）。
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg });
   const messages = [];
   const keeper = createKeeper({
-    instanceDir: work, writer,
+    instanceDir: work, writer, nativeReg,
     provider: { judge: async () => ({ json: { disposition: 'canonical', zone: 'knowledge', action: 'remove_page', target: 'coffee-brewing', summary: '删除手冲咖啡页', confidence: 0.95 }, model: 'flash', usage: {} }) },
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,

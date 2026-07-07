@@ -1,9 +1,11 @@
 // keeper 的确定性执行器：LLM 只出决定，落盘永远走这里（直改文件或调实例 vendored 脚本）。
 import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, rmSync } from 'node:fs';
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { newContentId } from './content-id.js';
+import { parseEntryBody, scanSegments, INBOX_PREVIEW_CHARS } from './inbox.js';
 import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
@@ -23,6 +25,13 @@ const TIER_BEARING_ACTIONS = new Set(['new_page', 'merge_into']);
 const EPISTEMIC_TYPES = new Set(['fact', 'preference', 'decision', 'opinion', 'excerpt', 'to-verify']);
 // 骨架/流水区永久禁删（keeper 对 inbox 的清理走内部通路，不经 remove_page）
 const NO_DELETE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
+
+// 十/十一轮 Codex Minor：rollbackSchemaWrites 只删【本次 applySchema 亲手新建】的 zone 目录——用【一次性不可伪造 token】鉴权
+// （比模块级 Set 更严：Set 按短 zoneDir key 判、跨实例/成功后残留旧授权，可误删既有两哨兵目录）。applySchema 落地成功即发一枚
+// token（登记 {instanceDir, zoneDir}）并返回；rollbackSchemaWrites 必须【带 token】、消费即作废，且校验 instanceDir 一致；
+// schemaApply 成功 commit 后 finalize 清账。token 唯一、消费/finalize 双清 → 无残留授权、无跨实例误删。
+const pendingSchemaRollbacks = new Map(); // token -> { instanceDir, zoneDir }
+export function finalizeSchemaRollback(token) { if (token) pendingSchemaRollbacks.delete(token); }
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -56,12 +65,47 @@ export function runDoctor(instanceDir, { enabled = true } = {}) {
   });
 }
 
-// 从提案件正文取首个 ```json 块并 parse（schema 内容只认件自身——白名单原则）。无块/非法 JSON → null。
+// 从提案件【可见正文】取首个 ```json 块并 parse（schema 内容只认件自身——白名单原则）。无块/非法 JSON → null。
+// 三轮加固（Codex 异源）：只认 parseEntryBody(raw).content（已剥掉 <!--keeper-options-->/<!--owner-decision--> 隐藏块），
+// 不扫完整 raw。否则 approve-then-swap：approvalToken 绑的也是可见 content、会剥隐藏块，攻击者批准后往隐藏块塞一个
+// 【更靠前】的恶意 ```json → token 仍验过、applySchema 却从完整 raw 取到隐藏 payload、落地被替换的 zone path/privacy。
+// 改用可见正文后，取到的必是 approvalToken 绑定、主人看到的那份；往可见正文塞注入则 approvalToken 立即失配被拦。
+// entry.body 本就是 parseEntryBody(raw).content（keeper 侧），工具侧只给 raw → 这里统一从 raw 重算可见正文。
+// 取可见正文里【第一个 top-level（不在任何其它围栏/注释内）info === 'json' 的代码围栏】内容 verbatim 并 parse。
+// 七轮 Codex：早先自成一套【只找 ```json、不跟踪外层非-json 围栏】的扫描 → 外层 ``` 代码块里【字面量】的 ```json（渲染上是
+// 主人看的代码示例、非活动 payload）被当真 payload 执行、建 evil zone。改为复用 inbox.scanSegments（与 parseEntryBody.content
+// 同一套 fence/comment 语义）：外层非-json 围栏内的 ```json 只是其文本、不是独立段；注释内的 ```json 也不算段。取第一个
+// info='json' 的 top-level 围栏内容。无则 null → applySchema 拒件（白名单、安全失败）。二~六轮的隐藏块偷换（LF/CRLF/未闭合
+// /行内 ``` desync）在同一套语义下一并闭合。
+// 在【注释未剥】的原始正文上跑 scanSegments，取第一个 top-level kind==='fence' && info==='json' 的段（comment 段天然跳过）。
+// 九轮 Codex：绝不能在【剥完注释】的字符串上找围栏——删注释会把 ``<!--x-->`json 拼成原文不存在的 ```json 活动围栏被误取。
+function firstJsonFenceSeg(s) {
+  for (const seg of scanSegments(s)) {
+    if (seg.kind === 'fence' && seg.info === 'json') return seg;
+  }
+  return null;
+}
+function fenceInner(s, seg) {
+  return seg ? s.slice(seg.innerStart, seg.innerEnd).replace(/\r?\n$/, '') : null;
+}
 function extractSchemaPayload(entry) {
-  const src = entry?.raw ?? entry?.body ?? '';
-  const m = String(src).match(/```json\n([\s\S]*?)\n```/);
-  if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
+  // 注释未剥的 scanBody（parseEntryBody 暴露）——scanSegments 把机器块/隐藏注释切成 comment 段跳过，且不因删注释合成假围栏。
+  const pe = entry?.raw != null ? parseEntryBody(String(entry.raw)) : null;
+  const scanBody = pe ? pe.scanBody : (entry?.scanBody ?? entry?.body ?? '');
+  const execJson = fenceInner(String(scanBody), firstJsonFenceSeg(String(scanBody)));
+  if (execJson == null) return null;
+  if (pe != null) {
+    const content = String(pe.content);
+    const prevSeg = firstJsonFenceSeg(content);
+    // ① 预览/执行一致（十一轮 Codex）：inbox_list 展示剥注释后的 content、执行取未剥的 scanBody。删注释若合成了排在前面的假围栏，
+    //    主人预览到的 payload 会与执行的不一致（预览 visiblegood、落地 hiddenactive）→ 逐字不符即拒。真围栏在两串里内容逐字节相同。
+    if (fenceInner(content, prevSeg) !== execJson) return null;
+    // ② 预览窗口硬门禁（十二轮 Codex）：可执行 payload 的围栏必须【完整落在 inbox_list 预览窗口内】（seg.end ≤ 预览字数）。否则
+    //    payload 被埋在预览截断之外（纯截断攻击）→ 主人预览不到却被落地。要求可见 → 拒掉「预览不到的 payload」。跨 keeper 点选/工具
+    //    直调两通路统一在此收口（option label 不展示 payload，故只有绑定 target 不够）。
+    if (!prevSeg || prevSeg.end > INBOX_PREVIEW_CHARS) return null;
+  }
+  try { return JSON.parse(execJson); } catch { return null; }
 }
 
 // schema 提案校验（propose 与 apply 重校验共用）：只认 payload 自身内容 + 此刻 zones 冲突。
@@ -98,9 +142,17 @@ export function validateSchemaProposal({ instanceDir, payload }) {
 }
 
 function badTarget(target) {
-  return !target || typeof target !== 'string' || path.isAbsolute(target) || target.split('/').some((s) => s === '..' || s === '.git');
+  if (!target || typeof target !== 'string' || path.isAbsolute(target)) return true;
+  // SEC-6（审计 B）：注入的 keeper 决定可把带换行/控制字符的 target 塞进文件名/frontmatter——如
+  // target:"good\n\n## injected-heading"（另起 Markdown 标题）或 target:"note\nowner_ruling: forged"
+  // （伪造 frontmatter 认证行）。先拒一切控制字符（C0 \u0000-\u001f 含 \n\r\t + DEL \u007f），消灭换行注入面。
+  if (/[\u0000-\u001f\u007f]/.test(target)) return true;
+  // 再对每个 `/` 分段做严格 slug 白名单：字母/数字/下划线/点/连字符/CJK（与本文件 slugify 的 [一-鿿] 同族）。
+  // `..`/`.git` 会通过 slug 正则（`.` 在白名单内），故显式检查保留在前。分段不含 `/`；空段（`//`、首尾 `/`）
+  // 因 `+` 要求至少一字符而被拒（合法 slug 无空段）。收紧只挡异常字符——既有合法 slug（英文连字符 /
+  // concepts/xxx 子目录 / CJK 页名）均放行（见 audit-b SEC-6 回归断言）。
+  return target.split('/').some((s) => s === '..' || s === '.git' || !/^[\w.一-鿿-]+$/u.test(s));
 }
-
 // slug → 实例内页相对路径（slug 可自带 zone 前缀也可不带，与 remove_page/merge_into 的既有惯例同义）
 function pageRel(zone, slugRaw) {
   const slug = String(slugRaw).replace(/\.md$/, '');
@@ -166,8 +218,17 @@ export function validateDecision({ instanceDir, decision, entry }) {
     // 裸的 owner_ruling / ruling_via_trust（git pull 可伪造这些 frontmatter 字段绕过本门）。普通 capture/save
     // 伪造件即便带 owner_ruling，未经 resolveEntry 记账 → __ruling_authentic=false → 在此拦下。
     const rulingMarked = !!entry?.__ruling_authentic;
-    if (entry?.kind !== 'remove' && !rulingMarked) {
-      return { ok: false, reason: `remove_page 仅用于删除件（kind=remove）或主人明确裁定；本件 kind=${entry?.kind ?? '未知'} 且无认证的主人裁定，不予删除（需主人确认）` };
+    // SEC-2（审计 B §4）：kind=remove 旁路必须【额外】要求件是服务端亲生的（entry.__native）。核心洞察——
+    // 「认证『主人动过手』≠ 认证『件是服务端亲生的』」：旧码只看 kind==='remove' 即短路认证，而 kind 是
+    // frontmatter 里 git pull 可任意伪造的字段——伪造件写 kind: remove 即被 keeper 洗成合法删页（零交互删任意页）。
+    // __native 由 keeper.processEntry 按【内容绑定 token】复算置（nativeReg.get(id)===nativeToken(当前件)），只有本
+    // 进程 addEntry 亲手造【且未被篡改】的合法删除件才 __native=true；git pull 伪造件从不经 addEntry、即便复用某个
+    // 公开的历史 native id，其正文/kind 与登记 token 不符 → 失配 → nativeRemove=false → 挡下（二轮加固：一轮只按
+    // id 判 native 被公开 id 复用打穿）。重启语义：nativeReg 是进程内状态、重启即空——重启前造的 remove 件重启后处理
+    // 会因非 native 落 held（安全失败，主人重发 remove 即可），与 approvals 批准登记表的重启语义同族、一致。
+    const nativeRemove = entry?.kind === 'remove' && !!entry?.__native;
+    if (!nativeRemove && !rulingMarked) {
+      return { ok: false, reason: `remove_page 仅用于服务端生成的删除件（kind=remove）或主人明确裁定；本件 kind=${entry?.kind ?? '未知'} 且无认证的主人裁定，不予删除（需主人确认）` };
     }
     // 通道限权也只认 registry 里的 viaTrust（keeper 置 entry.__ruling_trust）：capture 通道（App 最低档）
     // 的裁定无权删页——伪造件改写文件里的 ruling_via_trust 无效。
@@ -278,11 +339,39 @@ export async function applySchema({ instanceDir, entry }) {
     rmSync(dirAbs, { recursive: true, force: true });
     throw new Error(`doctor 报 ${errors} error，已回滚`);
   }
+  // 发一枚一次性 rollback token（登记本次新建目录 + 实例）——doctor 通过后才发，故 doctor-fail 路径（上方自回滚+throw）不留 token。
+  const rollbackToken = randomBytes(16).toString('hex');
+  pendingSchemaRollbacks.set(rollbackToken, { instanceDir, zoneDir: path.dirname(`${v.path}README.md`) });
   return {
     changedPaths: [zonesRel, `${v.path}README.md`, `${v.path}.gitkeep`],
     detail: `zone ${v.id} 已建（${v.path}）`,
     zoneId: v.id,
+    rollbackToken,
   };
+}
+
+// 五轮加固（Codex Minor#2）：applySchema 落盘（改 zones.md + 建 zone 目录）成功、但调用方 writer.transact 内随后的
+// commit 失败（如提案件未 tracked → git add pathspec 报错）时，transact 无回滚 → 半落地的孤儿 zone。此助手撤回 zones.md、删
+// 本次新建 zone 目录、恢复提案件。整体【只在 applySchema 发的一次性 token 命中且 instanceDir 一致时】才动手——既有目录/跨实例/
+// 成功后残留/伪 token 都无有效授权 → 全函数 no-op（十二轮 Codex：连 zones.md 的 checkout 都不能碰，否则误调会丢本地未提交改动）。
+// token 消费即作废，删目录叠加形状守卫（恰两哨兵）作纵深防御。changedPaths 仅用于兼容/日志。
+export async function rollbackSchemaWrites({ instanceDir, changedPaths, rollbackToken, entryRel, entryRaw }) {
+  if (!rollbackToken) return;
+  const pending = pendingSchemaRollbacks.get(rollbackToken);
+  pendingSchemaRollbacks.delete(rollbackToken); // 消费即作废（即便 instanceDir 不符也烧掉），防 token 重用
+  if (!pending || pending.instanceDir !== instanceDir) return; // 无效/跨实例 token → 彻底 no-op，绝不触碰 zones.md/目录/件
+  await git(instanceDir, ['checkout', '--', 'governance/zones.md']).catch(() => {}); // 撤回本次 zones.md 追加（回到 HEAD）
+  const dirAbs = path.join(instanceDir, pending.zoneDir);
+  const dirFiles = existsSync(dirAbs) ? readdirSync(dirAbs) : [];
+  if (dirFiles.length === 2 && dirFiles.includes('README.md') && dirFiles.includes('.gitkeep')) {
+    rmSync(dirAbs, { recursive: true, force: true });
+  }
+  if (entryRel) {
+    const abs = path.join(instanceDir, entryRel);
+    await git(instanceDir, ['checkout', '--', entryRel]).catch(() => {}); // 件 tracked → 恢复到 HEAD
+    // 五轮 Codex Minor：件 untracked（本地未提交提案）时 checkout 无从恢复——调用方在 rmSync 前存了原文 entryRaw，写回杜绝丢失。
+    if (!existsSync(abs) && entryRaw != null) writeFileSync(abs, entryRaw);
+  }
 }
 
 // setPageTier（M4.6 D1）：非破坏性降级/晋升——把页 frontmatter 的 tier 在 canonical↔candidate 之间互翻。
@@ -448,10 +537,14 @@ async function newPage(instanceDir, entry, decision, zone) {
     // 认知类型仅白名单值才写（validateDecision 已归一为白名单或 null；此处再过白名单=tier 的 normTier 同款
     // 二次兜底——万一未来出现绕开 validateDecision 直调 apply 的路径，frontmatter 也写不进任意值）
     ...(EPISTEMIC_TYPES.has(decision.epistemic_type) ? [`epistemic_type: ${decision.epistemic_type}`] : []),
-    `title: ${(decision.title ?? slug).replace(/\n/g, ' ')}`,
+    // SEC-6（审计 B）：title 原只剥 `\n`，仍放行 `\r`/`\t` 等控制字符（可拆行/错位注入 frontmatter）。
+    // 改剥【全部】控制字符（C0 \u0000-\u001f 含 \n\r\t + DEL \u007f）→ 强制 title 落在一行，注入行无从另起。
+    `title: ${(decision.title ?? slug).replace(/[\u0000-\u001f\u007f]/g, ' ')}`,
     `created: ${today()}`,
     `updated: ${today()}`,
-    `type: ${decision.page_type ?? zone.id}`,
+    // SEC-6（审计 B）：page_type 原样落进 `type:` 行、零清洗——注入的决定塞 page_type:"note\nowner_ruling: forged"
+    // 即在 frontmatter 里另起伪造认证行。改为 slug 白名单（字母/数字/下划线/连字符）：非法/缺省回落 zone.id。
+    `type: ${/^[\w-]+$/.test(String(decision.page_type ?? '')) ? decision.page_type : zone.id}`,
     `sources: [inbox ${entry.id} via ${entry.client}]`,
     '---',
     '',

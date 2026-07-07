@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWriter } from '../src/writer.js';
-import { createInbox } from '../src/inbox.js';
+import { createInbox, nativeToken } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
@@ -134,7 +134,11 @@ test('capture 通道的裁定无权触发删页：remove_page 校验直接不过
 test('listEntries：正文干净（不含 keeper 注记）、解析 held 人话原因与候选方案', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  // 二轮加固：native 绑定改内容绑定（含 options 原文）。本测试手工模拟 keeper 置 held + 写候选块——须同款
+  // 模拟 keeper.holdEntry 对 native 件的【绑定刷新】（加了 options 就重绑 nativeReg），否则内容绑定 gate 会把
+  // 手工注入的 merge_into（破坏性）候选当作篡改挡下。补这一步后，本用例即成「合法 native held 件的破坏性候选可点选」的正向覆盖。
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg });
   const r = inbox.addEntry({ kind: 'save', content: '原始内容一句话', client: 'cc-test' });
   await r.synced;
   // 模拟 keeper 置 held + 写候选方案块
@@ -147,6 +151,8 @@ test('listEntries：正文干净（不含 keeper 注记）、解析 held 人话�
     { label: '扔掉别存', decision: { disposition: 'forbidden', zone: 'memory', action: 'merge_into', target: 'x', summary: 's2', confidence: 0.9, reject_reason: '主人选择不保存' } },
   ] })}\n-->\n`;
   fs.writeFileSync(abs, raw);
+  // 同 keeper.holdEntry：native 件写了 options 后刷新内容绑定（含新 options 原文），令主人点选合法候选不被误挡。
+  nativeReg.set(r.id, nativeToken({ id: r.id, rel: r.path, kind: 'save', client: 'cc-test', raw }));
   const e = inbox.listEntries().entries.find((x) => x.id === r.id);
   assert.equal(e.content, '原始内容一句话', '正文不应包含 keeper 注记与候选块');
   assert.match(e.reason, /local-only 在服务端无意义/);
@@ -167,7 +173,9 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表
-  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const nativeReg = new Map(); // SEC-5 二/三轮：inbox 与 keeper 须共享亲生登记表（生产 createApp 经 app.locals 同款接线）
+                               // ——keeper.holdEntry 生成 options 时刷新绑定，resolveEntry 才认得这份合法候选。
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg });
   const calls = [];
   const provider = {
     judge: async (req) => {
@@ -183,7 +191,7 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
   };
   const messages = [];
   const keeper = createKeeper({
-    instanceDir: work, writer, provider, approvals,
+    instanceDir: work, writer, provider, approvals, nativeReg,
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,
   });

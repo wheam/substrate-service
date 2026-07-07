@@ -2,8 +2,16 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
-import { parseZones, canRead, zoneFor } from './acl.js';
+import { parseZones, canRead, canReadZone, zoneFor } from './acl.js';
 import { readTier, normalizeInclude, isQuarantineRejected } from './tier.js';
+
+// SEC-6：直读结果面路径单行化——删控制字符（\r\n\t 等 Cc）+ Unicode 格式字符（零宽/BOM 等 Cf）+
+// 行/段分隔符（U+2028/U+2029，Zl/Zp）。search 返回的 path、recall 的 citations path 都是裸文件名、未过任何
+// 中和；攻击者可 push 一个文件名内嵌换行/Markdown/控制字符的伪造件（经 git pull 进库），裸拼进下游 agent
+// 的提示面即成注入（keeper.js 的 displaySafePath 为治理/日志面建的中和，直读结果面没享受到）。
+// 只【删】不实体化——保持路径仍可回传 read_page；合法路径本不含这些字符（零副作用），带这些字符的文件名
+// 是病态伪造件，删后不可用即预期。刻意不复用 displaySafePath（它把 [ / # / 反引号实体化，会让路径无法回传）。
+const oneLinePath = (p) => String(p ?? '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, '');
 
 const SEARCH_EXTS = new Set(['.md', '.csv', '.txt']);
 const MAX_RESULTS = 50;
@@ -83,7 +91,8 @@ export function createTools({ instanceDir }) {
       const lines = text.split('\n');
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].toLowerCase().includes(needle)) {
-          results.push({ path: rel, line: i + 1, tier, snippet: lines[i].trim().slice(0, MAX_SNIPPET) });
+          // SEC-6：path 单行化后再入结果——裸 rel 可能带换行/控制字符（伪造文件名注入），下游不得原样拼提示面。
+          results.push({ path: oneLinePath(rel), line: i + 1, tier, snippet: lines[i].trim().slice(0, MAX_SNIPPET) });
           if (results.length >= MAX_RESULTS) return { results, truncated: true };
         }
       }
@@ -93,7 +102,19 @@ export function createTools({ instanceDir }) {
 
   async function readPage({ path: relPath, trust = 'low' }) {
     const { abs, rel } = safeResolve(relPath);
-    if (!canRead(zones(), rel, trust)) {
+    // SEC-3：read_page 必须命中【注册 zone】且过 canReadZone。
+    // 洞在哪：acl.js 的 canRead(null, trust) 对未注册 zone 恒返回 true（为 search/index「未注册即不扫」的收紧
+    // 而设的默认放行）。read_page 这条直读通路旧代码直接调 canRead，误用了这个默认放行——低信任/免认证客户端
+    // 只要知道路径即可直读 inbox/（别的客户端在途待判正文，含 memory 事实）、keeper-feedback/_cases.md（主人裁定
+    // 史）、governance/、skills/。search/index 侧都精心收紧成「只扫注册 zone」，唯独 read_page 漏了。
+    // 修法：要求 zoneFor 非 null（命中注册 zone）+ 过 canReadZone；未注册路径（inbox/keeper-feedback/governance/
+    // skills 及任何非 zone 根文件）一律拒——那正是漏洞面。zone 判定在 exists 之前，顺带不给未注册路径存在性预言。
+    const zs = zones();
+    const zone = zoneFor(zs, rel);
+    if (!zone) {
+      throw new Error(`拒绝：${rel} 不在可读知识分区内（inbox/治理/骨架区不经 read_page 读取；如需管理读取请用高信任专用通路）`);
+    }
+    if (!canReadZone(zone, trust)) {
       throw new Error(`拒绝：${rel} 属于 sensitive 敏感分区，当前客户端信任级不足`);
     }
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`没有这个文件：${rel}`);

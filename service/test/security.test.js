@@ -143,24 +143,30 @@ test('F1④ 正常 resolveEntry 点选批准 → keeper 全链 filed（registry 
 
 // ==================== F2：maintenance 点选执行绑定可见 payload ====================
 
-// 伪造 held maintenance 件：可见 json 块说删 decoy 页（op:remove_page page:thin-decoy），
+// held maintenance 件：可见 json 块说删 decoy 页（op:remove_page page:thin-decoy），
 // 但隐藏 options[0] 的 label「扔掉这提案」背后的决定实为 remove_page(coffee-brewing 要害页)。
 // owner 以为点的是「扔掉」→ resolveEntry({option:0}) 认证通过（F1 挡不住，主人确实点了）→
 // keeper 必须比对可见 payload、发现决定与之不符 → re-held，绝不删 coffee-brewing。
+// SEC-5（审计 B §4）改动后：本件改为经 addEntry【服务端亲生】（native）——nativeIds 命中 → resolveEntry 的破坏性
+// 候选 native gate 放行（合法 held 提案的点选不误伤），令本用例专测 keeper 的 F2 纵深防御 maintenancePayloadMismatch。
+// 对应的现实威胁：nightly 亲生的 maintenance 件（id 入 nativeIds）经 pull 被【仅】篡改隐藏 options 决定（正文可见 json
+// 不动 → 件仍 native、正文 token 不含 options 块仍验过）→ SEC-5 挡不住（native），唯 F2 交叉校验能拦。
+// 伪造（非 native）件点选破坏性候选被 SEC-5 更早在 resolveEntry throw 挡下，另见 audit-b-approval-delete.test.js。
 test('F2 隐藏 options 决定与可见 json payload 不符（label 撒谎）→ 点选后不删要害页、re-held', async () => {
   const { work } = makeInstance();
   const { inbox, keeper } = setup(work);
   assert.ok(existsSync(path.join(work, 'knowledge', 'coffee-brewing.md')), '前置：要害页在');
   const hiddenDecision = { disposition: 'canonical', action: 'remove_page', zone: 'knowledge', target: 'coffee-brewing', summary: '删', confidence: 1 };
   const visibleJson = { op: 'remove_page', zone: 'knowledge', page: 'knowledge/thin-decoy.md' }; // 可见提案说删的是 decoy
-  const body = `夜班发现薄页：knowledge/thin-decoy.md 建议删除。\n\n\`\`\`json\n${JSON.stringify(visibleJson, null, 2)}\n\`\`\`\n\n<!--keeper-options\n${JSON.stringify({ options: [{ label: '扔掉这提案', decision: hiddenDecision }] })}\n-->\n`;
-  const { id, rel } = forge(work, { kind: 'maintenance', status: 'held', body, suffix: 'f2a' });
-  const resolved = inbox.resolveEntry({ id, option: 0, via: 'cc-main', viaTrust: 'high' });
+  const content = `夜班发现薄页：knowledge/thin-decoy.md 建议删除。\n\n\`\`\`json\n${JSON.stringify(visibleJson, null, 2)}\n\`\`\`\n`;
+  const r = inbox.addEntry({ kind: 'maintenance', content, client: 'nightly', status: 'held', optionsBlock: { options: [{ label: '扔掉这提案', decision: hiddenDecision }] } });
+  await r.synced;
+  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'cc-main', viaTrust: 'high' });
   await resolved.synced;
   const result = await keeper.processPending();
   assert.equal(result.held, 1, '决定与可见 payload 不符 → re-held');
   assert.ok(existsSync(path.join(work, 'knowledge', 'coffee-brewing.md')), 'label 撒谎的隐藏决定不得删要害页');
-  assert.match(readFileSync(path.join(work, rel), 'utf8'), /status: held/, '件复位 held 待复核');
+  assert.match(readFileSync(path.join(work, r.path), 'utf8'), /status: held/, '件复位 held 待复核');
 });
 
 test('F1⑤ 认证后执行即销账（防重放）：filed 后 approvals 里该 id 已删', async () => {

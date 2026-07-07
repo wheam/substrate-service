@@ -16,7 +16,7 @@ import { createWriter } from './writer.js';
 import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
 import { createKeeper } from './keeper.js';
 import { createNightly, formatNightlyDigest } from './nightly.js';
-import { applySchema, validateSchemaProposal, setPageTier } from './executor.js';
+import { applySchema, validateSchemaProposal, setPageTier, rollbackSchemaWrites, finalizeSchemaRollback } from './executor.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
 import { createEventStore } from './events.js';
@@ -35,6 +35,15 @@ const NUDGE_EXEMPT = new Set(['inbox_list', 'inbox_resolve']);
 // （原则=不给人无权兑现的按钮）。keeper 层的通道限权守卫保留作纵深防御，本层只是把拦截前移到入口。
 const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema']);
 
+// SEC-1（原型污染免认证）shape 校验：只接受形状合法的 identity——client 是 string 且 trust ∈ {high,low,capture}。
+// 挡什么：`tokens` 是 JSON.parse 出的普通对象，静态查表命中的原型继承键（toString/constructor/hasOwnProperty/
+// valueOf/isPrototypeOf）是 Object.prototype 上的【函数】（truthy），旧的 `||` 短路会把它当合法 identity → 免认证。
+// 边界：typeof id==='object' 直接排除函数（函数是 typeof 'function'）；trust 白名单排除任何缺 trust/坏 trust 的对象。
+// 对【静态查表】与【enrollment.identify 的返回】同时生效（纵深防御：即便某源被灌坏形状的对象也进不来）。
+const validIdentity = (id) =>
+  !!id && typeof id === 'object' && typeof id.client === 'string'
+  && (id.trust === 'high' || id.trust === 'low' || id.trust === 'capture');
+
 export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000, nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json'),
   // M4.8 enrollment 面：notify = 单向播报函数（接文本；来自 createNotifier().notify，enrollment 通知不依赖 provider）；
   // enrollCodeTtlMs = 铸码有效期（进渲染文本/通知的「N 分钟」）；publicUrl = 对外基址（拼 curl/mcp add，来自 env）；
@@ -48,6 +57,11 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
       console.warn(`TOKENS_JSON 配置告警：client ${t.client} 标了 channel:primary 但 trust=${t.trust}——主频道需要 high（inbox 工具是 high-only），该标记不会生效`);
     }
   }
+  // SEC-4：给每个【静态】token 值打来源标记 source='static'。静态 capture = 主人自己的 iOS App（收件审阅心脏，
+  // 全见全文可裁，有意设计）；enrollment 发的 capture = 严格只投递。identify 处给 enrollment 命中的返回打
+  // source='enrolled'，/capture/status 与 /capture/resolve 据此区分放行主人 App、拦截第三方 deliver-only capture。
+  // 只加属性、不换对象引用（nudgeState 用 identity 对象引用当 Map key）；非对象值跳过（防御 TOKENS_JSON 误配）。
+  for (const v of Object.values(tokens)) if (v && typeof v === 'object') v.source = 'static';
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
   // F1（Critical）进程内批准登记表：resolveEntry（唯一合法批准入口，本进程内）记账、keeper 查表核验。
@@ -55,21 +69,39 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   // keeper/nightly。取舍：Map 是进程内状态，重启即丢在途批准；届时相关件因登记表无记录变「未认证」→ 提案件
   // re-held、普通件回落 LLM 重判（安全失败，主人再批一次）。绝不把认证信息落盘（落盘即可被 git pull 伪造）。
   const approvals = new Map();
-  const inbox = createInbox({ instanceDir, writer, indexStore, approvals });
+  // SEC-2/SEC-5 接线：进程内「服务端亲生件登记表」Map<id, nativeToken>，语义同 approvals Map——inbox 记账
+  // （id→件内容绑定 token）、keeper/nightly 复算比对、终态删账。亲生件 = 本进程写路径产出的件（非 git pull 拉进来
+  // 的伪造件）。二轮加固：登记的是【内容绑定 token】而非裸 id（inbox 件 id 公开、可被伪造件复用绕过）。inbox 与
+  // keeper/nightly 必须共享【这一个】 Map（经 app.locals.nativeReg 暴露给 isMain），否则两侧各持一份 = 亲生判定失配。
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir, writer, indexStore, approvals, nativeReg });
   // recall（读侧智能）需要 LLM：无 provider（如缺 DEEPSEEK_API_KEY）时不注册该工具，与 keeper 同一档降级。
   const recall = provider ? createRecall({ indexStore, provider, instanceDir }) : null;
   const app = express();
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
   app.locals.approvals = approvals; // F1：keeper（isMain）经此拿到与 inbox 同一个批准登记表
+  app.locals.nativeReg = nativeReg; // SEC-2/SEC-5：keeper/nightly（isMain）经此拿到与 inbox 同一个亲生件登记表
 
   // 两源合并，静态优先（M4.8 要点 1）：静态 TOKENS_JSON 命中就短路（行为零变化、连账本都不查）；
   // 未命中再问 enrollment 账本（自助接入的 token）。enrollment.identify 返回 { client, trust }（无 channel——
   // channel:primary 不经 enrollment 发出，故自助 token 永不进主频道分支）。账本降级时 identify 内部返回 null。
+  // SEC-1（原型污染免认证）：静态命中改用 Object.hasOwn（只认自有属性）——旧的 `tokens[token]` 会命中
+  // Object.prototype 上继承的函数键（toString/constructor/hasOwnProperty/valueOf/isPrototypeOf），被 `||` 当合法
+  // identity → 免认证。两道闸：① Object.hasOwn 让继承键一律未命中；② 无论哪源，最终 identity 都过 validIdentity
+  // 形状校验，不合格返 null（→ 401）。静态命中【返回原对象引用】（不 spread）——nudgeState 用 identity 对象引用当
+  // Map key，换引用会破坏主频道 nudge 防重复。
   const identify = (req) => {
     const auth = req.headers.authorization ?? '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
     if (!token) return null;
-    return tokens[token] || enrollment.identify(token) || null;
+    if (Object.hasOwn(tokens, token)) {
+      const id = tokens[token];             // 原对象引用（含启动期打的 source='static'）
+      return validIdentity(id) ? id : null;
+    }
+    // enrollment.identify 每次返回新对象，可安全打来源标记（SEC-4：与静态 capture 区分为 deliver-only）。
+    const enr = enrollment.identify(token);
+    if (enr) enr.source = 'enrolled';
+    return validIdentity(enr) ? enr : null;
   };
   app.use(express.json({ limit: '1mb' }));
 
@@ -228,7 +260,9 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.all('/mcp', async (req, res) => {
     const identity = identify(req);
     if (!identity) {
-      audit({ client: null, event: 'auth_rejected', ip: req.headers['x-forwarded-for'] ?? req.ip });
+      // SEC-7：审计 ip 必过 sanitizeIp——raw x-forwarded-for 是攻击者可控（能塞任意串/换行注入审计行），
+      // sanitizeIp 列表取首段、非法值落 null，与 /enroll 审计同源同实现。
+      audit({ client: null, event: 'auth_rejected', ip: sanitizeIp(req.headers['x-forwarded-for'] ?? req.ip) });
       return res.status(401).json({ error: 'unauthorized' });
     }
     if (identity.trust === 'capture') {
@@ -292,7 +326,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.post('/capture', (req, res) => {
     const identity = identify(req);
     if (!identity) {
-      audit({ client: null, event: 'auth_rejected', path: '/capture', ip: req.headers['x-forwarded-for'] ?? req.ip });
+      // SEC-7：同 /mcp——审计 ip 过 sanitizeIp，raw x-forwarded-for 绝不原样入审计（换行/注入串清成 null）。
+      audit({ client: null, event: 'auth_rejected', path: '/capture', ip: sanitizeIp(req.headers['x-forwarded-for'] ?? req.ip) });
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
     const { url, text, note } = req.body ?? {};
@@ -321,6 +356,12 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.get('/capture/status', (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    // SEC-4：enrollment 发的 capture token = 严格只投递（契约：只能 POST /capture，不得连 MCP/读裁）。静态 capture
+    // 是主人自己的 iOS App（收件审阅心脏，全见全文可裁，有意设计）——只拦 source==='enrolled' 的第三方 capture。
+    // 守卫之后能到达的 capture 只剩静态（主人 App），下方 mineOnly/D2 逻辑保持不变。
+    if (identity.trust === 'capture' && identity.source === 'enrolled') {
+      return res.status(403).json({ ok: false, error: 'deliver-only capture token 只能投递 /capture' });
+    }
     const mineOnly = identity.trust !== 'high' && identity.trust !== 'capture';
     let pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
     if (identity.trust !== 'high') pending = pending.filter((e) => !CAPTURE_UNRULABLE_KINDS.has(e.kind));
@@ -332,6 +373,11 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   app.post('/capture/resolve', (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    // SEC-4：enrollment 发的 capture = deliver-only，不得裁定（同 /capture/status 守卫）。静态 capture（主人 App）
+    // 保留裁定权，走下方 D2 逻辑；enrolled capture 在入口即 403，不触达 resolveEntry（不落 owner_ruling）。
+    if (identity.trust === 'capture' && identity.source === 'enrolled') {
+      return res.status(403).json({ ok: false, error: 'deliver-only capture token 只能投递 /capture' });
+    }
     const { id, ruling, option } = req.body ?? {};
     // D2（M4.6）入口限权：maintenance/schema 件不经手机裁定——在入口就拒（不再走到 keeper 层通道限权才弹回，
     // 那样主人体验 = 「判了→不算→重来」，违反原则 B）。keeper 层通道限权守卫仍在，作纵深防御。高信任仍可裁。
@@ -701,8 +747,18 @@ async function schemaApply({ instanceDir, inbox, writer, id }) {
   let out;
   await writer.transact(async (commit) => {
     const applied = await applySchema({ instanceDir, entry: { rel: hit.path } });
-    rmSync(path.join(instanceDir, hit.path));
-    await commit({ paths: [...applied.changedPaths, hit.path], message: `schema: 落地 zone ${applied.zoneId}（${id}）` });
+    const abs = path.join(instanceDir, hit.path);
+    const savedRaw = readFileSync(abs, 'utf8'); // 存原文：commit 失败回滚时，未 tracked 的提案件 git checkout 恢复不了，交回滚助手写回
+    try {
+      rmSync(abs);
+      await commit({ paths: [...applied.changedPaths, hit.path], message: `schema: 落地 zone ${applied.zoneId}（${id}）` });
+      finalizeSchemaRollback(applied.rollbackToken); // 成功落地 → 作废 rollback token（防成功后残留授权被后续误调删掉真 zone）
+    } catch (e) {
+      // commit 失败（如提案件未 tracked → git add pathspec 报错）→ 凭 applySchema 发的 token 回滚已落盘的写，避免半落地孤儿 zone；
+      // 提案件由 rollbackSchemaWrites 用 entryRaw 复原（tracked→checkout，untracked→写回），杜绝数据丢失。
+      await rollbackSchemaWrites({ instanceDir, changedPaths: applied.changedPaths, rollbackToken: applied.rollbackToken, entryRel: hit.path, entryRaw: savedRaw });
+      throw e;
+    }
     out = applied;
   });
   return { id, zoneId: out.zoneId, changedPaths: out.changedPaths };
@@ -812,7 +868,7 @@ if (isMain) {
     // 安全（与写工具共用同一个单写者 writer，串行不打架；createApp 不动）。
     const nightly = createNightly({
       instanceDir,
-      inbox: createInbox({ instanceDir, writer: app.locals.writer, approvals: app.locals.approvals }),
+      inbox: createInbox({ instanceDir, writer: app.locals.writer, approvals: app.locals.approvals, nativeReg: app.locals.nativeReg }),
       notifier, audit,
       writer: app.locals.writer, // M4.6：降级/维护日志/迁移的写入走单写者队列（与归档写串行不打架）
       indexStore,                // 降级翻 tier 后刷新同一派生索引（candidate 默认检索不含）
@@ -821,6 +877,7 @@ if (isMain) {
     const keeper = createKeeper({
       instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly,
       approvals: app.locals.approvals, // F1：与 createApp 内 inbox 共享同一个批准登记表
+      nativeReg: app.locals.nativeReg, // SEC-2/SEC-5：与 createApp 内 inbox 共享同一个亲生件登记表
       onEvent: (e) => eventStore.push(e),
       minConfidence: Number(KEEPER_MIN_CONFIDENCE),
       notifyLevel: KEEPER_NOTIFY_LEVEL,

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createApp } from '../src/server.js';
 import { createEventStore } from '../src/events.js';
+import { nativeToken } from '../src/inbox.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 const TOKENS = {
@@ -14,7 +15,7 @@ const TOKENS = {
   'high-token': { client: 'cc-test', trust: 'high' },
 };
 
-let httpServer, baseUrl, work, eventStore;
+let httpServer, baseUrl, work, eventStore, app;
 
 function git(cwd, ...args) {
   return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });
@@ -34,7 +35,7 @@ before(async () => {
   git(seedDir, 'push', '-u', 'origin', 'main');
   execFileSync('git', ['clone', origin, work]);
   eventStore = createEventStore({ file: path.join(base, 'events.jsonl') });
-  const app = createApp({ instanceDir: work, tokens: TOKENS, eventStore });
+  app = createApp({ instanceDir: work, tokens: TOKENS, eventStore });
   await new Promise((resolve) => { httpServer = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${httpServer.address().port}`;
 });
@@ -107,6 +108,9 @@ test('POST /capture/resolve：点选候选（option 参数）→ 预批决定落
   fs.writeFileSync(abs, fs.readFileSync(abs, 'utf8') + `\n<!--keeper-options\n${JSON.stringify({ options: [
     { label: '进待办', decision: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: 's', confidence: 0.9 } },
   ] })}\n-->\n`);
+  // SEC-5 二/三轮：capture 件经 /capture 亲生（内容绑定已登记，无 options）。本测试无 keeper，故手工塞 options 模拟
+  // keeper.holdEntry——须同款刷新亲生绑定（把新 options 纳入），否则内容绑定 gate 会把这份合法候选当篡改挡下。
+  app.locals.nativeReg.set(posted.id, nativeToken({ id: posted.id, rel: posted.path, kind: 'capture', client: 'app-ios', raw: fs.readFileSync(abs, 'utf8') }));
   const res = await post('/capture/resolve', 'cap-token', { id: posted.id, option: 0 });
   assert.equal(res.status, 200, `应 200，实际 ${res.status}: ${JSON.stringify(await res.json().catch(() => ''))}`);
   const after = fs.readFileSync(abs, 'utf8');

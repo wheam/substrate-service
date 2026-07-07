@@ -14,6 +14,12 @@ import path from 'node:path';
 import { cjkTokens } from './index-store.js';
 import { parseZones, canRead } from './acl.js';
 
+// SEC-6：citations 结果面路径单行化——删控制字符（Cc）+ Unicode 格式字符（Cf，零宽/BOM）+ 行/段分隔符（Zl/Zp）。
+// citations 的 path 源自 indexStore（= 磁盘文件名），攻击者可 push 一个文件名内嵌换行/控制字符的伪造件经
+// git pull 进库；裸拼进下游 agent 提示面即成注入。只【删】不实体化——合法路径本不含这些字符（零副作用），
+// 带这些字符的文件名是病态伪造件。仅在【返回前】过一遍：内部引用验真/去重/staleness/ACL 复核仍用原始 path。
+const oneLinePath = (p) => String(p ?? '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, '');
+
 const PER_TERM_LINES = 20;      // 每个 token 各检索多少行（并集前）
 const TOP_N = 8;                // 聚合后最多带几页候选给 LLM（上下文预算：8 页 × 3 行 × ~200 字 ≈ 5K 字）
 const SNIPPETS_PER_DOC = 3;     // 每页最多带几条命中行做上下文
@@ -77,7 +83,9 @@ function retrieve(indexStore, query, zone, trust) {
 
 function buildUserPrompt(query, candidates) {
   const blocks = candidates.map((d, i) => {
-    const head = `[${i + 1}] path=${d.path} content_id=${d.content_id ?? 'null'}`;
+    // SEC-6（二轮加固，Codex 异源）：喂给 LLM 的 prompt 里 path 也必须单行化——否则伪造文件名内嵌的换行/Markdown
+    // heading 直接进 LLM 材料面（内部按 content_id / 原始 path 归位仍用 d.path，见 pickCitations）。只此展示面清洗。
+    const head = `[${i + 1}] path=${oneLinePath(d.path)} content_id=${d.content_id ?? 'null'}`;
     const lines = d.snippets.map((s) => `    - ${s}`).join('\n');
     return lines ? `${head}\n${lines}` : head;
   });
@@ -140,7 +148,9 @@ export function createRecall({
       const age = now() - t;
       if (age > staleMs) {
         const weeks = Math.round(age / (7 * 24 * 60 * 60 * 1000));
-        out.push(`「${c.path}」最近更新于 ${updated}（约 ${weeks} 周前），可能已过时`);
+        // SEC-6（二轮加固）：gaps 是工具返回面 + 可能回喂 agent——path 单行化，防伪造文件名换行注入（内部按 c.path 原始
+        // 值读 updated，此处仅展示面清洗）。
+        out.push(`「${oneLinePath(c.path)}」最近更新于 ${updated}（约 ${weeks} 周前），可能已过时`);
       }
     }
     return out;
@@ -220,7 +230,8 @@ export function createRecall({
     const degradedGaps = degraded ? [`未能为「${q.trim()}」找到可验真的引用来源（材料不足，未采信 LLM 无引用答案）`] : [];
     const gaps = [...new Set([...llmGaps, ...degradedGaps, ...stalenessGaps(citations)])].slice(0, MAX_GAPS);
 
-    const payload = { answer, citations, gaps };
+    // SEC-6：返回/入缓存前把 citations 的 path 单行化（内部验真/去重/staleness 均已在原始 path 上完成）。
+    const payload = { answer, citations: citations.map((c) => ({ ...c, path: oneLinePath(c.path) })), gaps };
     cacheSet(key, payload, candidates.length);
     return { ...structuredClone(payload), meta: { cached: false, llm_ms, candidate_count: candidates.length } };
   }

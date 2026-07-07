@@ -3,8 +3,8 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { parseZones } from './acl.js';
-import { validateDecision, applyDecision, runDoctor } from './executor.js';
-import { parseEntryBody, approvalToken, normKind } from './inbox.js';
+import { validateDecision, applyDecision, runDoctor, rollbackSchemaWrites, finalizeSchemaRollback } from './executor.js';
+import { parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 
 // SKIP_LLM kinds（M4.4 D2）：提案件（schema/maintenance）直达主人、keeper 绝不 LLM 判它们。
 // 有主人预批决定 → 走现有校验执行流；无 → re-held 提示点选（纯文字裁定永不触发执行/清场，防误伤）。
@@ -122,7 +122,7 @@ export function displaySafePath(p) {
     .slice(0, 200);                                    // 长度上限
 }
 
-export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, approvals = new Map() }) {
+export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, approvals = new Map(), nativeReg = new Map() }) {
   let running = false;
   // F4：夜班独立 in-flight 旗，与归档锁 running 解耦——长扫描/慢 push 不再阻塞下一次 pending 受理。
   let nightlyRunning = false;
@@ -299,6 +299,16 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       }
       await commit({ paths: [rel], message: `keeper: held ${entry.id}` });
     });
+    // SEC-5 加固：keeper 生成的 held options 须纳入 native 内容绑定——否则「亲生件被 held 后、options 经 pull 篡改」
+    // 会绕过 resolveEntry 的破坏性候选 gate。仅在【本件本就是 native】（entry.__native，本进程亲生且此刻未被篡改）
+    // 且确写了 options 时才刷新绑定：伪造/篡改件（__native=false）不因被 keeper held 而获得 native、复用 id 的伪造件
+    // 也进不来（其 __native 早在上方复算失配为 false）。
+    if (entry.__native && options.length) {
+      nativeReg.set(entry.id, nativeToken({
+        id: entry.id, rel: entry.rel, kind: entry.kind, client: entry.client,
+        raw: readFileSync(path.join(instanceDir, rel), 'utf8'),
+      }));
+    }
     await notifier.notify([
       '🤔 待你定夺',
       `内容：「${entry.body.slice(0, 80)}${entry.body.length > 80 ? '…' : ''}」`,
@@ -322,13 +332,22 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     // 经 git pull 换掉 payload/body 即失配 → 认证失败 → approved_decision 作废 → re-held（不按篡改内容执行）。
     // H1（Critical）：token 再绑 entry.kind（frontmatter 稳定字段）——批准后仅 swap kind: maintenance→save 想
     // 绕过 maintenance 守卫时哈希失配 → 认证失败 → 同样 re-held。resolveEntry 记账与此处须同序同分隔符复算。
+    // SEC-8（审计 B）：token 再绑 entry.client（frontmatter 溯源字段，落进新页 source_agent）——批准落定后经 pull
+    // 换掉 client 想伪造溯源即哈希失配 → 认证失败 → approved_decision 作废 → re-held（不可执行、仅溯源欺骗，仍拒）。
     const rec = approvals.get(entry.id);
     const authentic = !!rec && rec.token === approvalToken({
       id: entry.id, ruling: entry.owner_ruling ?? '', decision: entry.approved_decision,
-      rel: entry.rel, kind: entry.kind, content: entry.body,
+      rel: entry.rel, kind: entry.kind, content: entry.body, client: entry.client,
     });
     entry.__ruling_authentic = authentic;
     entry.__ruling_trust = authentic ? (rec.viaTrust ?? null) : null;
+    // SEC-2（审计 B §4 + 二轮加固）：件是否本进程 addEntry 亲生【且未被篡改】——按【内容绑定】token 复算比对，
+    // 不再只按公开 id（一轮 Set<id> 被 id 复用打穿）。executor 的 remove_page 分支据此收紧 kind=remove 旁路
+    // （认证「主人动过手」≠ 认证「件是服务端亲生的」）。伪造件复用历史 native id 但正文/kind 不符 → token 失配 →
+    // __native=false → 挡下。与 __ruling_authentic 相邻设置：nativeReg 与 approvals 同族的进程内共享状态、重启即空。
+    entry.__native = nativeReg.get(entry.id) === nativeToken({
+      id: entry.id, rel: entry.rel, kind: entry.kind, client: entry.client, raw: entry.raw,
+    });
     if (!authentic) entry.approved_decision = null;
 
     // SKIP_LLM 分支（最先判）：提案件（schema/maintenance）有主人预批决定 → 落现有校验执行流（下方）；
@@ -400,6 +419,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         }
       });
       approvals.delete(entry.id); // F1：认证批准执行完即销账（防重放）
+      if (ownerRuled) nativeReg.delete(entry.id); // 主人裁定清场（件已 rmSync）→ 亲生登记随之删账（终态、防历史 id 复用 + 界内存）
       emit(entry, 'rejected', rel, v.reason);
       // 隔离-rejected 件并进派生索引（默认检索仍排除它，include=rejected 可查）。主人裁定的拒收已清场、不入索引。
       if (!ownerRuled) refreshIndex('reject', [rel]);
@@ -415,10 +435,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       return 'held';
     }
 
-    let detail, changedPaths = [];
+    let detail, changedPaths = [], applied = null;
     try {
       await writer.transact(async (commit) => {
-        const applied = await applyDecision({ instanceDir, entry, decision, zone: v.zone });
+        applied = await applyDecision({ instanceDir, entry, decision, zone: v.zone });
         detail = applied.detail;
         changedPaths = applied.changedPaths;
         rmSync(path.join(instanceDir, rel));
@@ -426,13 +446,20 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         if (entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
         await commit({ paths, message: `keeper: ${decision.action} → ${detail}（${entry.id}）` });
       });
+      if (applied?.rollbackToken) finalizeSchemaRollback(applied.rollbackToken); // 成功落地 → 作废 schema rollback token（防成功后残留授权）
     } catch (e) {
       approvals.delete(entry.id); // G2：认证票一次性——execution 失败也销账（stale 票不留，防翻回 pending 后复燃）
+      // 十二轮 Codex：schema_apply 落盘成功但 commit 失败时，keeper 早先只 holdEntry、不回滚 → zones.md/目录残留孤儿 active zone。
+      // 与工具通路（server.schemaApply）同构：凭 applySchema 发的 token 回滚（撤 zones.md + 删本次新建目录 + 用 entry.raw 恢复提案件）。
+      if (applied?.rollbackToken) {
+        await rollbackSchemaWrites({ instanceDir, changedPaths: applied.changedPaths, rollbackToken: applied.rollbackToken, entryRel: rel, entryRaw: entry.raw });
+      }
       await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`);
       audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', error: e.message, ms: Date.now() - t0 });
       return 'held';
     }
     approvals.delete(entry.id); // F1：认证批准执行成功即销账（防重放）——件已 filed 移除，登记表也一并清账
+    nativeReg.delete(entry.id); // 件已 filed rmSync（终态）→ 亲生登记随之删账（防历史 id 复用；内容绑定已使复用无害，此为界内存 + 纵深）
     // 归档已落定 → 刷新派生索引（受影响页；删页则全量重建）。仅到此处代表 filed 成功。
     // 一并带上被移除的收件 rel：清掉它可能残留的「隔离-rejected」索引行（如先前被拒、经主人裁定又 filed 别处）；
     // 普通件从没被索引过 → updatePage 只做一次无害 DELETE。
