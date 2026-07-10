@@ -121,6 +121,30 @@ export function createTools({ instanceDir }) {
     return { path: rel, content: readFileSync(abs, 'utf8') };
   }
 
+  // digest v2 化：实例 vendored 的 render-context.py 是 v1 渲染器，输出携带 v1 时代的
+  // 技能路由表 / v1 房规 / Packet 操作行——它们指挥 agent 调已退役的本地 skill、直接改文件、
+  // 跑 wire-context 刷新，与 DIGEST_RULES「读写一律走 MCP 工具」在同一份提示里直接矛盾。
+  // 实例数据与 v1 脚本都不动，在渲染出口统一剥锈：
+  // ① 整段剥除「## 何时用哪个 skill…」与「## 房规（substrate 常驻接入）」（v2 房规由 DIGEST_RULES/instructions 下发）；
+  // ② 剥除 Packet 操作行（维护 skill / 写前查 / 写后更新——v2 写入经 inbox 治理，不教 agent 直改文件）；
+  // ③ substrate-memory 技能引用改写成 read_page 口径。
+  function stripV1Sections(text) {
+    const out = [];
+    let skipping = false;
+    for (const line of text.split('\n')) {
+      if (/^## /.test(line)) {
+        skipping = /^## (何时用哪个 skill|房规（substrate 常驻接入）)/.test(line);
+      }
+      if (skipping) continue;
+      if (/^>\s*-\s*(维护 skill|写前查|写后更新)[:：]/.test(line)) continue;
+      out.push(line);
+    }
+    return `${out.join('\n')
+      .replace(/用 `?substrate-memory`? 读对应页/g, '用 read_page 现读对应页')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()}\n`;
+  }
+
   async function getContext({ trust = 'low' }) {
     // 常驻上下文内嵌 about-owner 核心（sensitive），与 memory 区同级把关
     if (trust !== 'high') throw new Error('拒绝：常驻上下文含 sensitive 敏感记忆，当前客户端信任级不足');
@@ -129,7 +153,7 @@ export function createTools({ instanceDir }) {
       execFile('python3', [script], { cwd: instanceDir, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 },
         (err, stdout, stderr) => (err ? reject(new Error(`render-context 失败：${stderr || err.message}`)) : resolve(stdout)));
     });
-    return { content };
+    return { content: stripV1Sections(content) };
   }
 
   async function todoList({ list } = {}) {

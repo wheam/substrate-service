@@ -95,6 +95,27 @@ test('get_context：跑实例 vendored 的 render-context.py；低信任拒绝',
   await assert.rejects(() => tools.getContext({ trust: 'low' }), /sensitive|敏感/);
 });
 
+test('get_context：digest v2 化——剥掉 v1 锈迹段，保留记忆与库地图', async () => {
+  const { content } = await tools.getContext({ trust: 'high' });
+  // 该留的：主人核心记忆、记忆目录、各区速览（zone/canonical 描述行）
+  assert.match(content, /关于主人（核心）/);
+  assert.match(content, /Alex/);
+  assert.match(content, /库里有什么/);
+  assert.match(content, /zone: collections/);
+  assert.match(content, /canonical: 每个收藏的行式主表/);
+  // 该剥的：v1 技能路由表、v1 房规整段（含 wire-context/SKILL.md 指令）
+  assert.ok(!content.includes('何时用哪个 skill'), 'v1 路由表段应整段剥除');
+  assert.ok(!content.includes('房规（substrate 常驻接入）'), 'v1 房规段应整段剥除（v2 房规由 DIGEST_RULES 下发）');
+  assert.ok(!content.includes('wire-context'), 'v1 刷新指令不得残留');
+  // 该剥的：Packet 里指挥直接改文件的操作行（维护 skill / 写前查 / 写后更新）
+  assert.ok(!content.includes('维护 skill'), 'Packet 的维护 skill 行应剥除');
+  assert.ok(!content.includes('写前查'), 'Packet 的写前查行应剥除（v2 写入走 MCP+inbox）');
+  assert.ok(!content.includes('写后更新'), 'Packet 的写后更新行应剥除');
+  // 该改写的：substrate-* 技能引用换成 MCP 工具口径
+  assert.ok(!content.includes('substrate-memory'), 'substrate-memory 技能引用应改写为 read_page');
+  assert.match(content, /read_page/);
+});
+
 test('todo_list：默认返回 owner.md，并告知还有哪些清单', async () => {
   const r = await tools.todoList();
   assert.match(r.content, /柠檬树/);
