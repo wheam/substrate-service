@@ -6,7 +6,7 @@ print("""# Substrate 常驻上下文（fixture）
 
 ## 关于主人（核心）
 
-主人称呼 Alex。
+主人称呼 Alex。细节在分类页，按目录用 `substrate-memory` 现读。
 
 ## 关于主人（记忆目录，需要细节时用 substrate-memory 读对应页）
 

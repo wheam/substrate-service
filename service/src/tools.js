@@ -139,8 +139,10 @@ export function createTools({ instanceDir }) {
       if (/^>\s*-\s*(维护 skill|写前查|写后更新)[:：]/.test(line)) continue;
       out.push(line);
     }
+    // substrate-memory 已是不存在的 v1 技能——digest 里任何提法（含库数据正文里的变体措辞）
+    // 一律译成 v2 的 read_page 工具口径，消费方才有可执行的指引。
     return `${out.join('\n')
-      .replace(/用 `?substrate-memory`? 读对应页/g, '用 read_page 现读对应页')
+      .replace(/`?substrate-memory`?/g, 'read_page')
       .replace(/\n{3,}/g, '\n\n')
       .trim()}\n`;
   }
