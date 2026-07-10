@@ -66,8 +66,10 @@ export function enrollProtocol(baseUrl) {
     claude mcp add --transport http substrate-kb ${baseUrl}/mcp --header "Authorization: Bearer <你的 token>"
 - Codex：
     codex mcp add substrate-kb -- <你的宿主转 http 的命令>   # 传 --header "Authorization: Bearer <你的 token>"，token 走环境变量别硬编码
-- 不消费 MCP instructions 的宿主（如 Hermes）：用 token 定期拉 ${baseUrl}/digest（仅高信任可取），
-  把返回的常驻小抄注入你的常驻上下文（它会随服务更新、自带接入房规）。
+- 不消费 MCP instructions 的宿主、或常驻网关想要断网兜底（如 Hermes）：用 token 定期拉 ${baseUrl}/digest
+  （仅高信任可取），原子写入宿主的原生常驻上下文文件——Hermes 即运行用户家目录的 ~/.hermes.md
+  （每个新会话自动加载，无需重启）。建议 cron 每 30 分钟；铁律：拉取失败（断网/非 200/正文缺
+  「接入房规」锚点）一律保留旧文件——小抄旧了能用，消失不行。
 
 ## 3. 自验清单（接通后跑一遍，INSTALL §7 子集）
 - GET ${baseUrl}/healthz 返回 200（服务在线）。
