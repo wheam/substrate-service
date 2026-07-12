@@ -3,6 +3,7 @@
 import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { containsCredential } from './secrets.js';
 
 // 导出供读路径复验：实例仓库经 git pull 同步，inbox 件可以不经 addEntry、被手工伪造后拉进来——
 // 「kind 合法、id 是服务端生成的」只在写路径成立，任何要把 id/kind 拼进响应面的读方必须自己再验。
@@ -31,19 +32,6 @@ export const INBOX_PREVIEW_CHARS = 2000;
 // 校验命中，见下方 nativeToken；gate 在 resolveEntry 点选分支）。收窄轨迹：二轮只 gate 破坏性删/改页 → 三轮 Codex 指出漏
 // schema_apply 等副作用、放宽到「非 forbidden 全 gate」 → 四轮 Codex 指出 forbidden 也非无副作用（主人裁定 reject 会写
 // keeper-feedback/_cases.md 判例考卷、被伪造件注入攻击者字段污染 few-shot）→ 收口为【全部候选一律 native】。
-
-// 与引擎 doctor 的凭据扫描同族的模式集（服务侧写路径前置一道）
-const CREDENTIAL_PATTERNS = [
-  /sk-ant-[A-Za-z0-9_-]{8,}/,            // Anthropic
-  /\bsk-[A-Za-z0-9]{20,}/,               // OpenAI / DeepSeek 风格
-  /AKIA[0-9A-Z]{16}/,                    // AWS access key
-  /ghp_[A-Za-z0-9]{20,}/,                // GitHub PAT
-  /github_pat_[A-Za-z0-9_]{20,}/,        // GitHub fine-grained PAT
-  /gho_[A-Za-z0-9]{20,}/,                // GitHub OAuth
-  /xox[baprs]-[A-Za-z0-9-]{10,}/,        // Slack
-  /AIza[0-9A-Za-z_-]{30,}/,              // Google API key
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,  // PEM 私钥
-];
 
 // F1（Critical）进程内批准登记表：resolveEntry 是【唯一】合法批准入口（MCP inbox_resolve / App
 // /capture/resolve 都经它、都在本进程）。它敲定 ruling+approvedDecision 后向 approvals Map 记一笔
@@ -120,11 +108,8 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
     //（需 u 标志）。这几类几近穷尽「视觉/功能可忽略、能隐形拆 key」的字符空间——可见字符（如 `sk-a.b.c`）拆
     // key 会破坏其可用性、非有效攻击，不剥；\p{Mc}（可见的间距组合标记）FP 高且可见，不纳入。正常内容极罕见含
     // 这些字符，剥后仅当巧合凑成词边界凭据前缀才误判（FP 面比纯空白略大但可控，见 inbox.test.js 组合标记 FP 护栏）。
-    const collapsedTarget = scanTarget.replace(/[\s\p{Cf}\p{Mn}\p{Me}\p{Cc}]+/gu, '');
-    for (const pattern of CREDENTIAL_PATTERNS) {
-      if (pattern.test(scanTarget) || pattern.test(collapsedTarget)) {
-        throw new Error('拒收：内容含疑似密钥/凭据（红线：密钥原文绝不进库）。请脱敏后重试。');
-      }
+    if (containsCredential(scanTarget)) {
+      throw new Error('拒收：内容含疑似密钥/凭据（红线：密钥原文绝不进库）。请脱敏后重试。');
     }
 
     const id = `${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;

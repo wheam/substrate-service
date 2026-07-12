@@ -1,9 +1,8 @@
 # Substrate Service — 服务化访问层方案（总览）
 
-> 状态：PLANNED（2026-07-03，设计已收敛，未动工）
-> 分两步：**01 个人版（我的）**（M0–M3；私有文档，未随开源仓库发布）→ **[02-长期产品化](02-productization.md)**
-> 本文件夹只放方案；代码将来放**新仓库**（暂名 `substrate-service`），与引擎仓库 `substrate` 分离。
-> 本方案不改动引擎仓库，也不改动个人实例（私有实例库）——动工前它们保持现状运转。
+> 状态：IMPLEMENTED / 个人 alpha（M0–M4.9 已完成并在生产日用）
+> 演化路线：**01 个人版**（M0–M3；含私人细节，未公开）→ **[03 MCP 版](03-next-version-spec.md)**（M4.x，已实现）→ **[02 长期产品化](02-productization.md)**（未来）
+> 本仓库包含 `substrate-service` 的实现与公开设计文档；个人知识库实例始终放在独立私有仓库。
 
 ## 一句话
 
@@ -51,7 +50,7 @@
 | 仓库 | 内容 | 可见性 | 变化 |
 |---|---|---|---|
 | `substrate`（现有） | 引擎：格式、governance、schemas、参考 skill、迁移 | 公开 | **不动**。继续作为 open-core 的"core"：格式与治理规则的事实源、自托管入口、信任背书 |
-| `substrate-service`（新建） | MCP server、keeper、capture 端点、（后续）手机 App、（产品期）账号/多租户 | 先私有 | 本方案的全部代码落这里 |
+| `substrate-service` | MCP server、keeper、capture 端点、实验性手机 App | 公开 | 本仓库；个人 alpha，单租户自托管 |
 | 个人实例私库（现有） | 个人实例（数据） | 私有 | **不动**。将来被服务端 clone 为工作副本 |
 
 **依赖方向**：service 操作"实例"，而实例是自包含的（vendored 了 curate/collections/doctor 等零依赖脚本）——所以 **keeper 的执行器直接用实例内的脚本**，service 运行时不需要引擎在场；引擎只在版本升级（--refresh / migrate）时出现，与今天的模式一致。service 对引擎只有一个弱依赖：契约（schemas、zones 格式）按引擎版本号 pin。
@@ -66,15 +65,15 @@
 2. **keeper 自研，不复用任何现有 agent 框架**——它是系统的信任根和未来产品的核心资产，必须可控、可测、可换模型。
 3. **keeper 架构 = LLM 只判断，代码才执行**——LLM 产出结构化决定（JSON），写入永远走确定性脚本；判断可用 golden 判例集回归。
 4. **keeper 归属：逻辑上每个实例一个，物理上无状态工人池**——个性化（规则、判例、反馈）全存在该实例仓库里（可带走）；计算按任务池化（轻、便宜、可横向扩）。keeper 属于"库"不属于"人"（共享库有自己的 keeper 上下文）。
-5. **一切写入先进 inbox 隔离区，写路径无 LLM**——捕获永远秒回；token 泄露最坏是收件箱进垃圾，碰不到库本体。
+5. **一切写入先进 inbox 隔离区，写路径无 LLM**——捕获永远秒回；投递型 token 泄露的写入爆炸半径被限制为收件箱垃圾，碰不到库本体；其它 token 每客户端独立、可单独吊销。
 6. **行为契约（该存/该提示存/该读库/查无不编）经 MCP server instructions 下发**——从"逐台接线"变"连接即得"；不支持 instructions 的客户端保留 digest 注入兜底。
 
-## 动工前的现状快照（2026-07-03，给接手的 session）
+## 实现状态
 
-- **引擎仓库**：`<workspace>/substrate`（公开，github.com/wheam/substrate）。153 测试全绿，已推送（HEAD `b4021f0`），CI 绿。**本方案不改它**。
-- **实例仓库**：`~/<instance-repo>`（私有）。已补齐实例 CI / .gitattributes / 撞车协议，vendored skill 为引擎 `b4021f0` 版。**本方案动工前不改它**；M1 起服务端从 GitHub clone 它作工作副本。
-- **现有 fleet**（MBP + Mac mini/OpenWrt/Railway 的 Hermes）：照常运转，**不再投入**（不追加同步/接线工作），等 M2 后按 01 的切换表逐台迁移。
-- **本机 CC/Codex 里的 substrate skill 停在 6-27 版是有意冻结**——不要"好心补齐同步"；切 MCP 后它们会被整体卸载。
+- **引擎仓库**：[`substrate`](https://github.com/wheam/substrate) 继续提供格式、治理规则与实例脚手架。
+- **服务仓库**：本仓库已完成 M0–M4.9，支持 MCP 读写、keeper、capture、分层检索、夜班和自助接入。
+- **实例仓库**：每位用户自备独立私有 git 仓库，服务端只持有其工作副本。
+- **部署**：支持 [Railway 模板](https://railway.com/deploy/AlyM7t) 与本地单机运行。
 
 ## 实现时的硬约束（拥有者明确要求，勿回退）
 
@@ -88,6 +87,6 @@
 
 - **01-personal-alpha.md** —— 我的个人版：部署选择、M0–M3 里程碑与验收、keeper v0 规格、App v0 规格、现有 fleet 的切换与退役、安全清单、成本与回退。**含个人实例细节，未随开源仓库发布。**
 - **[02-productization.md](02-productization.md)** —— 长期产品化：产品定义与体验、多租户架构、keeper 规模化、安全与信任、多人共享、open-core 立场、难点与非目标。含 §9 竞品格局与借鉴清单（gbrain / openhuman 调研）。
-- **[03-next-version-spec.md](03-next-version-spec.md)** —— 下一版 spec（MCP 版 v0.3）：定位为「受治理的 agent 记忆（GAM）」开源参考实现（项目名仍 `substrate`）；成功判据、两条硬原则（装得极简 / 用得零负担）、能力增量（分层 lossless、服务端读侧智能 + 可抛索引、溯源置信、schema 演化、审批式夜班、抗注入、判例考卷 + 仪表）、主频道 agent、安装模型、**数据模型与契约（frontmatter 字段 / inbox 状态机 / 工具面 / 迁移）**、**安全与隐私威胁册**、M4.x 里程碑、决策记录。
+- **[03-next-version-spec.md](03-next-version-spec.md)** —— MCP 版 v0.3 spec：定位为「受治理的 agent 记忆（GAM）」开源参考实现；成功判据、两条硬原则（装得极简 / 用得零负担）、能力增量（分层 lossless、服务端读侧智能 + 可抛索引、溯源置信、schema 演化、审批式夜班、抗注入、判例考卷 + 仪表）、主频道 agent、安装模型、**数据模型与契约（frontmatter 字段 / inbox 状态机 / 工具面 / 迁移）**、**安全与隐私威胁册**、M4.x 里程碑、决策记录。
 - **04-team-brain.md** —— 团队版（**未来方向 / 分支**，gate 在个人版之后）：受治理的团队大脑，把 GAM 从个人扩到团队。**含团队私有策略，未随开源仓库发布。**
 - **[05-pattern-gam.md](05-pattern-gam.md)** —— **Governed Agent Memory（受治理的 agent 记忆）模式说明（对外版）**：能单独读懂的模式参考——一段式定义、四特色、机制骨架（隔离 inbox → LLM 只出决定 → 确定性执行器 → 判例法 → 文件即真相 → 服务端集中治理 → 全程审计 + 进程内批准登记表）、与 capture-first 竞品的一句差异（审批式治理 vs 静默改）。`substrate` 是它的开源参考实现。

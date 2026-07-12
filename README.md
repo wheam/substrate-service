@@ -35,15 +35,15 @@ Your context today is scattered across tools, and every new AI you open starts f
 
 > **多人共享时它才真正见功力。** 对一个人，保持记忆整洁是种便利；对一个团队——几十号人和他们的 agent 同时往一份记忆里写——它就是「共享大脑」和「一潭沼泽」之间的分界：去重、厘清谁说的、标出过时和自相矛盾之处。往里倒的人越多，那层治理越是物有所值。
 
-## Why you can trust it with everything · 为什么你敢把一切都交给它
+## How it earns trust · 它怎样建立信任
 
 One design choice holds it all together: **the AI only advises — it never writes your files itself.**
 
 > 一个设计选择撑起这一切：**AI 只出主意——从不亲手写你的文件。**
 
-The keeper reads what comes in and outputs only a *decision* — file it here, hold it, ask you, refuse it — always with a plain reason; ordinary, testable code carries that decision out. Because the model never *acts*, no one can hide an instruction inside a link or a document to make it delete or leak something — a poisoned input, at worst, gets filed away as low-priority. Credentials and secrets are refused before they land, and every read and write is logged with a reason. So you can pour in your most private notes and still see exactly what became of them.
+The keeper reads what comes in and outputs only a *decision* — file it here, hold it, ask you, refuse it — always with a plain reason; ordinary, testable code carries that decision out. Hidden instructions in captured content cannot directly become file operations: an allow-listed executor validates and applies the decision, backed by adversarial regression tests. Recognized credential patterns are refused before they land, and audits record metadata without copying private write content or credentials. This does not make any hosted system risk-free, but it sharply limits what a poisoned input can do and leaves a visible trail.
 
-> keeper 读进来的东西，只产出一个「决定」——归这儿、搁置、问你一句、拒收——都附一句人话理由；执行的是一段普通、可测的代码。因为模型从不「动手」，没人能在一个链接或文档里藏一句指令、骗它去删或去泄露——带毒的输入最坏也只是被归为低优先、搁到一边。凭据、密钥在落盘前就被拒收，每一次读写都带理由记录在案。所以你尽可以把最私密的笔记倒进去，也始终看得见它们的下落。
+> keeper 读进来的东西，只产出一个「决定」——归这儿、搁置、问你一句、拒收——都附一句人话理由；执行的是一段普通、可测的白名单代码。藏在内容里的指令不能直接变成文件操作，决定还要经过确定性校验和对抗回归测试。已识别的凭据模式会在落盘前被拒收，审计只记元数据、不复制私人写入正文或凭据。这不代表托管系统绝对零风险，但它显著压小了带毒输入的爆炸半径，并留下可查的轨迹。
 
 This shape has a name: **Governed Agent Memory** — one long-term memory, many agents (and one day, many people), governed so it stays honest, with you keeping the final say. The full pattern: **[docs/05](docs/05-pattern-gam.md)**.
 
@@ -94,8 +94,10 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 
 两条实测跑通的路径，装的人只挑一条：
 
-- **上云（完整形态，够得着手机 + 远程 fleet）** —— 把 [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md) 交给你已有的 agent（CC / Codex / Hermes），它按协议帮你在 Railway 搭；或照 [INSTALL_FOR_AGENTS.md §4](INSTALL_FOR_AGENTS.md) 自己手动建。约 $5/月起。
+- **上云（完整形态，够得着手机 + 远程 fleet）** —— 点下面的 Railway 模板，或把 [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md) 交给你已有的 agent（CC / Codex / Hermes）代办。约 $5/月起。
 - **本地单机（无云，就这台机器）** —— 一台常开机器上 `node` 或 `docker compose` 一条命令起一份，**约 60 秒就能跑起来**、看懂它怎么工作（跑起来就是完整服务，没有任何时限）。见 **[run-local.md](run-local.md)**。诚实标注：本地形态跨不了设备（手机 / 远程 fleet 要上云）。
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/AlyM7t)
 
 ### 部署到 Railway
 
@@ -115,8 +117,6 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 
 把这段丢给任何新 agent，它自己 `POST /enroll` 换一把专属可吊销 token、按公开协议自配置自验证——零面板操作、零重启。随时 `enroll_revoke` 即刻失效。
 
-<!-- TODO(owner) 真·一键部署 button：Railway 的 one-click 机制是「已发布的模板」→ 链接形如 railway.app/template/<code>。需 owner 先在自己的 Railway 账户里用仓库根的 railway.json 发布一个 template（Railway 站内 New → Deploy a Template），拿到 URL 后回这里放官方 button 链到它，并注明「点完仍须在向导里设 Root Directory=service + 挂 /data 卷 + 填 REPO_URL/TOKENS_JSON」。railway.json 保留（合法且让日后发布模板省事）。 -->
-
 ## Daily use · 日常怎么用
 
 装好后用自然语言，agent 会调对应工具：
@@ -134,7 +134,7 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 
 ## Status · 状态
 
-个人 alpha，作者本人在日用（租户 #1）。里程碑均已上真机：**M0–M3**（只读 MCP + zone ACL + bearer 认证 + 审计 → 写路径 + keeper 守门 → 捕获端点 + iOS App）；**M4.0–M4.8**（仪表 + 判例考卷 / 读侧智能 / lossless 分层 / 主频道 agent / 溯源 + schema 演化 + 审批夜班 / 抗注入 / self-serve 接入）。里程碑与决策记录详见 **[docs/03 §8/§9](docs/03-next-version-spec.md)**。
+个人 alpha，作者本人在日用（租户 #1）。里程碑均已上真机：**M0–M3**（只读 MCP + zone ACL + bearer 认证 + 审计 → 写路径 + keeper 守门 → 捕获端点 + iOS App）；**M4.0–M4.9**（仪表 + 判例考卷 / 读侧智能 / lossless 分层 / 主频道 agent / 溯源 + schema 演化 + 审批夜班 / 抗注入 / self-serve 接入 / 常驻宿主 digest 下发）。里程碑与决策记录详见 **[docs/03 §8/§9](docs/03-next-version-spec.md)**。
 
 ## Docs · 文档
 

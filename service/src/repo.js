@@ -10,6 +10,13 @@ function git(cwd, args, timeout = 120_000) {
   });
 }
 
+// git 通常会隐藏 URL userinfo，但不能把这个行为当安全边界；任何错误出日志/状态前再兜底剥一次。
+export function sanitizeGitError(message) {
+  return String(message ?? '')
+    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[REDACTED]@')
+    .replace(/(https?:\/\/)[^\s/@]+@/gi, '$1[REDACTED]@');
+}
+
 export async function ensureRepo({ repoUrl, dir }) {
   if (existsSync(path.join(dir, '.git'))) return { cloned: false };
   mkdirSync(path.dirname(dir), { recursive: true });
@@ -22,7 +29,7 @@ export async function pullOnce(dir) {
     await git(dir, ['pull', '--ff-only']);
     return { ok: true, at: new Date().toISOString() };
   } catch (e) {
-    return { ok: false, at: new Date().toISOString(), error: e.message };
+    return { ok: false, at: new Date().toISOString(), error: sanitizeGitError(e.message) };
   }
 }
 
