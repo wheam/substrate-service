@@ -19,13 +19,13 @@ cd app && xcodegen generate
 open Cortex.xcodeproj   # Xcode 里选 Cortex scheme + 任一 iPhone 模拟器 ▶️
 ```
 
-首次启动进 ⚙️ 设置：服务地址默认已填，粘贴 capture token 即可。
+首次启动进 ⚙️ 设置：填写自己的服务地址并粘贴 capture token。
 测分享扩展：模拟器里开 Safari → 任意网页 → 分享 → 「存进 Cortex」。
 
 ## 真机 / TestFlight
 
-需要 Apple Developer 账号（$99/年）：Xcode 两个 target 的 Signing 里选 Team（bundle id
-`com.wheam.cortex` / `com.wheam.cortex.share`，App Group `group.com.wheam.cortex` 会随 Team 自动配置），
+需要 Apple Developer 账号（$99/年）：生成工程后，在 Xcode 两个 target 的 Signing 里选择你自己的 Team，
+并把 bundle id / App Group 改成你账号下可用的唯一标识，
 真机直接 ▶️；TestFlight 走 Product → Archive → Distribute。
 
 ## v0 边界（有意的）

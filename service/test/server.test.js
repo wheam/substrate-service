@@ -13,9 +13,10 @@ const TOKENS = {
 
 let httpServer;
 let baseUrl;
+let app;
 
 before(async () => {
-  const app = createApp({ instanceDir, tokens: TOKENS });
+  app = createApp({ instanceDir, tokens: TOKENS });
   await new Promise((resolve) => { httpServer = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${httpServer.address().port}`;
 });
@@ -32,8 +33,19 @@ async function mcpClient(token) {
 }
 
 test('healthz 无需认证', async () => {
+  app.locals.state.lastPull = {
+    ok: false,
+    at: '2026-07-12T00:00:00.000Z',
+    error: 'git pull 失败：https://x-access-token:ghp_abcdefghijklmnopqrstuvwxyz0123456789@example.com/private.git',
+  };
+  app.locals.state.keeper = { enabled: true, model: 'private-model', lastRun: null, lastResult: { detail: 'private' } };
   const res = await fetch(`${baseUrl}/healthz`);
   assert.equal(res.status, 200);
+  const body = await res.json();
+  const raw = JSON.stringify(body);
+  assert.deepEqual(body.lastPull, { ok: false, at: '2026-07-12T00:00:00.000Z' });
+  assert.deepEqual(body.keeper, { enabled: true, lastRun: null });
+  assert.ok(!raw.includes('ghp_') && !raw.includes('private-model') && !raw.includes('lastResult'));
 });
 
 test('无 token / 错 token 拒绝 MCP 请求', async () => {

@@ -13,6 +13,7 @@ const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url))
 const TOKENS = { 'w-high': { client: 'cc-test', trust: 'high' } };
 
 let origin, work, httpServer, baseUrl;
+const auditLog = [];
 
 function git(cwd, ...args) {
   return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });
@@ -32,7 +33,7 @@ before(async () => {
   git(seedDir, 'push', '-u', 'origin', 'main');
   execFileSync('git', ['clone', origin, work]);
 
-  const app = createApp({ instanceDir: work, tokens: TOKENS });
+  const app = createApp({ instanceDir: work, tokens: TOKENS, audit: (entry) => auditLog.push(entry) });
   await new Promise((resolve) => { httpServer = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${httpServer.address().port}`;
 });
@@ -79,9 +80,14 @@ test('todo_add / remember / collections_upsert 各自落件且 kind 正确', asy
 });
 
 test('save：密钥红线在写路径生效', async () => {
+  const secret = 'ghp_abcdefghij1234567890abcd';
   const client = await mcpClient('w-high');
-  const r = await client.callTool({ name: 'save', arguments: { content: 'token: ghp_abcdefghij1234567890abcd' } });
+  const r = await client.callTool({ name: 'save', arguments: { content: `token: ${secret}` } });
   assert.equal(r.isError, true);
   assert.match(r.content[0].text, /拒收/);
+  const audit = auditLog.findLast((entry) => entry.tool === 'save' && entry.ok === false);
+  assert.ok(audit);
+  assert.ok(!JSON.stringify(audit).includes(secret), '被拒的密钥原文不得进入审计');
+  assert.deepEqual(audit.args.content, { redacted: true, length: `token: ${secret}`.length });
   await client.close();
 });

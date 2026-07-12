@@ -1,8 +1,8 @@
-# 03 — 下一版 spec：受治理的 agent 记忆（MCP 版 substrate v0.3，开源参考实现）
+# 03 — 受治理的 agent 记忆（substrate-service v0.3，MCP 开源参考实现）
 
-> 状态：SPEC / 待动工（2026-07-05）。承接 01 个人 alpha（M0–M3 已完成、已上真机；**含个人实例细节，未随开源仓库发布**）、[02](02-productization.md)（长期产品化——其中托管 SaaS 部分本版**冻结**）。
+> 状态：IMPLEMENTED / 个人 alpha。M0–M4.9 已完成并在生产日用；本文件保留规格、里程碑与设计裁定。01 个人版含私人细节，未随开源仓库发布；[02](02-productization.md) 的托管 SaaS 部分仍冻结。
 > 定位一句话：给你一份**所有 AI 共享、且不会随增长而变乱的长期记忆**（受治理、可 `git clone` 带走）；把已跑通的个人 alpha，升级为 **「受治理的 agent 记忆」这个模式的开源参考实现**——我自己是租户 #1，也是模式作者。
-> **命名约定**：项目名保持 **`substrate`**（不改）；**模式**对外名暂用 **Governed Agent Memory / 受治理的 agent 记忆（GAM）**（临时，不纠结，见 §9）。
+> **命名约定**：本实现名为 **`substrate-service`**；**模式**对外名暂用 **Governed Agent Memory / 受治理的 agent 记忆（GAM）**（见 §9）。
 > 依据：2026-07-05 对 gbrain / openhuman 的调研 + fable5 / Codex(GPT-5.5) 两轮外部评审（要点已并入 [02 §9](02-productization.md) 与本 spec 各节），据拥有者定调收敛。
 
 ---
@@ -178,7 +178,7 @@
 - **部署**：你自己维持**云**（Railway 已在跑，是唯一够得着手机 + 远程 Hermes 且不架隧道的形态）。OSS 侧**两种都给**——本地单机作「60 秒试用」入口（留到 M4.5 打包时加），云为完整形态；安装 prompt 问一句「就这台机器还是所有设备+手机」分流。
 - **检索**：**默认纯词法（SQLite FTS5）**，语义（sqlite-vec + embedding）作一键升级档；**开不开由 M4.0 的「检索落空率」仪表用真实数据定**，不拍脑袋。
 - **分层落点**：用 **frontmatter `tier` 字段**（`raw` 住 inbox zone；keeper 归档后落真 zone 带 `tier: candidate|canonical`；`rejected` = `tier: rejected` 隔离可查）。晋升 = 翻字段，不搬文件、`content_id` 稳定。
-- **命名**：模式对外名暂定 **Governed Agent Memory / 受治理的 agent 记忆**（临时，不纠结）；**项目名保持 `substrate` 不改**。
+- **命名**：模式对外名暂定 **Governed Agent Memory / 受治理的 agent 记忆**；MCP 实现仓库名为 **`substrate-service`**，存储引擎仍为独立的 **`substrate`**。
 - **主频道「主动浮出」= 拉为主（M4.3 裁定）**：**不做 server push**——无状态 HTTP transport 没有 server→client 推送通道，改有状态 SSE 是架构手术、不值；且主频道 agent 只在主人对话时在场，push 没有常驻接收端。改**拉**，三条承接：① primary 客户端每次工具成功响应**尾部 piggyback** 一行「📥 待主人裁定 N 件」提示——浮出恰好发生在主人已在的那个对话里，零轮询成本；防重复 = held id 集合为 key，`NUDGE_TTL_MS`（默认 4h）窗口内只发一次，`inbox_list`/`inbox_resolve` 豁免（正在处置面里不再自扰）。② **不消费 MCP instructions 的宿主**（如 Hermes）用 primary token 定期拉 `/digest` 承接——digest 的 primary 版已含主频道房规 + 实时 held 摘要，等效于把「连接即下发」补成「拉取即保鲜」。③ 飞书 webhook 降为**哑兜底**通知。**安全红线**：piggyback 与 digest 的 held 摘要都**只带 id/kind/计数**，待裁件正文（= 对抗输入）绝不进提示面 / instructions / digest（与 M4.0 考卷同款威胁模型）。
 
 - **M4.4 三项设计裁定（2026-07-05 编排落地）**：

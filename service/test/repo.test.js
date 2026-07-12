@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ensureRepo, pullOnce } from '../src/repo.js';
+import { ensureRepo, pullOnce, sanitizeGitError } from '../src/repo.js';
 
 let origin; // bare 仓库当远端
 let seed;   // 往远端推内容用的工作副本
@@ -56,4 +56,11 @@ test('pullOnce：远端不可达时返回 ok=false 不抛', async () => {
   const result = await pullOnce(path.join(detached, 'clone'));
   assert.equal(result.ok, false);
   assert.ok(result.error);
+});
+
+test('git 错误里的 URL 凭据在进入日志/状态前被剥除', () => {
+  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+  const out = sanitizeGitError(`fatal: unable to access 'https://x-access-token:${secret}@github.com/owner/repo.git'`);
+  assert.ok(!out.includes(secret));
+  assert.match(out, /REDACTED/);
 });

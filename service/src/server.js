@@ -146,7 +146,13 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   const state = { startedAt: new Date().toISOString(), lastPull: null };
   app.locals.state = state;
 
-  app.get('/healthz', (_req, res) => res.json({ ok: true, ...state }));
+  // 公开健康检查只给存活/时间信号。原始 git/keeper 错误只留在已脱敏内部日志，绝不回显给未认证访客。
+  app.get('/healthz', (_req, res) => res.json({
+    ok: true,
+    startedAt: state.startedAt,
+    lastPull: state.lastPull ? { ok: state.lastPull.ok, at: state.lastPull.at } : null,
+    keeper: state.keeper ? { enabled: state.keeper.enabled, lastRun: state.keeper.lastRun ?? null } : undefined,
+  }));
 
   // ==== M4.8 enrollment 面：/enroll（兑换）+ 主频道 MCP 工具的服务端支撑 ====
   // 对外基址推导（要点 4 + 双审 Major#2）：返回 { url, source }。source 供铸码 prompt 判断是否要挂钓鱼警告。
@@ -776,10 +782,18 @@ function rulingAuditFields(r) {
   return fields;
 }
 
-// 审计里长内容截断（日志可读性；全文反正已在 inbox/git 里）
+// 内容类参数永不进审计正文：只记长度/字段名。其余参数仍保留供调试，最终还会经过 audit.js 的凭据兜底脱敏。
+const PRIVATE_AUDIT_ARGS = new Set(['content', 'item', 'fact', 'ruling', 'note', 'hint', 'text', 'url', 'row']);
+
 function auditArgs(args) {
   const out = {};
   for (const [k, v] of Object.entries(args ?? {})) {
+    if (PRIVATE_AUDIT_ARGS.has(k)) {
+      out[k] = typeof v === 'string'
+        ? { redacted: true, length: v.length }
+        : { redacted: true, fields: v && typeof v === 'object' ? Object.keys(v).slice(0, 20) : [] };
+      continue;
+    }
     out[k] = typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + `…(${v.length})` : v;
   }
   return out;
