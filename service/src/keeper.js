@@ -5,10 +5,11 @@ import path from 'node:path';
 import { parseZones } from './acl.js';
 import { validateDecision, applyDecision, runDoctor, rollbackSchemaWrites, finalizeSchemaRollback } from './executor.js';
 import { parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
+import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
 
 // SKIP_LLM kinds（M4.4 D2）：提案件（schema/maintenance）直达主人、keeper 绝不 LLM 判它们。
 // 有主人预批决定 → 走现有校验执行流；无 → re-held 提示点选（纯文字裁定永不触发执行/清场，防误伤）。
-const SKIP_LLM_KINDS = new Set(['schema', 'maintenance']);
+const SKIP_LLM_KINDS = new Set(['schema', 'maintenance', 'core']);
 
 const SYSTEM_PROMPT = `你是一个个人知识库（Substrate 实例）的守门 agent（keeper）。你的唯一职责：对一条待入库内容（CAPTURE）给出结构化归档决定。
 
@@ -122,10 +123,11 @@ export function displaySafePath(p) {
     .slice(0, 200);                                    // 长度上限
 }
 
-export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, approvals = new Map(), nativeReg = new Map() }) {
+export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, coreCalibration = null, approvals = new Map(), nativeReg = new Map() }) {
   let running = false;
   // F4：夜班独立 in-flight 旗，与归档锁 running 解耦——长扫描/慢 push 不再阻塞下一次 pending 受理。
   let nightlyRunning = false;
+  let coreRunning = false;
 
   // 派生检索索引的增量刷新（spec §6.4：增量由 keeper 单写口驱动）。indexStore 缺省 null → 完全无副作用
   // （老调用方行为不变）。索引在 git 之外、可随时重建，故刷新失败绝不回滚归档、只记日志。
@@ -184,7 +186,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       : '';
     const memDir = path.join(instanceDir, 'memory', 'about-owner');
     const memoryPages = existsSync(memDir)
-      ? readdirSync(memDir).filter((f) => f.endsWith('.md') && f !== 'README.md').map((f) => f.replace(/\.md$/, '')).join('、')
+      ? readdirSync(memDir).filter((f) => f.endsWith('.md') && f !== 'README.md' && !f.startsWith('_')).map((f) => f.replace(/\.md$/, '')).join('、')
       : '';
     const todoPath = path.join(instanceDir, 'todo', 'owner.md');
     const todoList = existsSync(todoPath) ? readFileSync(todoPath, 'utf8').slice(0, 6000) : '';
@@ -341,6 +343,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     });
     entry.__ruling_authentic = authentic;
     entry.__ruling_trust = authentic ? (rec.viaTrust ?? null) : null;
+    entry.__ruling_channel = authentic ? (rec.viaChannel ?? null) : null;
     // SEC-2（审计 B §4 + 二轮加固）：件是否本进程 addEntry 亲生【且未被篡改】——按【内容绑定】token 复算比对，
     // 不再只按公开 id（一轮 Set<id> 被 id 复用打穿）。executor 的 remove_page 分支据此收紧 kind=remove 旁路
     // （认证「主人动过手」≠ 认证「件是服务端亲生的」）。伪造件复用历史 native id 但正文/kind 不符 → token 失配 →
@@ -409,7 +412,9 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         if (ownerRuled) {
           // 主人亲自裁定不保存：件直接清场（git 历史留痕），裁定进判例
           rmSync(path.join(instanceDir, rel));
-          const paths = [rel, appendCase(entry, decision, 'rejected（主人裁定）')];
+          // core 提案是派生治理件，不是 keeper 语义判例；把整份 always-load 草案写进 _cases 会污染 future few-shot。
+          const paths = [rel];
+          if (entry.kind !== 'core') paths.push(appendCase(entry, decision, 'rejected（主人裁定）'));
           await commit({ paths, message: `keeper: rejected ${entry.id}（主人裁定）` });
         } else {
           // keeper 主动拒收：件不再丢——标 tier: rejected「隔离可查」（spec §3.1 / §6.2），留 inbox 待主人复核。
@@ -443,16 +448,20 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         changedPaths = applied.changedPaths;
         rmSync(path.join(instanceDir, rel));
         const paths = [...applied.changedPaths, rel];
-        if (entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
+        if (entry.kind !== 'core' && entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
         await commit({ paths, message: `keeper: ${decision.action} → ${detail}（${entry.id}）` });
       });
       if (applied?.rollbackToken) finalizeSchemaRollback(applied.rollbackToken); // 成功落地 → 作废 schema rollback token（防成功后残留授权）
+      if (applied?.rollbackCoreToken) finalizeCoreRollback(applied.rollbackCoreToken); // core 整页替换提交成功 → 作废回滚快照
     } catch (e) {
       approvals.delete(entry.id); // G2：认证票一次性——execution 失败也销账（stale 票不留，防翻回 pending 后复燃）
       // 十二轮 Codex：schema_apply 落盘成功但 commit 失败时，keeper 早先只 holdEntry、不回滚 → zones.md/目录残留孤儿 active zone。
       // 与工具通路（server.schemaApply）同构：凭 applySchema 发的 token 回滚（撤 zones.md + 删本次新建目录 + 用 entry.raw 恢复提案件）。
       if (applied?.rollbackToken) {
         await rollbackSchemaWrites({ instanceDir, changedPaths: applied.changedPaths, rollbackToken: applied.rollbackToken, entryRel: rel, entryRaw: entry.raw });
+      }
+      if (applied?.rollbackCoreToken) {
+        rollbackCoreCalibration({ instanceDir, rollbackToken: applied.rollbackCoreToken, entryRel: rel, entryRaw: entry.raw });
       }
       await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`);
       audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', error: e.message, ms: Date.now() - t0 });
@@ -491,6 +500,14 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       }
     } finally {
       running = false; // F4：先释放归档锁，再跑夜班——长扫描/慢 push 不再阻塞下一次 pending 受理
+    }
+    // about-owner 核心校准是独立 worker：分类页 hash 变化才调模型并生成 held 提案；不占 keeper 归档锁，
+    // 真写仍走同一个 writer 队列。与 nightly 分旗，避免慢模型/慢 push 让下一 tick 重入同一校准。
+    if (coreCalibration && !coreRunning) {
+      coreRunning = true;
+      try { await coreCalibration.maybeRun(); }
+      catch (e) { console.error(`core calibration 本轮异常（不影响归档）：${e.message}`); }
+      finally { coreRunning = false; }
     }
     // F4（Minor）：夜班（M4.4 D3）移出归档锁，自带独立 in-flight 旗 nightlyRunning 防重入，与 running 解耦。
     // 为何解锁 running 安全（不引入并发写）：夜班的写仍走 writer.transact 串行队列——那才是真正的串行点，

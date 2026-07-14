@@ -94,7 +94,7 @@
 
 ### 环境变量全表
 
-以 `service/src/server.js` 入口块为准（19 个，含 `RAILWAY_PUBLIC_DOMAIN`）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
+以 `service/src/server.js` 入口块为准（20 个，含 `RAILWAY_PUBLIC_DOMAIN`）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
 
 | 变量 | 必填 | 默认 | 说明 / 示例 |
 |---|---|---|---|
@@ -111,6 +111,7 @@
 | `KEEPER_NOTIFY_LEVEL` | | `all` | 通知档：`all` 全播报；`quiet` 静音「✅ 已存」成功播报（doctor 报错仍必达）。 |
 | `NUDGE_TTL_MS` | | `14400000`（4 小时） | 主频道待裁提示的防重复 TTL：同一批 `held` 件在此窗口内，工具响应尾部只提醒一次。 |
 | `NIGHTLY_INTERVAL_MS` | | `604800000`（7 天） | 夜班养护（去重/合并薄页/断链）确定性扫描间隔，产出走 inbox 的预批提案；`0`=禁用。仅在 provider 在场（`DEEPSEEK_API_KEY` 有值）时才挂。 |
+| `CORE_CALIBRATION_RETRY_MS` | | `3600000`（1 小时） | about-owner 核心摘要蒸馏失败后，对同一批分类页的最短重试间隔；成功时仍只生成主频道可审阅的 held 提案，不自动改 `_core.md`。 |
 | `FEISHU_WEBHOOK_URL` | | —（缺=只打日志） | 飞书自定义机器人 webhook，哑兜底通知。缺 → 通知只落服务日志。 |
 | `FEISHU_WEBHOOK_SECRET` | | — | 飞书 webhook 加签密钥（机器人开了「签名校验」才需要）。 |
 | `AUDIT_FILE` | | —（缺=只进 stdout） | 审计另存到卷上文件的路径。缺 → 审计只进 stdout（即 Railway 日志）。 |

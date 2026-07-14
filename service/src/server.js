@@ -16,6 +16,7 @@ import { createWriter } from './writer.js';
 import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
 import { createKeeper } from './keeper.js';
 import { createNightly, formatNightlyDigest } from './nightly.js';
+import { createCoreCalibration } from './core-calibration.js';
 import { applySchema, validateSchemaProposal, setPageTier, rollbackSchemaWrites, finalizeSchemaRollback } from './executor.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
@@ -30,10 +31,10 @@ const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 // 给它们再尾附待裁提示是噪音（agent 已在裁决面里），故排除。
 const NUDGE_EXEMPT = new Set(['inbox_list', 'inbox_resolve']);
 
-// D2（M4.6）：capture 通道无权兑现的件——maintenance（夜班/维护提案）与 schema（结构提案）是治理面，
+// D2（M4.6/M4.9.1）：capture 通道无权兑现的件——maintenance/schema/core 都是治理面，
 // 只能由高信任 CC/Hermes 裁定。服务端强制：这类件不进 App 的「待定夺（可裁）」列表、也不经 /capture/resolve 裁定
 // （原则=不给人无权兑现的按钮）。keeper 层的通道限权守卫保留作纵深防御，本层只是把拦截前移到入口。
-const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema']);
+const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema', 'core']);
 
 // SEC-1（原型污染免认证）shape 校验：只接受形状合法的 identity——client 是 string 且 trust ∈ {high,low,capture}。
 // 挡什么：`tokens` 是 JSON.parse 出的普通对象，静态查表命中的原型继承键（toString/constructor/hasOwnProperty/
@@ -79,6 +80,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   const recall = provider ? createRecall({ indexStore, provider, instanceDir }) : null;
   const app = express();
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
+  app.locals.inbox = inbox; // 夜班/core calibration 复用同一门面（尤其共享 native/approval 账本）
   app.locals.approvals = approvals; // F1：keeper（isMain）经此拿到与 inbox 同一个批准登记表
   app.locals.nativeReg = nativeReg; // SEC-2/SEC-5：keeper/nightly（isMain）经此拿到与 inbox 同一个亲生件登记表
 
@@ -356,9 +358,10 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   });
 
   // App 状态页 = 收件审阅心脏界面：capture 与高信任 token 全见（含全文）；低信任仅见自己的。
-  // D2（M4.6）：非高信任通道只列它有权兑现的件——maintenance/schema（治理提案）整体不进「待定夺」列表
+  // D2（M4.6/M4.9.1）：非高信任通道只列它有权兑现的件——maintenance/schema/core（治理提案）整体不进「待定夺」列表
   // （方案 = 整体不列，而非只读 rulable:false 区：对现有 iOS App 的 pending 数组解析零破坏、不引入新字段/新区，
-  // 也彻底消灭「给人无权兑现的按钮」）。高信任 CC/Hermes 仍全见（它们有权裁这类件）。见交付报告的 D2 说明。
+  // 也彻底消灭「给人无权兑现的按钮」）。高信任 CC/Hermes 可见 maintenance/schema；core 再收窄到 primary，
+  // 因为它会改变 Hermes 的 always-load 上下文。见交付报告的 D2/M4.9.1 说明。
   app.get('/capture/status', (req, res) => {
     const identity = identify(req);
     if (!identity) return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -371,6 +374,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     const mineOnly = identity.trust !== 'high' && identity.trust !== 'capture';
     let pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
     if (identity.trust !== 'high') pending = pending.filter((e) => !CAPTURE_UNRULABLE_KINDS.has(e.kind));
+    if (identity.channel !== 'primary') pending = pending.filter((e) => e.kind !== 'core');
     const events = (eventStore?.list() ?? []).filter((e) => !mineOnly || e.client === identity.client).slice(-100).reverse();
     return res.json({ ok: true, pending, events });
   });
@@ -385,17 +389,21 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
       return res.status(403).json({ ok: false, error: 'deliver-only capture token 只能投递 /capture' });
     }
     const { id, ruling, option } = req.body ?? {};
-    // D2（M4.6）入口限权：maintenance/schema 件不经手机裁定——在入口就拒（不再走到 keeper 层通道限权才弹回，
+    const coreHit = inbox.listEntries().entries.find((e) => e.id === id && e.kind === 'core');
+    if (coreHit && identity.channel !== 'primary') {
+      return res.status(403).json({ ok: false, error: '核心小抄提案只能在主频道审阅与批准' });
+    }
+    // D2（M4.6/M4.9.1）入口限权：maintenance/schema/core 件不经手机裁定——在入口就拒（不再走到 keeper 层通道限权才弹回，
     // 那样主人体验 = 「判了→不算→重来」，违反原则 B）。keeper 层通道限权守卫仍在，作纵深防御。高信任仍可裁。
     if (identity.trust !== 'high') {
       const hit = inbox.listEntries().entries.find((e) => e.id === id);
       if (hit && CAPTURE_UNRULABLE_KINDS.has(hit.kind)) {
         audit({ client: identity.client, tool: 'capture_resolve', args: { id }, ok: false, error: '该类件不经手机裁定' });
-        return res.status(403).json({ ok: false, error: '该类件（维护/结构提案）不经手机裁定，请在 CC / Hermes 等高信任客户端处理' });
+        return res.status(403).json({ ok: false, error: '该类件（维护/结构/核心小抄提案）不经手机裁定，请在主频道的 CC / Hermes 处理' });
       }
     }
     try {
-      const r = inbox.resolveEntry({ id, ruling, option, via: identity.client, viaTrust: identity.trust });
+      const r = inbox.resolveEntry({ id, ruling, option, via: identity.client, viaTrust: identity.trust, viaChannel: identity.channel });
       audit({ client: identity.client, tool: 'capture_resolve', args: { id, ruling }, ok: true, ...rulingAuditFields(r) });
       return res.json({ ok: true, id: r.id, status: r.status });
     } catch (e) {
@@ -583,17 +591,24 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
       title: '查收件箱',
       description: '列出 inbox 收件（含待定夺 held / 被拒收 rejected / 待处理 pending 的件）。主人问「有什么待定夺的/我的收件箱」或要处置某条时先用它拿 id。',
       inputSchema: {},
-    }, wrap('inbox_list', async () => inbox.listEntries(), asJson));
+    }, wrap('inbox_list', async () => {
+      const listed = inbox.listEntries();
+      return identity.channel === 'primary' ? listed : { entries: listed.entries.filter((e) => e.kind !== 'core') };
+    }, asJson));
 
     server.registerTool('inbox_resolve', {
       title: '主人裁定收件',
-      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。提案件（schema/maintenance）批准请传 option 点选候选。仅在主人明确表态后使用，id 用 inbox_list 查。',
+      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。提案件（schema/maintenance/core）批准请传 option 点选候选；core 仅主频道可见、可批。仅在主人明确表态后使用，id 用 inbox_list 查。',
       inputSchema: {
         id: z.string().describe('收件 id（inbox_list 可查）'),
         ruling: z.string().describe('主人的裁定原话，一句话'),
-        option: z.number().int().min(0).optional().describe('点选候选方案的序号（inbox_list 里 options[].index）——提案件（schema/maintenance）批准用它，比转述 ruling 更准'),
+        option: z.number().int().min(0).optional().describe('点选候选方案的序号（inbox_list 里 options[].index）——提案件（schema/maintenance/core）批准用它，比转述 ruling 更准'),
       },
-    }, wrap('inbox_resolve', async ({ id, ruling, option }) => inbox.resolveEntry({ id, ruling, option, via: client, viaTrust: trust }),
+    }, wrap('inbox_resolve', async ({ id, ruling, option }) => {
+      const hit = inbox.listEntries().entries.find((e) => e.id === id);
+      if (hit?.kind === 'core' && identity.channel !== 'primary') throw new Error('核心小抄提案只能在主频道审阅与批准');
+      return inbox.resolveEntry({ id, ruling, option, via: client, viaTrust: trust, viaChannel: identity.channel });
+    },
       (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`,
       rulingAuditFields));
 
@@ -819,6 +834,7 @@ if (isMain) {
     KEEPER_NOTIFY_LEVEL = 'all',
     NUDGE_TTL_MS = 14_400_000,
     NIGHTLY_INTERVAL_MS = 604_800_000, // 夜班默认 7 天一轮；0=禁用
+    CORE_CALIBRATION_RETRY_MS = 3_600_000, // 核心蒸馏失败后同一来源至少等 1 小时再试
     PUBLIC_URL,                        // M4.8：对外基址（拼 /enroll 里的 curl / mcp add 示例）
     RAILWAY_PUBLIC_DOMAIN,             // Railway 注入的域名（无 scheme）——PUBLIC_URL 缺省时回落它
     ENROLL_CODE_TTL_MS = 900_000,      // M4.8：enrollment 码有效期（默认 15 分钟）
@@ -878,18 +894,24 @@ if (isMain) {
   if (provider) {
     // notifier 已在 createApp 之前建好（enrollment 通知复用同一实例）；keeper/夜班共用它。
     // 夜班（M4.4 D3）只在 provider 在场时挂：它的提案执行依赖 keeper 循环（tick 里勾 maybeRun），
-    // 降级模式（无 key）下 keeper 不跑、夜班也不跑——文档口径不变。inbox 是无状态门面，另开一个实例
-    // 安全（与写工具共用同一个单写者 writer，串行不打架；createApp 不动）。
+    // 降级模式（无 key）下 keeper、夜班和 core calibration 都不跑——文档口径不变。
+    // 三者复用 createApp 建立的 inbox/writer，确保进程内批准账本与单写者队列严格一致。
+    const serviceInbox = app.locals.inbox;
     const nightly = createNightly({
       instanceDir,
-      inbox: createInbox({ instanceDir, writer: app.locals.writer, approvals: app.locals.approvals, nativeReg: app.locals.nativeReg }),
+      inbox: serviceInbox,
       notifier, audit,
       writer: app.locals.writer, // M4.6：降级/维护日志/迁移的写入走单写者队列（与归档写串行不打架）
       indexStore,                // 降级翻 tier 后刷新同一派生索引（candidate 默认检索不含）
       intervalMs: Number(NIGHTLY_INTERVAL_MS),
     });
+    const coreCalibration = createCoreCalibration({
+      instanceDir, inbox: serviceInbox, provider, writer: app.locals.writer, notifier, audit,
+      approvals: app.locals.approvals, nativeReg: app.locals.nativeReg,
+      retryMs: Number(CORE_CALIBRATION_RETRY_MS),
+    });
     const keeper = createKeeper({
-      instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly,
+      instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly, coreCalibration,
       approvals: app.locals.approvals, // F1：与 createApp 内 inbox 共享同一个批准登记表
       nativeReg: app.locals.nativeReg, // SEC-2/SEC-5：与 createApp 内 inbox 共享同一个亲生件登记表
       onEvent: (e) => eventStore.push(e),

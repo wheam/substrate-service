@@ -7,6 +7,7 @@ import { parseZones } from './acl.js';
 import { newContentId } from './content-id.js';
 import { parseEntryBody, scanSegments, INBOX_PREVIEW_CHARS } from './inbox.js';
 import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
+import { applyCoreCalibration, extractCoreDraft } from './core-calibration.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
 // schema_apply（M4.4 D2b）：落地一个 zone 提案。内容只认提案件正文的 json 块，decision 只能「指向」件（白名单原则）。
@@ -163,6 +164,15 @@ function pageRel(zone, slugRaw) {
 export function validateDecision({ instanceDir, decision, entry }) {
   const d = decision ?? {};
   if (!DISPOSITIONS.has(d.disposition)) return { ok: false, reason: `disposition 不合法：${d.disposition}` };
+  // core 提案连“丢弃”也是治理决定（会清场提案、改变下次是否重提），统一要求服务端亲生 + 主频道高信任批准；
+  // 这道门须在 forbidden 早返回之前，否则非主频道可借 forbidden 清掉 core 提案。
+  if (entry?.kind === 'core') {
+    if (!entry.__native) return { ok: false, reason: 'core 提案只接受服务端亲生且未被篡改的件' };
+    if (!entry.__ruling_authentic) return { ok: false, reason: 'core 提案需已认证的主人点选裁定' };
+    if (entry.__ruling_trust !== 'high' || entry.__ruling_channel !== 'primary') {
+      return { ok: false, reason: 'core 提案只能由高信任主频道裁定' };
+    }
+  }
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
   if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无意义（无本地），需主人定夺' };
   // D1（M4.6）安全边界：set_tier 绝不能从 LLM decision 触达——注入可诱导 keeper 把任意页降级=软删除，绕过
@@ -170,6 +180,26 @@ export function validateDecision({ instanceDir, decision, entry }) {
   // 不经本校验。显式早拒（不只依赖「不在 ACTIONS 白名单」——防未来误把它并进白名单静默开洞）。
   if (d.action === 'set_tier') {
     return { ok: false, reason: 'set_tier 不是 keeper 可产出的动作（降级只在夜班进程内确定性执行；恢复请用高信任 page_set_tier 工具）' };
+  }
+  // _core 是 always-load 的高权限派生面：普通 ACTIONS/LLM 永远触达不了，只有服务端亲生 core 提案
+  // 经高信任主人点选后，才能走 calibrate_core 整页替换。decision 只指向可见草案并绑定 hash，不能夹带正文。
+  if (d.action === 'calibrate_core') {
+    if (d.disposition !== 'canonical') return { ok: false, reason: 'calibrate_core 只接受 canonical disposition' };
+    if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: 'calibrate_core 缺 confidence 或 summary' };
+    if (entry?.kind !== 'core') return { ok: false, reason: `calibrate_core 仅用于 core 提案件；本件 kind=${entry?.kind ?? '未知'}` };
+    if (!entry?.__native) return { ok: false, reason: 'calibrate_core 只接受服务端亲生且未被篡改的 core 提案' };
+    if (!entry?.__ruling_authentic) return { ok: false, reason: 'calibrate_core 需已认证的主人点选批准' };
+    if (entry?.__ruling_trust !== 'high') return { ok: false, reason: 'calibrate_core 只能由高信任客户端批准' };
+    if (entry?.__ruling_channel !== 'primary') return { ok: false, reason: 'calibrate_core 只能由主频道批准' };
+    if (d.zone !== 'memory' || d.target !== '_core') return { ok: false, reason: 'calibrate_core 只能整页替换 memory/about-owner/_core.md' };
+    let draft;
+    try { draft = extractCoreDraft(entry); }
+    catch (e) { return { ok: false, reason: `core 可见草案校验失败：${e.message}` }; }
+    if (d.draft_hash !== draft.hash) return { ok: false, reason: 'calibrate_core 的隐藏决定与主人可见草案 hash 不符' };
+    const zones = parseZones(instanceDir);
+    const zone = zones.find((z) => z.id === 'memory');
+    if (!zone) return { ok: false, reason: 'memory zone 不存在' };
+    return { ok: true, verdict: 'file', zone };
   }
   if (!ACTIONS.has(d.action)) return { ok: false, reason: `action 不合法：${d.action}` };
   if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: '缺 confidence 或 summary' };
@@ -272,6 +302,12 @@ export function validateDecision({ instanceDir, decision, entry }) {
       return { ok: false, reason: `收藏不存在：${d.target}` };
     }
     if (!d.fields || typeof d.fields !== 'object') return { ok: false, reason: 'upsert_row 缺 fields' };
+  } else if (d.action === 'new_page' || d.action === 'merge_into') {
+    if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
+    const rel = pageRel(zone, d.target);
+    if (path.basename(rel) === 'README.md' || path.basename(rel).startsWith('_')) {
+      return { ok: false, reason: `普通 keeper 写动作不允许触碰结构页：${rel}` };
+    }
   } else {
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
   }
@@ -288,6 +324,7 @@ export async function applyDecision({ instanceDir, entry, decision, zone }) {
     case 'remove_page': return removePage(instanceDir, decision, zone);
     case 'merge_pages': return mergePages(instanceDir, decision, zone);
     case 'schema_apply': return applySchema({ instanceDir, entry }); // zone 参数忽略——schema 内容只从件正文取
+    case 'calibrate_core': return applyCoreCalibration({ instanceDir, entry }); // 特权整页替换；正文只取主人可见 core 草案
     default: throw new Error(`未知 action：${decision.action}`);
   }
 }

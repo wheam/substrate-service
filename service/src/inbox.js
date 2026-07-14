@@ -7,8 +7,8 @@ import { containsCredential } from './secrets.js';
 
 // 导出供读路径复验：实例仓库经 git pull 同步，inbox 件可以不经 addEntry、被手工伪造后拉进来——
 // 「kind 合法、id 是服务端生成的」只在写路径成立，任何要把 id/kind 拼进响应面的读方必须自己再验。
-// schema/maintenance = M4.4 提案件（D2）：创建即 held、直达主人，keeper 不 LLM 判它们（走点选预批通路）。
-export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture', 'schema', 'maintenance']);
+// schema/maintenance/core = 服务端提案件：创建即 held、直达主人，keeper 不 LLM 判它们（走点选预批通路）。
+export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture', 'schema', 'maintenance', 'core']);
 
 // F4（M4.6 Finding4）kind 规范化：inbox 件经 git pull 拉进来时 frontmatter 的 `kind:` 是任意文本——
 // 大小写/首尾空白变体（`Maintenance`、` maintenance `、`SCHEMA`）会让【展示面】（server.js 的 D2 过滤按
@@ -27,6 +27,9 @@ export const ID_FORMAT = /^[a-z0-9]{1,12}-[a-f0-9]{4}$/;
 // （十二轮 Codex）——保证「主人在 inbox_list 预览里看得到的」==「applySchema/schema_apply 实际落地的」，杜绝把 payload 埋在
 // 预览截断之外偷偷落地（纯截断 Major）。
 export const INBOX_PREVIEW_CHARS = 2000;
+// core 草案本身就是待主人审阅的完整可执行 payload，允许到 _core 硬上限 3000 再加固定说明；
+// 只给 kind=core 放宽，不扩大普通 capture/schema 的响应面与既有契约。
+export const CORE_PROPOSAL_PREVIEW_CHARS = 4000;
 
 // SEC-5（审计 B §4 + 二/三/四轮加固）：【一切】隐藏候选——点选它须件是【服务端亲生且未被篡改】（nativeToken 内容绑定
 // 校验命中，见下方 nativeToken；gate 在 resolveEntry 点选分支）。收窄轨迹：二轮只 gate 破坏性删/改页 → 三轮 Codex 指出漏
@@ -176,10 +179,18 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
         const raw = readFileSync(path.join(dir, f), 'utf8');
         const get = (k) => raw.match(new RegExp(`^${k}: (.*)$`, 'm'))?.[1] ?? '';
         const parsed = parseEntryBody(raw);
+        const kind = normKind(get('kind'));
+        const id = get('id');
+        const rel = `inbox/${f}`;
+        const client = get('client');
+        // core 的 4k 专用预览只给本进程服务端亲生且未被篡改的提案。伪造件、以及重启后失去 native
+        // 登记的旧件仍只回普通 2k，避免攻击者仅靠手写 kind:core 扩大提示注入响应面。
+        const nativeCore = kind === 'core' && nativeReg.get(id) === nativeToken({ id, rel, kind, client, raw });
         return {
-          id: get('id'), path: `inbox/${f}`, kind: normKind(get('kind')), status: get('status'),
+          id, path: rel, kind, status: get('status'),
           received_at: get('received_at'), hint: get('hint') || undefined,
-          client: get('client'), excerpt: parsed.content.slice(0, 120), content: parsed.content.slice(0, INBOX_PREVIEW_CHARS),
+          client, excerpt: parsed.content.slice(0, 120),
+          content: parsed.content.slice(0, nativeCore ? CORE_PROPOSAL_PREVIEW_CHARS : INBOX_PREVIEW_CHARS),
           reason: parsed.reason, options: parsed.options.map((o, i) => ({ index: i, label: o.label })),
         };
       });
@@ -188,7 +199,7 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
 
   // 主人裁定：把件复位为 pending 并携带 owner_ruling，keeper 下一轮按裁定执行并自动立判例。
   // via/viaTrust 记录裁定进来的通道——capture 通道的裁定在执行层被限权（如无权删页）。
-  function resolveEntry({ id, ruling, option, via, viaTrust }) {
+  function resolveEntry({ id, ruling, option, via, viaTrust, viaChannel }) {
     const { entries } = listEntries();
     const hit = entries.find((e) => e.id === id);
     if (!hit) {
@@ -259,6 +270,7 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
       // 防 approve-then-swap 改 client 伪造新页 source_agent。
       token: approvalToken({ id, ruling, decision: approvedDecision, rel: hit.path, kind: hit.kind, content: parseEntryBody(raw).content, client: hit.client }),
       viaTrust: viaTrust ?? null,
+      viaChannel: viaChannel ?? null,
     });
     // 缺陷2b：复位后刷新派生索引——件现为 status:pending（不再满足隔离-rejected 双条件），updatePage 会
     // DELETE 掉它此前作为 rejected 入的旧行、不再重插。索引在 git 之外、可随时重建，故刷新失败绝不影响复位

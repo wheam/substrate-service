@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-# fixture：模拟实例 vendored 的 render-context.py（真实版见真实例私库）。
-# 输出刻意带上 v1 时代的锈迹段落（路由表 / v1 房规 / 维护 skill 行 / substrate-memory 引用），
-# 供 getContext 的「digest v2 化过滤」测试当靶子——真实例的 v1 渲染器同样会产出这些。
-print("""# Substrate 常驻上下文（fixture）
+# fixture：动态读取真实 _core.md，同时刻意带上 v1 锈迹段落供 getContext 出口过滤测试。
+from pathlib import Path
+import re
+
+raw = Path('memory/about-owner/_core.md').read_text(encoding='utf-8')
+core = re.sub(r'^---\n.*?\n---\n?', '', raw, count=1, flags=re.S).strip()
+print(f"""# Substrate 常驻上下文（fixture）
 
 ## 关于主人（核心）
 
-主人称呼 Alex。细节在分类页，按目录用 `substrate-memory` 现读。
+{core}
 
 ## 关于主人（记忆目录，需要细节时用 substrate-memory 读对应页）
 
 - habits: 作息偏好
+- communication-preferences: 沟通偏好
 
 ## 库里有什么（各区速览）
 

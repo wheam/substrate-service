@@ -139,6 +139,25 @@ test('primary 调 inbox_list / inbox_resolve 响应不附 nudge（正在处理�
   await client.close();
 });
 
+test('core 提案只在 primary 的 inbox_list 可见，普通 high 不能看也不能裁', async () => {
+  const work = freshWork();
+  writeHeld(work, 'core0001-aa11', { kind: 'core', client: 'core-calibrator', marker: 'CORE-DRAFT-SECRET' });
+  const { baseUrl } = await startApp(work);
+  const primary = await mcpClient(baseUrl, 'tok-primary');
+  const primaryList = await primary.callTool({ name: 'inbox_list', arguments: {} });
+  assert.match(primaryList.content[0].text, /core0001-aa11/);
+  await primary.close();
+
+  const plain = await mcpClient(baseUrl, 'tok-plain');
+  const plainList = await plain.callTool({ name: 'inbox_list', arguments: {} });
+  assert.ok(!plainList.content[0].text.includes('core0001-aa11'));
+  assert.ok(!plainList.content[0].text.includes('CORE-DRAFT-SECRET'));
+  const denied = await plain.callTool({ name: 'inbox_resolve', arguments: { id: 'core0001-aa11', ruling: '批准', option: 0 } });
+  assert.equal(denied.isError, true);
+  assert.match(denied.content[0].text, /主频道/);
+  await plain.close();
+});
+
 test('防重复：同一 held 集合第二次 callTool 不再附', async () => {
   const work = freshWork();
   writeHeld(work, 'held-1');
