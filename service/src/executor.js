@@ -52,16 +52,64 @@ function git(instanceDir, args) {
   });
 }
 
-// doctor 迁自 keeper（Global Constraints：共用一处）。行为不变：enabled=false → null；无 doctor.py（execFile 失败）
-// → stdout 空 → 正则不命中 → null。null 语义 = 「无 doctor 视为无告警」，调用方按 0 处理（不阻断）。
+function nulPaths(raw) {
+  return String(raw).split('\0').filter(Boolean);
+}
+
+// keeper 的复合写在专用 clone + 单写者队列里执行。正式落盘前要求工作树 clean，避免把人工/并发改动
+// 混进本次归档；失败时只恢复本次产生的 tracked diff，并逐个删除本次新建的 untracked 文件。
+// 不用 reset --hard / git clean，回滚面保持可枚举、可审计。
+export async function assertCleanWorktree(instanceDir) {
+  const status = await git(instanceDir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  const dirty = nulPaths(status);
+  if (dirty.length) throw new Error(`实例工作树有 ${dirty.length} 处未提交改动，拒绝混入 keeper 归档`);
+}
+
+function outsideInbox(rel) {
+  return rel !== 'inbox' && !rel.startsWith('inbox/');
+}
+
+export async function rollbackUncommitted(instanceDir) {
+  // addEntry/resolveEntry 为了秒回，会先在 inbox/ 落盘、再排进 writer 队列。它们可能恰好发生在
+  // clean 检查与 doctor 失败之间，因此统一回滚绝不能碰 inbox/；当前处理件由随后 holdEntry
+  // 根据 entry.raw 重建，其余并发收件/裁定则保留给各自已排队的 commit。
+  const staged = nulPaths(await git(instanceDir, ['diff', '--cached', '--name-only', '-z'])).filter(outsideInbox);
+  if (staged.length) {
+    // 先只退暂存区；这样 HEAD 中不存在的 staged-new 文件会变回 untracked，而不会让
+    // `restore --source=HEAD --staged --worktree` 因无 HEAD 对象而中断整次回滚。
+    await git(instanceDir, ['restore', '--staged', '--', ...staged]);
+  }
+
+  const tracked = nulPaths(await git(instanceDir, ['diff', '--name-only', '-z'])).filter(outsideInbox);
+  if (tracked.length) {
+    await git(instanceDir, ['restore', '--source=HEAD', '--worktree', '--', ...tracked]);
+  }
+
+  const untracked = nulPaths(await git(instanceDir, ['ls-files', '--others', '--exclude-standard', '-z']))
+    .filter(outsideInbox);
+  const root = path.resolve(instanceDir);
+  for (const rel of untracked) {
+    const abs = path.resolve(root, rel);
+    if (abs === root || !abs.startsWith(root + path.sep)) {
+      throw new Error(`回滚遇到越界 untracked 路径，拒绝删除：${rel}`);
+    }
+    if (existsSync(abs) && !statSync(abs).isDirectory()) rmSync(abs, { force: true });
+  }
+}
+
+// doctor 迁自 keeper（Global Constraints：共用一处）。enabled=false → null；脚本不可用或输出不可解析也返回 null。
+// keeper 的正式写路径会把「enabled=true 且 null」视为验收失败，fail closed；显式 doctor=false 的测试/调用方保持跳过。
 export function runDoctor(instanceDir, { enabled = true } = {}) {
   if (!enabled) return Promise.resolve(null);
   return new Promise((resolve) => {
     execFile('python3', [path.join(instanceDir, 'skills', 'substrate-doctor', 'doctor.py'), '.'],
       { cwd: instanceDir, timeout: 120_000, encoding: 'utf8' },
-      (_err, stdout) => {
-        const m = String(stdout).match(/→ (\d+) error/);
-        resolve(m ? Number(m[1]) : null);
+      (err, stdout) => {
+        const matches = [...String(stdout).matchAll(/^\s*→ (\d+) error(?:\(s\)|s)?(?:\s*,.*)?\s*$/gm)];
+        const errors = matches.length ? Number(matches.at(-1)[1]) : null;
+        // doctor 发现错误时会以非零码退出，但汇总里的正数仍可信；基础设施失败却声称 0
+        // 或根本没有汇总时一律不采信，交给调用方 fail closed。
+        resolve(err && (!errors || errors === 0) ? null : errors);
       });
   });
 }
@@ -368,13 +416,13 @@ export async function applySchema({ instanceDir, entry }) {
   writeFileSync(path.join(dirAbs, '.gitkeep'), '');
   writeFileSync(path.join(dirAbs, 'README.md'), `# ${v.id}\n\n${v.purpose}\n`);
 
-  // doctor 校验（enabled:true——schema 落地的验收就是 doctor 0 error）。errors>0 显式回滚、不 commit、throw。
+  // doctor 校验（enabled:true——schema 落地的验收就是 doctor 0 error）。无结果或 errors>0 都回滚、不 commit、throw。
   const errors = await runDoctor(instanceDir, { enabled: true });
-  if (errors && errors > 0) {
+  if (errors === null || errors > 0) {
     await git(instanceDir, ['checkout', '--', zonesRel]); // 撤回 zones.md 追加（回到 HEAD，本 transact 前已 commit）
     // 只删「本次新建」：上方已存在即拒的守卫保证 dirAbs 必为本次 mkdirSync 所建，递归删不可能波及既有树。
     rmSync(dirAbs, { recursive: true, force: true });
-    throw new Error(`doctor 报 ${errors} error，已回滚`);
+    throw new Error(errors === null ? 'doctor 未返回可解析结果，已回滚' : `doctor 报 ${errors} error，已回滚`);
   }
   // 发一枚一次性 rollback token（登记本次新建目录 + 实例）——doctor 通过后才发，故 doctor-fail 路径（上方自回滚+throw）不留 token。
   const rollbackToken = randomBytes(16).toString('hex');
@@ -560,8 +608,7 @@ async function upsertRow(instanceDir, decision) {
 }
 
 async function newPage(instanceDir, entry, decision, zone) {
-  const slug = decision.target.replace(/\.md$/, '');
-  const rel = path.posix.join(zone.path, `${slug}.md`);
+  const rel = pageRel(zone, decision.target);
   const abs = path.join(instanceDir, rel);
   if (existsSync(abs)) throw new Error(`页已存在：${rel}（该用 merge_into）`);
   const fm = [
@@ -593,10 +640,10 @@ async function newPage(instanceDir, entry, decision, zone) {
   const linksSection = validLinks.length ? `\n\n相关：${validLinks.map((l) => `[[${l}]]`).join('、')}\n` : '\n';
   writeFileSync(abs, fm + entry.body.trim() + linksSection);
   // 登记索引（reindex 会给新页入链，免成孤儿）
-  const zoneDir = zone.path.replace(/\/$/, '');
+  const pageDir = path.posix.dirname(rel);
   await py(instanceDir, path.join(instanceDir, 'skills', 'substrate-curator', 'curate.py'),
-    ['reindex', '--instance', '.', '--dir', zoneDir, '--apply']);
-  return { changedPaths: [rel, `${zoneDir}/README.md`], detail: rel };
+    ['reindex', '--instance', '.', '--dir', pageDir, '--apply']);
+  return { changedPaths: [rel, `${pageDir}/README.md`], detail: rel };
 }
 
 function mergeInto(instanceDir, entry, decision, zone) {

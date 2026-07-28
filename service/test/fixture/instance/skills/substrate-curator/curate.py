@@ -27,7 +27,7 @@ d = pathlib.Path(a.instance) / a.dir
 readme = d / "README.md"
 lines = [
     f"| [[{f.stem}]] | {f.stem} |"
-    for f in sorted(d.rglob("*.md"))
+    for f in sorted(d.glob("*.md"))
     if f.name != "README.md" and not f.name.startswith("_")
 ]
 if a.apply:

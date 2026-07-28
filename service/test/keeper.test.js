@@ -1,13 +1,14 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, cpSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, cpSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper, caseLogSafe } from '../src/keeper.js';
+import { rollbackUncommitted } from '../src/executor.js';
 import { readTier } from '../src/tier.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
@@ -39,6 +40,14 @@ test('caseLogSafe：写进 _cases.md 的方括号全实体化，doctor 任何 st
 
 function git(cwd, ...args) {
   return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });
+}
+
+async function waitForFile(abs, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(abs)) {
+    if (Date.now() >= deadline) throw new Error(`等待文件超时：${abs}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 // 每个测试独立实例，避免状态串扰
@@ -78,7 +87,7 @@ function fakeNotifier() {
   return { messages, notify: async (text) => { messages.push(text); return { ok: true }; } };
 }
 
-function setup({ providerScript }) {
+function setup({ providerScript, doctor = false }) {
   const { origin, work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
   const inbox = createInbox({ instanceDir: work, writer });
@@ -86,7 +95,7 @@ function setup({ providerScript }) {
   const notifier = fakeNotifier();
   const auditLog = [];
   const audit = (e) => auditLog.push(e);
-  const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, audit, doctor: false });
+  const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, audit, doctor });
   return { origin, work, inbox, keeper, provider, notifier, auditLog };
 }
 
@@ -112,6 +121,127 @@ test('save→knowledge new_page：建页、reindex、删收件、commit、通知
   assert.match(git(origin, 'log', '--oneline', '-2'), /keeper/);
   assert.equal(notifier.messages.length, 1);
   assert.match(notifier.messages[0], /✅.*已存/s);
+});
+
+test('nested new_page：刷新页面实际所在目录的 README，不污染 zone 根索引', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [{
+      disposition: 'canonical', zone: 'knowledge', action: 'new_page',
+      target: 'ops/nested-runbook', title: '嵌套运维手册',
+      summary: '嵌套目录索引回归', confidence: 0.95,
+    }],
+  });
+  const receipt = inbox.addEntry({ kind: 'save', content: '一份嵌套目录运维记录。', client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+  assert.equal(result.filed, 1);
+  assert.ok(existsSync(path.join(work, 'knowledge', 'ops', 'nested-runbook.md')), '新页应落在 knowledge/ops');
+  assert.match(
+    readFileSync(path.join(work, 'knowledge', 'ops', 'README.md'), 'utf8'),
+    /\[\[nested-runbook\]\]/,
+    '页面实际所在目录索引应登记新页',
+  );
+  const rootReadme = path.join(work, 'knowledge', 'README.md');
+  assert.ok(
+    !existsSync(rootReadme) || !/\[\[nested-runbook\]\]/.test(readFileSync(rootReadme, 'utf8')),
+    '两级索引下不应把嵌套页塞进 zone 根 README',
+  );
+});
+
+test('doctor 提交前闸门：ERROR 时回滚新页与索引，收件转 held，不推坏提交', async () => {
+  const { work, inbox, keeper } = setup({
+    doctor: true,
+    providerScript: [{
+      disposition: 'canonical', zone: 'knowledge', action: 'new_page',
+      target: 'doctor-gate-repro', title: 'Doctor Gate',
+      summary: '验证提交前闸门', confidence: 0.95,
+    }],
+  });
+  const doctorPath = path.join(work, 'skills', 'substrate-doctor', 'doctor.py');
+  writeFileSync(doctorPath, '#!/usr/bin/env python3\nprint("→ 1 error(s)")\n');
+  git(work, 'add', 'skills/substrate-doctor/doctor.py');
+  git(work, 'commit', '-m', 'test: make doctor fail');
+
+  const rootReadme = path.join(work, 'knowledge', 'README.md');
+  const indexBefore = existsSync(rootReadme) ? readFileSync(rootReadme, 'utf8') : null;
+  const receipt = inbox.addEntry({ kind: 'save', content: '这条写入应被 doctor 拦下。', client: 'cc-test' });
+  await receipt.synced;
+  const result = await keeper.processPending();
+
+  assert.equal(result.held, 1);
+  assert.ok(!existsSync(path.join(work, 'knowledge', 'doctor-gate-repro.md')), 'doctor ERROR 后新页应回滚');
+  assert.equal(
+    existsSync(rootReadme) ? readFileSync(rootReadme, 'utf8') : null,
+    indexBefore,
+    '目录索引应逐字回滚',
+  );
+  const held = readFileSync(path.join(work, receipt.path), 'utf8');
+  assert.match(held, /^status: held$/m, '原收件应恢复并转 held');
+  assert.match(held, /doctor 报 1 error，已回滚/, 'held 原因应说明 doctor 门禁');
+  assert.equal(git(work, 'status', '--short'), '', '回滚与 held 提交后工作树应 clean');
+  assert.doesNotMatch(
+    git(work, 'ls-tree', '-r', '--name-only', 'origin/main'),
+    /knowledge\/doctor-gate-repro\.md/,
+    '远端 main 不得出现被 doctor 拦下的坏页',
+  );
+});
+
+test('doctor 回滚并发安全：闸门运行期间的新收件不被统一回滚误删', async () => {
+  const { work, inbox, keeper } = setup({
+    doctor: true,
+    providerScript: [{
+      disposition: 'canonical', zone: 'knowledge', action: 'new_page',
+      target: 'doctor-race-repro', title: 'Doctor Race',
+      summary: '验证并发收件存活', confidence: 0.95,
+    }],
+  });
+  const doctorPath = path.join(work, 'skills', 'substrate-doctor', 'doctor.py');
+  writeFileSync(doctorPath, [
+    '#!/usr/bin/env python3',
+    'from pathlib import Path',
+    'import time',
+    'Path(".doctor-started").write_text("1")',
+    'time.sleep(0.3)',
+    'print("→ 1 error(s)")',
+    '',
+  ].join('\n'));
+  git(work, 'add', 'skills/substrate-doctor/doctor.py');
+  git(work, 'commit', '-m', 'test: make doctor slow and fail');
+
+  const failing = inbox.addEntry({ kind: 'save', content: '触发慢 doctor 的原件。', client: 'cc-test' });
+  await failing.synced;
+  const processing = keeper.processPending();
+  await waitForFile(path.join(work, '.doctor-started'));
+  const concurrent = inbox.addEntry({ kind: 'save', content: 'doctor 运行期间到达的新收件。', client: 'cc-race' });
+
+  const result = await processing;
+  await concurrent.synced;
+  assert.equal(result.held, 1);
+  assert.ok(existsSync(path.join(work, concurrent.path)), '并发新收件应继续存在并完成自己的提交');
+  assert.match(readFileSync(path.join(work, concurrent.path), 'utf8'), /doctor 运行期间到达的新收件/);
+  assert.equal(git(work, 'status', '--short'), '', '失败件转 held 与并发收件提交后工作树应 clean');
+});
+
+test('rollbackUncommitted：能退 staged-new，并保留并发 inbox 新件与裁定改写', async () => {
+  const { work } = makeInstance();
+  const writer = createWriter({ instanceDir: work });
+  const inbox = createInbox({ instanceDir: work, writer });
+  const tracked = inbox.addEntry({ kind: 'save', content: '待裁定原件', client: 'cc-test' });
+  await tracked.synced;
+
+  const trackedAbs = path.join(work, tracked.path);
+  writeFileSync(trackedAbs, readFileSync(trackedAbs, 'utf8').replace(/^status: pending$/m, 'owner_ruling: 保留\nstatus: pending'));
+  const concurrentRel = 'inbox/_2099-01-01-concurrent.md';
+  writeFileSync(path.join(work, concurrentRel), '并发新件，不得删除\n');
+  const stagedRel = 'knowledge/staged-new.md';
+  writeFileSync(path.join(work, stagedRel), 'doctor 应拦下的暂存新页\n');
+  git(work, 'add', stagedRel);
+
+  await rollbackUncommitted(work);
+  assert.ok(!existsSync(path.join(work, stagedRel)), 'staged-new 应先退暂存再按 untracked 删除');
+  assert.ok(existsSync(path.join(work, concurrentRel)), '并发 inbox 新件不得删除');
+  assert.match(readFileSync(trackedAbs, 'utf8'), /owner_ruling: 保留/, '并发 inbox 裁定改写不得恢复成 HEAD');
+  assert.equal(git(work, 'diff', '--cached', '--name-only'), '', '回滚后暂存区应为空');
 });
 
 test('todo kind → todo_add 按编号追加到 ## 待办', async () => {
