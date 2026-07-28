@@ -3,7 +3,10 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { parseZones } from './acl.js';
-import { validateDecision, applyDecision, runDoctor, rollbackSchemaWrites, finalizeSchemaRollback } from './executor.js';
+import {
+  validateDecision, applyDecision, runDoctor, rollbackSchemaWrites, finalizeSchemaRollback,
+  assertCleanWorktree, rollbackUncommitted,
+} from './executor.js';
 import { parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
 
@@ -443,13 +446,44 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     let detail, changedPaths = [], applied = null;
     try {
       await writer.transact(async (commit) => {
-        applied = await applyDecision({ instanceDir, entry, decision, zone: v.zone });
-        detail = applied.detail;
-        changedPaths = applied.changedPaths;
-        rmSync(path.join(instanceDir, rel));
-        const paths = [...applied.changedPaths, rel];
-        if (entry.kind !== 'core' && entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
-        await commit({ paths, message: `keeper: ${decision.action} → ${detail}（${entry.id}）` });
+        await assertCleanWorktree(instanceDir);
+        try {
+          applied = await applyDecision({ instanceDir, entry, decision, zone: v.zone });
+          detail = applied.detail;
+          changedPaths = applied.changedPaths;
+          rmSync(path.join(instanceDir, rel));
+          const paths = [...applied.changedPaths, rel];
+          if (entry.kind !== 'core' && entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
+
+          // 普通内容写与 schema/core 一样，doctor 是 commit/push 前的硬闸门：
+          // ERROR 或 doctor 自身不可用都不允许把漂移推上主分支。
+          if (doctor) {
+            const errors = await runDoctor(instanceDir, { enabled: true });
+            if (errors === null) throw new Error('doctor 未返回可解析结果，已回滚');
+            if (errors > 0) throw new Error(`doctor 报 ${errors} error，已回滚`);
+          }
+          await commit({ paths, message: `keeper: ${decision.action} → ${detail}（${entry.id}）` });
+        } catch (e) {
+          // schema/core 有额外的目录/快照 token，先按其专用协议恢复；再统一清掉其余未提交 diff
+          // （如主人裁定判例行）。所有回滚都发生在单写者事务内。
+          if (applied?.rollbackToken) {
+            await rollbackSchemaWrites({
+              instanceDir, changedPaths: applied.changedPaths, rollbackToken: applied.rollbackToken,
+              entryRel: rel, entryRaw: entry.raw,
+            });
+          }
+          if (applied?.rollbackCoreToken) {
+            rollbackCoreCalibration({
+              instanceDir, rollbackToken: applied.rollbackCoreToken, entryRel: rel, entryRaw: entry.raw,
+            });
+          }
+          try {
+            await rollbackUncommitted(instanceDir);
+          } catch (rollbackError) {
+            throw new Error(`${e.message}；自动回滚失败：${rollbackError.message}`);
+          }
+          throw e;
+        }
       });
       if (applied?.rollbackToken) finalizeSchemaRollback(applied.rollbackToken); // 成功落地 → 作废 schema rollback token（防成功后残留授权）
       if (applied?.rollbackCoreToken) finalizeCoreRollback(applied.rollbackCoreToken); // core 整页替换提交成功 → 作废回滚快照
@@ -474,12 +508,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     // 普通件从没被索引过 → updatePage 只做一次无害 DELETE。
     refreshIndex(decision.action, [...changedPaths, rel]);
 
-    const doctorErrors = await runDoctor(instanceDir, { enabled: doctor });
-    const doctorNote = doctorErrors ? `\n⚠️ doctor 报 ${doctorErrors} 个 error，请抽空看看` : '';
     const verb = decision.action === 'remove_page' ? `✅ 已删 → ${detail}（git 历史可找回）` : `✅ 已存 → ${detail}`;
     emit(entry, decision.action === 'remove_page' ? 'removed' : 'filed', detail, decision.summary);
-    if (notifyLevel !== 'quiet' || doctorErrors) {
-      await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${model}）${doctorNote}`);
+    if (notifyLevel !== 'quiet') {
+      await notifier.notify(`${verb}\n${decision.summary}\n（inbox ${entry.id}，${model}）`);
     }
     // filed 的分层去向：canonical → disposition=accepted（进主库）；candidate → disposition=candidate
     // （入库但默认检索不含）。两者都算「已进库」（metrics IN_LIBRARY），verdict 旧字段仍 filed（向后兼容）。

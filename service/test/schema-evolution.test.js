@@ -197,6 +197,32 @@ test('B2 doctor 报 error → zones.md 回滚原样、目录不存在、工具�
   await client.close();
 });
 
+test('B2b doctor 无可解析结果 → schema_apply fail closed、回滚且不提交', async () => {
+  const { work } = makeInstance();
+  const { baseUrl } = await startApp(work);
+  const client = await mcpClient(baseUrl, 'w-high');
+  await client.callTool({ name: 'schema_propose', arguments: { id: 'health', path: 'health/', purpose: '健康记录' } });
+  const eid = schemaEntryId(work);
+  const zonesBefore = readFileSync(path.join(work, 'governance', 'zones.md'), 'utf8');
+  writeFileSync(
+    path.join(work, 'skills', 'substrate-doctor', 'doctor.py'),
+    'print("doctor output format changed")\n',
+  );
+
+  const r = await client.callTool({ name: 'schema_apply', arguments: { id: eid } });
+  assert.equal(r.isError, true, 'doctor 无结果时 apply 应安全失败');
+  assert.match(r.content[0].text, /doctor 未返回可解析结果.*回滚/, '报错应说明 fail-closed 回滚');
+  assert.equal(readFileSync(path.join(work, 'governance', 'zones.md'), 'utf8'), zonesBefore, 'zones.md 逐字回滚');
+  assert.ok(!existsSync(path.join(work, 'health')), '不得残留新 zone 目录');
+  assert.ok(readSchemaEntry(work), '提案件仍应留在 inbox');
+  assert.doesNotMatch(
+    git(work, 'ls-tree', '-r', '--name-only', 'origin/main'),
+    /^health\//m,
+    '远端 main 不得出现 doctor 无结果时的新 zone',
+  );
+  await client.close();
+});
+
 test('B3 对 kind≠schema 的件 apply 被拒', async () => {
   const { work } = makeInstance();
   const { baseUrl } = await startApp(work);
@@ -483,6 +509,8 @@ test('D6(F3) keeper 点选通路遇 apply 抛错（doctor fail）→ 件 re-held
   await resolved.synced;
   const zonesBefore = readFileSync(path.join(work, 'governance', 'zones.md'), 'utf8');
   makeDoctorFail(work); // applySchema 内的 doctor 必败 → 回滚 + throw
+  git(work, 'add', 'skills/substrate-doctor/doctor.py');
+  git(work, 'commit', '-m', 'test: make doctor fail');
   const result = await keeper.processPending();
   assert.equal(result.held, 1, 'apply 失败 → 件 re-held');
   assert.equal(provider.calls.length, 0, '失败边路也零 LLM（SKIP_LLM 不生成候选）');

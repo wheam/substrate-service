@@ -243,8 +243,9 @@ test('G1② approve-then-swap：resolve 批准 new_page 后篡改正文 body →
   const result = await keeper.processPending();
   assert.equal(result.filed, 0, '认证失配 → 不按篡改内容执行');
   assert.ok(!existsSync(path.join(work, 'knowledge', 'g1-page.md')), '不得按篡改 body 建页');
-  const knowledgeText = readdirSync(path.join(work, 'knowledge'))
-    .map((f) => readFileSync(path.join(work, 'knowledge', f), 'utf8')).join('\n');
+  const knowledgeText = readdirSync(path.join(work, 'knowledge'), { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => readFileSync(path.join(work, 'knowledge', entry.name), 'utf8')).join('\n');
   assert.ok(!knowledgeText.includes('被篡改的恶意正文'), '篡改正文不得落进任何知识页');
 });
 
