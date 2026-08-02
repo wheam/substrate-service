@@ -68,11 +68,14 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   const instructions = client.getInstructions();
   assert.ok(instructions, '应有 instructions');
   assert.match(instructions, /查无不编|没存过/);
-  assert.match(instructions, /get_context|search/);
+  assert.match(instructions, /读库再答/);
+  assert.match(instructions, /get_context|search|recall/);
+  assert.match(instructions, /捕获信号/);
+  assert.match(instructions, /主动提议保存/);
   await client.close();
 });
 
-test('tools/list：高信任 = 5 读 + 7 写（含 schema_propose/apply、page_set_tier）；低信任只有读且无 sensitive 通路', async () => {
+test('tools/list：高信任 = 5 读 + 11 写/治理；低信任只有读且无 sensitive 通路', async () => {
   const client = await mcpClient('test-token-high');
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
@@ -81,6 +84,12 @@ test('tools/list：高信任 = 5 读 + 7 写（含 schema_propose/apply、page_s
     'page_set_tier', 'read_page', 'remember', 'remove', 'save', 'schema_apply', 'schema_propose', 'search',
     'todo_add', 'todo_done', 'todo_list',
   ]);
+  const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+  assert.match(byName.search.description, /不要等主人明确说.*查知识库/s, 'search 描述应推动主动检索');
+  assert.match(byName.save.description, /重要决定.*主动提议/s, 'save 描述应覆盖非显式保存信号');
+  assert.match(byName.remember.description, /稳定事实.*主动提议/s, 'remember 描述应覆盖非显式记忆信号');
+  assert.match(byName.todo_add.description, /未来要做.*主动提议/s, 'todo_add 描述应覆盖非显式待办信号');
+  assert.match(byName.collections_upsert.description, /想去\/想试\/想买.*主动提议/s, 'collections_upsert 描述应覆盖非显式收藏信号');
   await client.close();
 
   const low = await mcpClient('test-token-low');
@@ -183,6 +192,9 @@ test('GET /digest：高信任返回常驻小抄纯文本；低信任/capture 403
   const text = await ok.text();
   assert.match(text, /Alex/);
   assert.match(text, /接入房规/, 'digest 应携带服务下发的接入房规');
+  assert.match(text, /读库再答/, 'digest 应携带主动检索契约');
+  assert.match(text, /捕获信号/, 'digest 应携带主动捕获契约');
+  assert.match(text, /主动提议保存/, 'digest 应明确要求主动提议保存');
   assert.match(text, /不要直接修改本地/, '房规应禁止直改本地 clone');
   assert.equal((await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-low' } })).status, 403);
   assert.equal((await fetch(`${baseUrl}/digest`)).status, 401);
