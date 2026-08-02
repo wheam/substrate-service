@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { parseZones } from './acl.js';
-import { newContentId } from './content-id.js';
+import { newContentId, readContentId } from './content-id.js';
 import { parseEntryBody, scanSegments, INBOX_PREVIEW_CHARS } from './inbox.js';
 import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
 import { applyCoreCalibration, extractCoreDraft } from './core-calibration.js';
@@ -26,6 +26,8 @@ const TIER_BEARING_ACTIONS = new Set(['new_page', 'merge_into']);
 const EPISTEMIC_TYPES = new Set(['fact', 'preference', 'decision', 'opinion', 'excerpt', 'to-verify']);
 // 骨架/流水区永久禁删（keeper 对 inbox 的清理走内部通路，不经 remove_page）
 const NO_DELETE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
+const CANONICAL_SKILL_RE = /^skills\/([a-z0-9][a-z0-9._-]*)\/SKILL\.md$/;
+const INCOMING_SKILL_RE = /^skills\/_incoming\/([a-z0-9][a-z0-9._-]*)\/SKILL\.md$/;
 
 // 十/十一轮 Codex Minor：rollbackSchemaWrites 只删【本次 applySchema 亲手新建】的 zone 目录——用【一次性不可伪造 token】鉴权
 // （比模块级 Set 更严：Set 按短 zoneDir key 判、跨实例/成功后残留旧授权，可误删既有两哨兵目录）。applySchema 落地成功即发一枚
@@ -208,6 +210,27 @@ function pageRel(zone, slugRaw) {
   return slug.startsWith(zone.path) ? `${slug}.md` : path.posix.join(zone.path, `${slug}.md`);
 }
 
+function parseSkillDocument(raw) {
+  const text = String(raw ?? '');
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!m) return { ok: false, reason: 'Skill 内容必须是带 frontmatter 的完整 SKILL.md' };
+  const get = (key) => m[1].match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1]?.trim() ?? '';
+  const name = get('name').replace(/^["']|["']$/g, '');
+  if (!name) return { ok: false, reason: 'Skill frontmatter 缺 name' };
+  if (!get('target_runtimes')) return { ok: false, reason: 'Skill frontmatter 缺 target_runtimes' };
+  if (!get('risk_level')) return { ok: false, reason: 'Skill frontmatter 缺 risk_level' };
+  return { ok: true, name };
+}
+
+function skillDocumentWithContentId(raw, contentId) {
+  const text = String(raw).replace(/\r\n/g, '\n');
+  const m = text.match(/^---\n([\s\S]*?)\n---(\n|$)/);
+  if (!m) throw new Error('Skill 内容必须是带 frontmatter 的完整 SKILL.md');
+  const fm = m[1].split('\n').filter((line) => !/^\s*content_id\s*:/.test(line));
+  const rest = text.slice(m[0].length);
+  return `---\ncontent_id: ${contentId}\n${fm.join('\n')}\n---\n${rest}`;
+}
+
 // 决定合法性校验（代码层，模型说什么不算数）
 export function validateDecision({ instanceDir, decision, entry }) {
   const d = decision ?? {};
@@ -223,6 +246,28 @@ export function validateDecision({ instanceDir, decision, entry }) {
   }
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
   if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无意义（无本地），需主人定夺' };
+  // replace_skill 是 keeper 代码根据【服务端亲生/主人已认证】件中的显式 path/content_id 意图派生出的内部动作，
+  // 不在模型 ACTIONS 白名单里。模型直接产同名动作、或 target 与代码解析到的真实页不一致，一律拒。
+  if (d.action === 'replace_skill') {
+    if (d.disposition !== 'canonical') return { ok: false, reason: 'replace_skill 只接受 canonical disposition' };
+    if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: 'replace_skill 缺 confidence 或 summary' };
+    const intent = entry?.__page_intent;
+    if (!intent || intent.kind !== 'existing' || !intent.trusted) {
+      return { ok: false, reason: 'replace_skill 只接受代码解析并认证过的现有页更新意图' };
+    }
+    if (d.zone !== 'skills' || d.target !== intent.rel || !CANONICAL_SKILL_RE.test(intent.rel)) {
+      return { ok: false, reason: 'replace_skill 只能原位替换 skills/<name>/SKILL.md 的真实路径' };
+    }
+    const doc = parseSkillDocument(entry?.body);
+    const expectedName = intent.rel.match(CANONICAL_SKILL_RE)?.[1];
+    if (!doc.ok) return doc;
+    if (doc.name !== expectedName) return { ok: false, reason: `Skill name（${doc.name}）与目标目录（${expectedName}）不一致` };
+    const zones = parseZones(instanceDir);
+    const zone = zones.find((z) => z.id === 'skills');
+    if (!zone) return { ok: false, reason: 'skills zone 不存在' };
+    if (!existsSync(path.join(instanceDir, intent.rel))) return { ok: false, reason: `目标页不存在：${intent.rel}` };
+    return { ok: true, verdict: 'file', zone };
+  }
   // D1（M4.6）安全边界：set_tier 绝不能从 LLM decision 触达——注入可诱导 keeper 把任意页降级=软删除，绕过
   // remove_page 的裁定保护。降级只走两个确定性入口（夜班进程内 / 高信任 page_set_tier），均直调 setPageTier、
   // 不经本校验。显式早拒（不只依赖「不在 ACTIONS 白名单」——防未来误把它并进白名单静默开洞）。
@@ -356,6 +401,13 @@ export function validateDecision({ instanceDir, decision, entry }) {
     if (path.basename(rel) === 'README.md' || path.basename(rel).startsWith('_')) {
       return { ok: false, reason: `普通 keeper 写动作不允许触碰结构页：${rel}` };
     }
+    if (d.zone === 'skills' && d.action === 'new_page') {
+      const hit = rel.match(INCOMING_SKILL_RE);
+      if (!hit) return { ok: false, reason: '新 Skill 必须先写入 skills/_incoming/<name>/SKILL.md' };
+      const doc = parseSkillDocument(entry?.body);
+      if (!doc.ok) return doc;
+      if (doc.name !== hit[1]) return { ok: false, reason: `Skill name（${doc.name}）与目标目录（${hit[1]}）不一致` };
+    }
   } else {
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
   }
@@ -369,6 +421,7 @@ export async function applyDecision({ instanceDir, entry, decision, zone }) {
     case 'upsert_row': return upsertRow(instanceDir, decision);
     case 'new_page': return newPage(instanceDir, entry, decision, zone);
     case 'merge_into': return mergeInto(instanceDir, entry, decision, zone);
+    case 'replace_skill': return replaceSkill(instanceDir, entry, decision);
     case 'remove_page': return removePage(instanceDir, decision, zone);
     case 'merge_pages': return mergePages(instanceDir, decision, zone);
     case 'schema_apply': return applySchema({ instanceDir, entry }); // zone 参数忽略——schema 内容只从件正文取
@@ -610,7 +663,13 @@ async function upsertRow(instanceDir, decision) {
 async function newPage(instanceDir, entry, decision, zone) {
   const rel = pageRel(zone, decision.target);
   const abs = path.join(instanceDir, rel);
+  const slug = path.posix.basename(rel, '.md');
   if (existsSync(abs)) throw new Error(`页已存在：${rel}（该用 merge_into）`);
+  mkdirSync(path.dirname(abs), { recursive: true });
+  if (INCOMING_SKILL_RE.test(rel)) {
+    writeFileSync(abs, skillDocumentWithContentId(entry.body, newContentId()));
+    return { changedPaths: [rel], detail: rel };
+  }
   const fm = [
     '---',
     `content_id: ${newContentId()}`, // 稳定短 id：落盘即写，扛改名（spec §6.1）
@@ -644,6 +703,15 @@ async function newPage(instanceDir, entry, decision, zone) {
   await py(instanceDir, path.join(instanceDir, 'skills', 'substrate-curator', 'curate.py'),
     ['reindex', '--instance', '.', '--dir', pageDir, '--apply']);
   return { changedPaths: [rel, `${pageDir}/README.md`], detail: rel };
+}
+
+function replaceSkill(instanceDir, entry, decision) {
+  const rel = decision.target;
+  const abs = path.join(instanceDir, rel);
+  if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`目标页不存在：${rel}`);
+  const oldId = readContentId(readFileSync(abs, 'utf8')) || newContentId();
+  writeFileSync(abs, skillDocumentWithContentId(entry.body, oldId));
+  return { changedPaths: [rel], detail: rel };
 }
 
 function mergeInto(instanceDir, entry, decision, zone) {

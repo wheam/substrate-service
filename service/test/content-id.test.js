@@ -5,7 +5,7 @@ import { mkdtempSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { newContentId, readContentId, addContentIdToFrontmatter } from '../src/content-id.js';
+import { newContentId, readContentId, addContentIdToFrontmatter, findPagesByContentId } from '../src/content-id.js';
 import { backfill } from '../scripts/backfill-content-id.js';
 import { parseZones } from '../src/acl.js';
 
@@ -38,6 +38,26 @@ test('addContentIdToFrontmatter：插入为 frontmatter 首字段；已有则幂
 test('readContentId：只认首个 frontmatter 块，正文同名字样不算', () => {
   const raw = '---\ncontent_id: aaaa1111\ntitle: t\n---\n\ncontent_id: fake9999 出现在正文里\n';
   assert.equal(readContentId(raw), 'aaaa1111');
+});
+
+test('findPagesByContentId：递归返回真实路径；撞 id 时把全部候选交给调用方安全失败', () => {
+  const dir = tmpInstance('find-by-id');
+  const coffee = path.join(dir, 'knowledge', 'coffee-brewing.md');
+  writeFileSync(coffee, addContentIdToFrontmatter(readFileSync(coffee, 'utf8'), 'abcddcba').text);
+  const zones = parseZones(dir);
+  assert.deepEqual(findPagesByContentId(dir, zones, 'ABCDDCBA'), ['knowledge/coffee-brewing.md']);
+
+  writeFileSync(path.join(dir, 'knowledge', 'collision.md'), [
+    '---',
+    'content_id: abcddcba',
+    'title: Collision',
+    '---',
+    '',
+  ].join('\n'));
+  assert.deepEqual(findPagesByContentId(dir, zones, 'abcddcba'), [
+    'knowledge/coffee-brewing.md',
+    'knowledge/collision.md',
+  ]);
 });
 
 // ==== backfill 幂等 ====

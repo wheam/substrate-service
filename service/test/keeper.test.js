@@ -1,15 +1,16 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, cpSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, cpSync, readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper, caseLogSafe } from '../src/keeper.js';
-import { rollbackUncommitted } from '../src/executor.js';
+import { rollbackUncommitted, validateDecision } from '../src/executor.js';
 import { readTier } from '../src/tier.js';
+import { createTools } from '../src/tools.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -90,14 +91,43 @@ function fakeNotifier() {
 function setup({ providerScript, doctor = false }) {
   const { origin, work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const approvals = new Map();
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg });
   const provider = fakeProvider(providerScript);
   const notifier = fakeNotifier();
   const auditLog = [];
   const audit = (e) => auditLog.push(e);
-  const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, audit, doctor });
+  const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, audit, doctor, approvals, nativeReg });
   return { origin, work, inbox, keeper, provider, notifier, auditLog };
 }
+
+function registerSkillsZone(work) {
+  const zonesPath = path.join(work, 'governance', 'zones.md');
+  const raw = readFileSync(zonesPath, 'utf8');
+  writeFileSync(zonesPath, raw.replace('zones:\n', [
+    'zones:',
+    '  - id: skills',
+    '    path: skills/',
+    '    purpose: 可分发的 Skill 页面',
+    '    privacy: private',
+    '',
+  ].join('\n')));
+}
+
+test('replace_skill 是确定性内部动作：模型直接伪造且无认证页意图时必须拒绝', () => {
+  const { work } = makeInstance();
+  const result = validateDecision({
+    instanceDir: work,
+    entry: { kind: 'save', body: '---\nname: fake\ntarget_runtimes: [codex]\nrisk_level: low\n---\n' },
+    decision: {
+      disposition: 'canonical', zone: 'skills', action: 'replace_skill',
+      target: 'skills/fake/SKILL.md', summary: '伪造替换', confidence: 1,
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /代码解析并认证过/);
+});
 
 test('save→knowledge new_page：建页、reindex、删收件、commit、通知', async () => {
   const { origin, work, inbox, keeper, notifier } = setup({
@@ -336,6 +366,113 @@ test('merge_into：追加到既有页并 bump updated', async () => {
   const raw = readFileSync(path.join(work, 'knowledge', 'coffee-brewing.md'), 'utf8');
   assert.match(raw, /闷蒸 30 秒/);
   assert.match(raw, /keeper 归档/);
+});
+
+test('Skill 原位更新：content_id 直接解析真实嵌套路径，整页替换并保留原 id', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [{
+      disposition: 'canonical', zone: 'skills', action: 'merge_into',
+      target: 'example-operator', summary: '更新示例运维 Skill', confidence: 0.96,
+    }],
+  });
+  registerSkillsZone(work);
+  const rel = 'skills/example-operator/SKILL.md';
+  mkdirSync(path.dirname(path.join(work, rel)), { recursive: true });
+  writeFileSync(path.join(work, rel), [
+    '---',
+    'content_id: a1b2c3d4',
+    'name: example-operator',
+    'target_runtimes: [codex]',
+    'risk_level: low',
+    '---',
+    '',
+    '# Example Operator',
+    '',
+    '旧内容。',
+    '',
+  ].join('\n'));
+  git(work, 'add', 'governance/zones.md', rel);
+  git(work, 'commit', '-m', 'fixture: add nested skill');
+
+  const next = [
+    '---',
+    'content_id: ffffffff',
+    'name: example-operator',
+    'target_runtimes: [codex]',
+    'risk_level: low',
+    '---',
+    '',
+    '# Example Operator',
+    '',
+    '这是更新后的完整内容。',
+    '',
+  ].join('\n');
+  const receipt = inbox.addEntry({
+    kind: 'save', content: next, hint: '请按 content_id: a1b2c3d4 原位更新现有页面', client: 'cc-test',
+  });
+  await receipt.synced;
+  const result = await keeper.processPending();
+
+  assert.equal(result.filed, 1);
+  const raw = readFileSync(path.join(work, rel), 'utf8');
+  assert.match(raw, /^---\ncontent_id: a1b2c3d4\n/, '必须保留现有页面的稳定 content_id');
+  assert.match(raw, /这是更新后的完整内容/);
+  assert.doesNotMatch(raw, /旧内容|keeper 归档/, '完整 Skill 更新应原位替换，不应追加第二份文档');
+  assert.ok(!existsSync(path.join(work, 'skills', 'example-operator.md')), '不得生成错误的扁平 Skill 页面');
+  assert.ok(!existsSync(path.join(work, receipt.path)), '成功后 inbox 件应清场');
+  const readBack = await createTools({ instanceDir: work }).readPage({ path: rel, trust: 'high' });
+  assert.match(readBack.content, /这是更新后的完整内容/, 'read_page 应立即读到最新 Skill 内容');
+
+  const byPath = inbox.addEntry({
+    kind: 'save',
+    content: next.replace('这是更新后的完整内容。', '这是按完整 canonical 路径更新的内容。'),
+    hint: `请原位更新 \`${rel}\`，不要扁平化。`,
+    client: 'cc-test',
+  });
+  await byPath.synced;
+  const byPathResult = await keeper.processPending();
+  assert.equal(byPathResult.filed, 1, '只给完整 canonical 路径也应原位更新');
+  assert.match(readFileSync(path.join(work, rel), 'utf8'), /这是按完整 canonical 路径更新的内容/);
+  assert.ok(!existsSync(path.join(work, byPath.path)), '第二次成功更新后也不应残留 inbox 件');
+});
+
+test('Skill _incoming 新建：显式嵌套路径不被扁平化，并递归创建父目录', async () => {
+  const { work, inbox, keeper } = setup({
+    providerScript: [{
+      disposition: 'canonical', zone: 'skills', action: 'new_page',
+      target: 'example-import', title: 'Example Import', summary: '回流示例 Skill', confidence: 0.95,
+    }],
+  });
+  registerSkillsZone(work);
+  git(work, 'add', 'governance/zones.md');
+  git(work, 'commit', '-m', 'fixture: register skills zone');
+
+  const rel = 'skills/_incoming/example-import/SKILL.md';
+  const receipt = inbox.addEntry({
+    kind: 'save',
+    hint: `目标路径：${rel}`,
+    client: 'cc-test',
+    content: [
+      '---',
+      'name: example-import',
+      'target_runtimes: [codex]',
+      'risk_level: low',
+      '---',
+      '',
+      '# Example Import',
+      '',
+      '回流候选内容。',
+      '',
+    ].join('\n'),
+  });
+  await receipt.synced;
+  const result = await keeper.processPending();
+
+  assert.equal(result.filed, 1);
+  assert.ok(existsSync(path.join(work, rel)), '应自动创建 _incoming/<name> 父目录并写入 SKILL.md');
+  assert.match(readFileSync(path.join(work, rel), 'utf8'), /^---\ncontent_id: [0-9a-f]{8}\nname: example-import/m);
+  assert.ok(!existsSync(path.join(work, 'skills', 'example-import.md')), '不得生成错误的扁平页面');
+  assert.ok(!existsSync(path.join(work, receipt.path)), '成功后不应留下 pending/held 重复件');
 });
 
 test('new_page 带 links：真实页写成 [[wikilink]]，不存在的丢弃', async () => {

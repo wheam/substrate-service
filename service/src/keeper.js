@@ -2,17 +2,93 @@
 // → git commit+push → 通知主人。低置信升级重判，仍不行就 held 不猜。
 import { readFileSync, writeFileSync, readdirSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { parseZones } from './acl.js';
+import { parseZones, zoneFor } from './acl.js';
 import {
   validateDecision, applyDecision, runDoctor, rollbackSchemaWrites, finalizeSchemaRollback,
   assertCleanWorktree, rollbackUncommitted,
 } from './executor.js';
 import { parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
+import { findPagesByContentId } from './content-id.js';
 
 // SKIP_LLM kinds（M4.4 D2）：提案件（schema/maintenance）直达主人、keeper 绝不 LLM 判它们。
 // 有主人预批决定 → 走现有校验执行流；无 → re-held 提示点选（纯文字裁定永不触发执行/清场，防误伤）。
 const SKIP_LLM_KINDS = new Set(['schema', 'maintenance', 'core']);
+const CANONICAL_SKILL_PATH_RE = /^skills\/[a-z0-9][a-z0-9._-]*\/SKILL\.md$/;
+const INCOMING_SKILL_PATH_RE = /^skills\/_incoming\/[a-z0-9][a-z0-9._-]*\/SKILL\.md$/;
+
+function explicitContentId(hint) {
+  return String(hint ?? '').match(/\bcontent_id\s*[:：=]?\s*([0-9a-f]{8})\b/i)?.[1]?.toLowerCase() ?? null;
+}
+
+function explicitPagePath(hint) {
+  const s = String(hint ?? '').trim();
+  const direct = s.match(/^`?((?:[\w.一-鿿-]+\/)+[\w.一-鿿-]+\.md)`?$/u)?.[1];
+  if (direct) return direct;
+  const labelled = s.match(/(?:^|\s)(?:target_path|path|目标路径|目标页|路径)\s*[:：=]\s*`?((?:[\w.一-鿿-]+\/)+[\w.一-鿿-]+\.md)`?(?=$|[\s,，。;；)）])/u)?.[1];
+  if (labelled) return labelled;
+  const mentioned = [...s.matchAll(/(?:^|[`\s"'(（])((?:[\w.一-鿿-]+\/)+[\w.一-鿿-]+\.md)(?=$|[`\s"',，。;；)）])/gu)]
+    .map((m) => m[1]);
+  const unique = [...new Set(mentioned)];
+  return unique.length === 1 ? unique[0] : null;
+}
+
+// hint 是路由提示，不是正文；但 inbox 文件会经 git pull，仍可能是伪造件。只有本进程 addEntry 亲生、
+// 或经 resolveEntry 真认证过的件，才允许显式 path/content_id 绕过模型猜路径。其余件保持旧的 LLM→白名单校验流。
+function resolvePageIntent(instanceDir, entry) {
+  const trusted = !!entry.__native || !!entry.__ruling_authentic;
+  if (!trusted) return null;
+  const requestedId = explicitContentId(entry.hint);
+  const requestedPath = explicitPagePath(entry.hint);
+  if (!requestedId && !requestedPath) return null;
+
+  const zones = parseZones(instanceDir);
+  let byId = null;
+  if (requestedId) {
+    const hits = findPagesByContentId(instanceDir, zones, requestedId);
+    if (hits.length === 0) return { error: `content_id ${requestedId} 未找到现有页面` };
+    if (hits.length > 1) return { error: `content_id ${requestedId} 命中 ${hits.length} 个页面，无法安全定位` };
+    [byId] = hits;
+  }
+
+  if (requestedPath) {
+    if (path.posix.normalize(requestedPath) !== requestedPath || requestedPath.startsWith('/') || requestedPath.includes('..')) {
+      return { error: `显式目标路径不合法：${requestedPath}` };
+    }
+    const zone = zoneFor(zones, requestedPath);
+    if (!zone) return { error: `显式目标路径不在注册 zone：${requestedPath}` };
+    if (byId && byId !== requestedPath) {
+      return { error: `显式路径 ${requestedPath} 与 content_id ${requestedId} 的真实路径 ${byId} 不一致` };
+    }
+    if (existsSync(path.join(instanceDir, requestedPath))) {
+      return { kind: 'existing', rel: requestedPath, zoneId: zone.id, contentId: requestedId, trusted: true };
+    }
+    if (INCOMING_SKILL_PATH_RE.test(requestedPath)) {
+      return { kind: 'new-skill', rel: requestedPath, zoneId: zone.id, trusted: true };
+    }
+    return { error: `显式目标页不存在：${requestedPath}` };
+  }
+
+  const zone = zoneFor(zones, byId);
+  if (!zone) return { error: `content_id ${requestedId} 的页面不在注册 zone` };
+  return { kind: 'existing', rel: byId, zoneId: zone.id, contentId: requestedId, trusted: true };
+}
+
+function applyPageIntent(decision, entry) {
+  const intent = entry.__page_intent;
+  if (!intent || decision?.disposition === 'forbidden') return decision;
+  decision.zone = intent.zoneId;
+  decision.target = intent.rel;
+  if (intent.kind === 'new-skill') {
+    decision.action = 'new_page';
+  } else if (CANONICAL_SKILL_PATH_RE.test(intent.rel)) {
+    decision.action = 'replace_skill';
+    decision.tier = 'canonical';
+  } else {
+    decision.action = 'merge_into';
+  }
+  return decision;
+}
 
 const SYSTEM_PROMPT = `你是一个个人知识库（Substrate 实例）的守门 agent（keeper）。你的唯一职责：对一条待入库内容（CAPTURE）给出结构化归档决定。
 
@@ -193,7 +269,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       : '';
     const todoPath = path.join(instanceDir, 'todo', 'owner.md');
     const todoList = existsSync(todoPath) ? readFileSync(todoPath, 'utf8').slice(0, 6000) : '';
-    return { zones, collections, examples, knowledge_index: kIndex, todo_list: todoList, memory_pages: memoryPages };
+    return {
+      zones, collections, examples, knowledge_index: kIndex, todo_list: todoList, memory_pages: memoryPages,
+      page_intent: entry.__page_intent && !entry.__page_intent.error ? entry.__page_intent : null,
+    };
   }
 
   async function judgeEntry(entry) {
@@ -202,6 +281,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       `材料：${JSON.stringify({ zones: materials.zones, collections: materials.collections }, null, 1)}`,
       `知识区现有页（merge_into 候选）：\n${materials.knowledge_index || '（空）'}`,
       `记忆区现有页（merge_into memory 时 target 只能取这些）：${materials.memory_pages || '（空）'}`,
+      ...(materials.page_intent ? [`代码已按显式 path/content_id 解析目标：${JSON.stringify(materials.page_intent)}`] : []),
       `历史判例：\n${materials.examples}`,
       ...(entry.kind === 'todo' || entry.kind === 'todo_done'
         ? [`当前待办清单（todo_done 的 target 从这里取原文；todo 新增先查重）：\n${materials.todo_list}`] : []),
@@ -356,6 +436,14 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     });
     if (!authentic) entry.approved_decision = null;
 
+    const pageIntent = resolvePageIntent(instanceDir, entry);
+    if (pageIntent?.error) {
+      await holdEntry(entry, rel, pageIntent.error);
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, verdict: 'held', disposition: 'held', reason: pageIntent.error, ms: Date.now() - t0 });
+      return 'held';
+    }
+    entry.__page_intent = pageIntent;
+
     // SKIP_LLM 分支（最先判）：提案件（schema/maintenance）有主人预批决定 → 落现有校验执行流（下方）；
     // 无预批（含纯文字裁定）→ 只 re-held 提示点选，绝不进 judgeEntry/generateOptions——纯文字永不触发执行或清场（防误伤）。
     if (SKIP_LLM_KINDS.has(entry.kind) && !entry.approved_decision) {
@@ -388,6 +476,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         return 'held';
       }
     }
+    decision = applyPageIntent(decision, entry);
 
     // F2（Important）：maintenance 点选执行必须与提案件【可见 json 块】一致——不盲信隐藏 options 的决定。
     // 伪造件可 label「扔掉」而隐藏决定实为删/并要害页，owner 点选即执行（F1 认证挡不住，主人确实点了）。

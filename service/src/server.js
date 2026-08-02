@@ -547,10 +547,10 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
 
     server.registerTool('save', {
       title: '存入知识库（经收件箱）',
-      description: '把一段内容存进主人的知识库。当主人说「记一下/存一下/收藏这段」，或你提议保存且主人同意时用。内容落 inbox 隔离区，由 keeper 判断归入哪个分区。hint 可携带你或主人对去向的提示（如「决定」「餐厅」）。',
+      description: '把一段内容存进主人的知识库。当主人说「记一下/存一下/收藏这段」，或你提议保存且主人同意时用。内容落 inbox 隔离区，由 keeper 判断归入哪个分区。hint 可携带你或主人对去向的提示（如「决定」「餐厅」）；更新现有页时可明确写 `path: knowledge/xxx.md` 或 `content_id: 1234abcd`。完整 Skill 文档更新支持 `skills/<name>/SKILL.md`，新 Skill 须先写 `skills/_incoming/<name>/SKILL.md`。',
       inputSchema: {
         content: z.string().describe('要保存的内容原文'),
-        hint: z.string().optional().describe('去向提示（可选），如：决定/事实/餐厅/想试'),
+        hint: z.string().optional().describe('去向提示（可选），如：决定/事实/餐厅/想试；现有页可写 path: <相对路径> 或 content_id: <8位id>'),
       },
     }, wrap('save', async ({ content, hint }) => inbox.addEntry({ kind: 'save', content, hint, client }), receiptText, null, 'save'));
 
