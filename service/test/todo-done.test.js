@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -33,10 +34,11 @@ function makeInstance() {
 
 function run(work, decisionJson, { content = '换轮胎那条做完了' } = {}) {
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const calls = [];
   const keeper = createKeeper({
-    instanceDir: work, writer,
+    instanceDir: work, writer, nativeReg,
     provider: { judge: async (req) => { calls.push(req); return { json: decisionJson, model: 'flash', usage: {} }; } },
     notifier: { notify: async () => ({ ok: true }) },
     doctor: false,

@@ -13,6 +13,7 @@ import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
 import { parseZones } from '../src/acl.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -41,7 +42,8 @@ function throwingProvider() {
   const calls = [];
   return { calls, judge: async (req) => { calls.push(req); throw new Error('provider 被调用（不该发生）'); } };
 }
-// 可控低置信 provider：认证被作废后 keeper 对普通件走正常判——给低置信 → held，证明伪造决定未被【直接执行】。
+// 备用低置信 provider：只有仍能证明 native 的普通件才可能走到它；伪造/篡改导致 native proof 失配时，
+// keeper 会先进入 security-held，不再把攻击正文送进模型。
 function heldProvider() {
   const calls = [];
   return {
@@ -57,7 +59,7 @@ function heldProvider() {
 function setup(work, { provider } = {}) {
   const approvals = new Map();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const inbox = createInbox({ instanceDir: work, writer, approvals, admissionProvider: testAdmissionForKind });
   const messages = [];
   const prov = provider ?? throwingProvider();
   const keeper = createKeeper({
@@ -225,7 +227,7 @@ test('G1① approve-then-swap：resolve 批准 schema(health/) 后篡改 payload
 
 test('G1② approve-then-swap：resolve 批准 new_page 后篡改正文 body → keeper 不写入篡改 body', async () => {
   const { work } = makeInstance();
-  const { inbox, keeper } = setup(work, { provider: heldProvider() }); // 认证失配 → 回落 judge（低置信 held），证篡改 body 未被直接执行
+  const { inbox, keeper } = setup(work, { provider: heldProvider() }); // approval/native 双失配 → security-held，证篡改 body 未被直接执行
   const r = inbox.addEntry({
     kind: 'save', content: '原始正文一条要归档的知识', client: 'cc-test', status: 'held',
     optionsBlock: { options: [
@@ -318,7 +320,7 @@ function proposeMaintenance(inbox, { visiblePage, decision, label = '按提案�
 
 test('H1① kind-swap：批准 maintenance（隐藏 decision 删要害页）后仅改 kind→save → 守卫被绕过失败、要害页不删、re-held', async () => {
   const { work } = makeInstance();
-  const { inbox, keeper } = setup(work, { provider: heldProvider() }); // 认证失配后 kind=save 回落 judge（低置信 held）
+  const { inbox, keeper } = setup(work, { provider: heldProvider() }); // kind swap 同时打破 approval/native proof → security-held
   assert.ok(existsSync(path.join(work, 'knowledge', 'coffee-brewing.md')), '前置：要害页在');
   // 可见 json 指无害 decoy（thin-decoy），隐藏 decision 实删 coffee-brewing——kind=maintenance 时 F2 守卫本会拦；
   // 攻击靠 swap kind 跳过该守卫。target 带 zone 前缀（同夜班惯例）令 removePage 正确寻址。

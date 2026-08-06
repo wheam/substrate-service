@@ -10,7 +10,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
-import { parseZones, canRead, canReadZone, zoneFor } from './acl.js';
+import { parseZones, canRead, canReadZone, zoneFor, SERVICE_ZONE_IDS } from './acl.js';
 import { readContentId } from './content-id.js';
 import { readTier, normalizeInclude, isQuarantineRejected } from './tier.js';
 
@@ -107,7 +107,10 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
   // 缺陷1（治理边界）：只索引「注册 zone」（parseZones 的 path 前缀之内）的路径。
   // inbox/（隔离件）、keeper-feedback/、governance/、skills/ 等未注册目录永不入索引——
   // 否则低/高信任 recall/查询会命中隔离件、把内容送进 LLM，破坏「隔离 inbox / governed promotion」边界。
-  const inRegisteredZone = (zones, rel) => !!zoneFor(zones, rel);
+  const inRegisteredZone = (zones, rel) => {
+    const zone = zoneFor(zones, rel);
+    return !!zone && !SERVICE_ZONE_IDS.has(zone.id);
+  };
 
   function ensureBuilt() {
     if (!hasIndex()) rebuild();
@@ -140,9 +143,9 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
     const tier = isMd ? readTier(text) : 'canonical'; // 无 frontmatter / 非 md（.csv/.txt 收藏）→ canonical
     const regZone = zoneFor(zones, rel);
     let zone;
-    if (regZone) zone = regZone.id;
-    // 缺陷2a：入索引特例改为 status:rejected + tier:rejected 双条件（与 tools.search 共用 isQuarantineRejected）。
-    else if (rel.startsWith('inbox/') && isQuarantineRejected(text)) zone = INBOX_SENTINEL; // 隔离-rejected 特例
+    // inbox 即使在真机 zones.md 注册，也仍是隔离区：pending/held 永不入索引；仅 rejected 窄特例可查。
+    if (rel.startsWith('inbox/') && isQuarantineRejected(text)) zone = INBOX_SENTINEL;
+    else if (regZone && !SERVICE_ZONE_IDS.has(regZone.id)) zone = regZone.id;
     else return []; // 未注册且非 inbox-rejected → 隔离/系统区永不入索引
     const contentId = isMd ? readContentId(text) : null;
     const rows = [];

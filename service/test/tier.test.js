@@ -11,6 +11,7 @@ import {
 } from '../src/tier.js';
 import { validateDecision } from '../src/executor.js';
 import { backfill } from '../scripts/backfill-content-id.js';
+import { testAuthorizedEntry } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 function tmpInstance(tag) {
@@ -80,13 +81,14 @@ test('normalizeInclude：数组/逗号串，去重、只留合法附加档（can
 test('validateDecision：tier 白名单——canonical/candidate/缺省过；rejected/非法拒', () => {
   const dir = tmpInstance('validate-tier');
   const base = { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 's', confidence: 0.9 };
-  assert.equal(validateDecision({ instanceDir: dir, decision: { ...base }, entry: {} }).ok, true, '缺省 tier → 视同 canonical，过');
-  assert.equal(validateDecision({ instanceDir: dir, decision: { ...base, tier: 'canonical' }, entry: {} }).ok, true);
-  assert.equal(validateDecision({ instanceDir: dir, decision: { ...base, tier: 'candidate' }, entry: {} }).ok, true);
-  const rej = validateDecision({ instanceDir: dir, decision: { ...base, tier: 'rejected' }, entry: {} });
+  const entry = testAuthorizedEntry();
+  assert.equal(validateDecision({ instanceDir: dir, decision: { ...base }, entry }).ok, true, '缺省 tier → 视同 canonical，过');
+  assert.equal(validateDecision({ instanceDir: dir, decision: { ...base, tier: 'canonical' }, entry }).ok, true);
+  assert.equal(validateDecision({ instanceDir: dir, decision: { ...base, tier: 'candidate' }, entry }).ok, true);
+  const rej = validateDecision({ instanceDir: dir, decision: { ...base, tier: 'rejected' }, entry });
   assert.equal(rej.ok, false, 'rejected 不是模型可产出的 tier（只能由 keeper 判 forbidden 后代码落）');
   assert.match(rej.reason, /tier/);
-  const bad = validateDecision({ instanceDir: dir, decision: { ...base, tier: 'admin' }, entry: {} });
+  const bad = validateDecision({ instanceDir: dir, decision: { ...base, tier: 'admin' }, entry });
   assert.equal(bad.ok, false);
   assert.match(bad.reason, /tier/);
 });
@@ -94,19 +96,20 @@ test('validateDecision：tier 白名单——canonical/candidate/缺省过；rej
 test('缺陷3：validateDecision 对无 tier 落点的 action 把 candidate 归一 canonical（new_page/merge_into 保留）', () => {
   const dir = tmpInstance('validate-tier-norm');
   const base = { disposition: 'canonical', tier: 'candidate', summary: 's', confidence: 0.9 };
+  const entry = testAuthorizedEntry();
   // new_page / merge_into：能落 tier → 保留 candidate
   const np = { ...base, zone: 'knowledge', action: 'new_page', target: 'x' };
-  assert.equal(validateDecision({ instanceDir: dir, decision: np, entry: {} }).ok, true);
+  assert.equal(validateDecision({ instanceDir: dir, decision: np, entry }).ok, true);
   assert.equal(np.tier, 'candidate', 'new_page 保留 candidate');
   const mi = { ...base, zone: 'knowledge', action: 'merge_into', target: 'coffee-brewing' };
-  assert.equal(validateDecision({ instanceDir: dir, decision: mi, entry: {} }).ok, true);
+  assert.equal(validateDecision({ instanceDir: dir, decision: mi, entry }).ok, true);
   assert.equal(mi.tier, 'candidate', 'merge_into 保留 candidate');
   // upsert_row / todo_add：无 tier 落点 → 归一 canonical（就地改写，令审计不说谎）
   const ur = { ...base, zone: 'collections', action: 'upsert_row', target: 'restaurants', fields: { name: 'x' } };
-  assert.equal(validateDecision({ instanceDir: dir, decision: ur, entry: {} }).ok, true);
+  assert.equal(validateDecision({ instanceDir: dir, decision: ur, entry }).ok, true);
   assert.equal(ur.tier, 'canonical', 'upsert_row 无 tier 落点 → 归一 canonical');
   const ta = { ...base, zone: 'todo', action: 'todo_add', target: 'owner' };
-  assert.equal(validateDecision({ instanceDir: dir, decision: ta, entry: {} }).ok, true);
+  assert.equal(validateDecision({ instanceDir: dir, decision: ta, entry: { ...entry, kind: 'todo' } }).ok, true);
   assert.equal(ta.tier, 'canonical', 'todo_add 无 tier 落点 → 归一 canonical');
 });
 

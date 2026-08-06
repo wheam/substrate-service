@@ -9,6 +9,7 @@ import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
 import { validateDecision } from '../src/executor.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -39,7 +40,7 @@ test('remove_page：keeper 按主人删除意图删页、播报、可从 git 历
   // 绑定 token 复算）——inbox 与 keeper 须共享同一个 nativeReg Map（生产 createApp 经 app.locals 同款接线），合法
   // remove 工具经 addEntry 造件才被 keeper 认作 native remove 予以删除。缺此共享则 keeper 看不见 inbox 亲生登记 → 安全失败（held）。
   const nativeReg = new Map();
-  const inbox = createInbox({ instanceDir: work, writer, nativeReg });
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const messages = [];
   const keeper = createKeeper({
     instanceDir: work, writer, nativeReg,
@@ -74,9 +75,10 @@ test('remove_page 禁区：governance/skills/inbox 一律校验不过', () => {
 test('remove_page：目标页不存在 → held 不误删', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const keeper = createKeeper({
-    instanceDir: work, writer,
+    instanceDir: work, writer, nativeReg,
     provider: { judge: async () => ({ json: { disposition: 'canonical', zone: 'knowledge', action: 'remove_page', target: 'no-such-page', summary: 's', confidence: 0.95 }, model: 'flash', usage: {} }) },
     notifier: { notify: async () => ({ ok: true }) },
     doctor: false,

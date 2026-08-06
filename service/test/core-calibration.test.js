@@ -15,6 +15,7 @@ import { validateDecision } from '../src/executor.js';
 import {
   CORE_MAX_CHARS, CORE_REL, collectCoreSources, createCoreCalibration, scanCoreThreats,
 } from '../src/core-calibration.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -54,7 +55,7 @@ function setup(json) {
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map();
   const nativeReg = new Map();
-  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg });
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const provider = fakeProvider(json);
   const notifier = { messages: [], notify: async (message) => { notifier.messages.push(message); return { ok: true }; } };
   const statePath = path.join(base, 'core-calibration-state.json');
@@ -228,7 +229,7 @@ test('重启后失去 nativeReg 的旧 core 提案会被行政关闭并重建，
 
   const approvals = new Map();
   const nativeReg = new Map();
-  const inbox = createInbox({ instanceDir: first.work, writer: first.writer, approvals, nativeReg });
+  const inbox = createInbox({ instanceDir: first.work, writer: first.writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const provider = fakeProvider({
     sections: { identity: [], communication: ['主人偏好简洁回答。'], collaboration_safety: [], environment: [] },
   });

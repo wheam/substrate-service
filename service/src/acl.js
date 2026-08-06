@@ -31,9 +31,15 @@ export function zoneFor(zones, relPath) {
   return zones.find((z) => z.path && relPath.startsWith(z.path)) ?? null;
 }
 
+// 不属于知识读面的服务/治理区。skills 是受专用写规则保护的内容区，
+// 但它仍可经 read_page/search 读取，不能与 inbox 隔离区混为一谈。
+export const SERVICE_ZONE_IDS = new Set(['governance', 'inbox', 'keeper-feedback']);
+
 // 单个 zone 是否对该 trust 可读（zone 可为 null）。sensitive 只放高信任；其余（含未注册 null）放行。
 // index-store 查询侧据此把「可读 zone 集合」预过滤进 SQL（ACL 在 LIMIT 之前生效）。
 export function canReadZone(zone, trust) {
+  // 服务/治理区不是知识内容面。即使真机 zones.md 为内部路由把它们注册成 zone，也不能因此被 read/search/index 暴露。
+  if (SERVICE_ZONE_IDS.has(zone?.id)) return false;
   if (zone?.privacy === 'sensitive') return trust === 'high';
   return true;
 }

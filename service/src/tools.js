@@ -2,7 +2,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
-import { parseZones, canRead, canReadZone, zoneFor } from './acl.js';
+import { parseZones, canRead, canReadZone, zoneFor, SERVICE_ZONE_IDS } from './acl.js';
 import { readTier, normalizeInclude, isQuarantineRejected } from './tier.js';
 
 // SEC-6：直读结果面路径单行化——删控制字符（\r\n\t 等 Cc）+ Unicode 格式字符（零宽/BOM 等 Cf）+
@@ -76,14 +76,15 @@ export function createTools({ instanceDir }) {
     const results = [];
     for (const rel of walkFiles()) {
       if (zoneDef && !rel.startsWith(zoneDef.path)) continue;
-      const registered = !!zoneFor(zs, rel);
+      const matchedZone = zoneFor(zs, rel);
+      const registered = !!matchedZone && !SERVICE_ZONE_IDS.has(matchedZone.id);
       if (registered) {
         if (!canRead(zs, rel, trust)) continue;
       } else if (!(allowInboxRejected && rel.startsWith('inbox/'))) {
         continue; // 未注册路径：除 inbox 隔离-rejected 窄例外，一律不扫
       }
       const text = readFileSync(path.join(instanceDir, rel), 'utf8');
-      // 未注册的 inbox 件必须过隔离-rejected 双条件（pending/held、手写残留一律挡在外面）。
+      // inbox 即使在生产 zones.md 注册，仍只开放 rejected 窄特例；pending/held 任意 trust/include 均不可查。
       if (!registered && !isQuarantineRejected(text)) continue;
       // tier 从 frontmatter 读（无 → canonical）；不在请求档内的页整页跳过（candidate/rejected 默认不现）。
       const tier = rel.endsWith('.md') ? readTier(text) : 'canonical';
@@ -115,7 +116,8 @@ export function createTools({ instanceDir }) {
       throw new Error(`拒绝：${rel} 不在可读知识分区内（inbox/治理/骨架区不经 read_page 读取；如需管理读取请用高信任专用通路）`);
     }
     if (!canReadZone(zone, trust)) {
-      throw new Error(`拒绝：${rel} 属于 sensitive 敏感分区，当前客户端信任级不足`);
+      const why = SERVICE_ZONE_IDS.has(zone.id) ? '属于服务/治理区，不经 read_page 读取' : '属于 sensitive 敏感分区，当前客户端信任级不足';
+      throw new Error(`拒绝：${rel} ${why}`);
     }
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`没有这个文件：${rel}`);
     return { path: rel, content: readFileSync(abs, 'utf8') };

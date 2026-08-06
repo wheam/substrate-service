@@ -13,7 +13,7 @@ import { DIGEST_RULES, PRIMARY_RULES, instructionsFor, enrollProtocol } from './
 import { createEnrollment, sanitizeIp } from './enroll.js';
 import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
-import { createInbox, KINDS, ID_FORMAT } from './inbox.js';
+import { createInbox, createAdmission, KINDS, ID_FORMAT, nativeToken } from './inbox.js';
 import { createKeeper } from './keeper.js';
 import { createNightly, formatNightlyDigest } from './nightly.js';
 import { createCoreCalibration } from './core-calibration.js';
@@ -24,6 +24,7 @@ import { createEventStore } from './events.js';
 import { createIndexStore } from './index-store.js';
 import { createRecall } from './recall.js';
 import { normalizeInclude } from './tier.js';
+import { createNativeRegistry } from './native-registry.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
@@ -50,7 +51,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   // enrollCodeTtlMs = 铸码有效期（进渲染文本/通知的「N 分钟」）；publicUrl = 对外基址（拼 curl/mcp add，来自 env）；
   // enrollment = 账本实例（默认落 volume、实例 git 之外；reservedClients 传静态表的 client 名，enrollment 铸码不得撞名）。
   notify = null, enrollCodeTtlMs = 900_000, publicUrl = null,
-  enrollment = createEnrollment({ statePath: path.resolve(instanceDir, '..', 'enroll-state.json'), codeTtlMs: enrollCodeTtlMs, reservedClients: Object.values(tokens).map((t) => t.client) }) }) {
+  enrollment = createEnrollment({ statePath: path.resolve(instanceDir, '..', 'enroll-state.json'), codeTtlMs: enrollCodeTtlMs, reservedClients: Object.values(tokens).map((t) => t.client) }),
+  nativeRegistry = createNativeRegistry({ statePath: path.resolve(instanceDir, '..', 'native-registry-state.json') }) }) {
   // 配置健全性：channel:primary 只在 high 客户端生效（主频道房规/nudge 依赖 inbox 工具，而 inbox 是 high-only）。
   // 标了 primary 却非 high = 无声失效的误配 —— 启动即告警点名，而不是运行期静默丢行为。
   for (const t of Object.values(tokens)) {
@@ -65,16 +67,11 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   for (const v of Object.values(tokens)) if (v && typeof v === 'object') v.source = 'static';
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
-  // F1（Critical）进程内批准登记表：resolveEntry（唯一合法批准入口，本进程内）记账、keeper 查表核验。
-  // inbox 与 keeper 必须共享【这一个】 Map——经 app.locals.approvals（下方 app 建好后暴露）给 isMain 的
-  // keeper/nightly。取舍：Map 是进程内状态，重启即丢在途批准；届时相关件因登记表无记录变「未认证」→ 提案件
-  // re-held、普通件回落 LLM 重判（安全失败，主人再批一次）。绝不把认证信息落盘（落盘即可被 git pull 伪造）。
-  const approvals = new Map();
-  // SEC-2/SEC-5 接线：进程内「服务端亲生件登记表」Map<id, nativeToken>，语义同 approvals Map——inbox 记账
-  // （id→件内容绑定 token）、keeper/nightly 复算比对、终态删账。亲生件 = 本进程写路径产出的件（非 git pull 拉进来
-  // 的伪造件）。二轮加固：登记的是【内容绑定 token】而非裸 id（inbox 件 id 公开、可被伪造件复用绕过）。inbox 与
-  // keeper/nightly 必须共享【这一个】 Map（经 app.locals.nativeReg 暴露给 isMain），否则两侧各持一份 = 亲生判定失配。
-  const nativeReg = new Map();
+  // SEC-2/SEC-5 接线：「服务端亲生件登记表」<id,nativeToken>。只存内容绑定 hash、
+  // 落在实例 git 之外的 volume；同一账本的 approvals 子表保存内容绑定主人批准，避免重启或
+  // retryable 执行故障后把主人裁定丢掉、让 LLM 静默改判。生产用持久子表；注入普通 Map 的测试回退 Map。
+  const nativeReg = nativeRegistry;
+  const approvals = nativeReg?.approvals ?? new Map();
   const inbox = createInbox({ instanceDir, writer, indexStore, approvals, nativeReg });
   // recall（读侧智能）需要 LLM：无 provider（如缺 DEEPSEEK_API_KEY）时不注册该工具，与 keeper 同一档降级。
   const recall = provider ? createRecall({ indexStore, provider, instanceDir }) : null;
@@ -110,7 +107,10 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   // held 摘要收集：piggyback nudge 与 /digest 两处共用。只带 id/kind/计数——件正文是对抗输入，
   // 绝不进 instructions/响应面/digest（M4.0 考卷同款威胁模型）。key = held id 集合，供 piggyback 防重复。
   const heldSummary = () => {
-    const held = inbox.listEntries().entries.filter((e) => e.status === 'held');
+    // 只有真正需要主人语义取舍的 owner-held 才进入 nudge/digest；retryable/security 是引擎/运维态，
+    // 不得伪装成“请主人裁定”。无 held_class 的历史件按 owner 兼容。
+    const held = inbox.listEntries().entries.filter((e) =>
+      e.status === 'held' && (!e.held_class || e.held_class === 'owner'));
     if (!held.length) return null;
     // 读路径必须再验 id/kind：实例仓库经 git pull 同步，inbox 件可以不经 addEntry 写路径、被手工伪造后
     // 拉进来——伪造 frontmatter 的 id/kind 是单行任意文本，直接拼进 sample 就是注入面。sample 只收
@@ -282,6 +282,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     const primary = identity.channel === 'primary' && identity.trust === 'high';
     // enrollment 工具（仅主频道注册）需要账本 + notify + 按本请求推导的 publicUrl（拼可粘贴 prompt 里的 <publicUrl>/enroll）。
     const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, audit, nudge: primary ? nudgeFor : null,
+      nativeReg,
       enrollment, notify: fireNotify, tokens, enrollPublicUrl: publicUrlFor(req), enrollCodeTtlMs });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
@@ -336,7 +337,10 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     }
     const content = [url?.trim(), text?.trim()].filter(Boolean).join('\n\n').slice(0, 20_000);
     try {
-      const receipt = inbox.addEntry({ kind: 'capture', content, hint: note?.slice(0, 500), client: identity.client });
+      const receipt = inbox.addEntry({
+        kind: 'capture', content, hint: note?.slice(0, 500), client: identity.client,
+        admission: createAdmission({ identity, ingress: 'capture', kind: 'capture' }),
+      });
       // 成功的捕获尝试带 inbox entry id：metrics 按 id join keeper 最终去向，算「发起→进库/拒收」
       audit({ client: identity.client, tool: 'capture', event: 'capture_attempt', kind: 'capture', source: identity.client, id: receipt.id, args: { url, note }, ok: true });
       return res.json({ ok: true, id: receipt.id, path: receipt.path });
@@ -362,7 +366,9 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
       return res.status(403).json({ ok: false, error: 'deliver-only capture token 只能投递 /capture' });
     }
     const mineOnly = identity.trust !== 'high' && identity.trust !== 'capture';
-    let pending = inbox.listEntries().entries.filter((e) => !mineOnly || e.client === identity.client);
+    let pending = inbox.listEntries().entries
+      .filter((e) => e.status !== 'held' || !e.held_class || e.held_class === 'owner')
+      .filter((e) => !mineOnly || e.client === identity.client);
     if (identity.trust !== 'high') pending = pending.filter((e) => !CAPTURE_UNRULABLE_KINDS.has(e.kind));
     if (identity.channel !== 'primary') pending = pending.filter((e) => e.kind !== 'core');
     const events = (eventStore?.list() ?? []).filter((e) => !mineOnly || e.client === identity.client).slice(-100).reverse();
@@ -406,9 +412,10 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
 }
 
 function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, audit, nudge = null,
-  enrollment = null, notify = null, tokens = {}, enrollPublicUrl = null, enrollCodeTtlMs = 900_000 }) {
+  nativeReg = new Map(), enrollment = null, notify = null, tokens = {}, enrollPublicUrl = null, enrollCodeTtlMs = 900_000 }) {
   const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity) });
   const { client, trust } = identity;
+  const admission = (ingress, kind) => createAdmission({ identity, ingress, kind });
 
   // auditFields(result, args)：可选，从工具结果/入参里抽结构化埋点字段并入审计条目（如 search 的 result_count/hit/query）。
   // captureKind：可选，标记这是「捕获/写入意图」的工具——成功/失败都记 event:'capture_attempt'（带 kind+source，
@@ -542,13 +549,17 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
         content: z.string().describe('要保存的内容原文'),
         hint: z.string().optional().describe('去向提示（可选），如：决定/事实/餐厅/想试；现有页可写 path: <相对路径> 或 content_id: <8位id>'),
       },
-    }, wrap('save', async ({ content, hint }) => inbox.addEntry({ kind: 'save', content, hint, client }), receiptText, null, 'save'));
+    }, wrap('save', async ({ content, hint }) => inbox.addEntry({
+      kind: 'save', content, hint, client, admission: admission('save', 'save'),
+    }), receiptText, null, 'save'));
 
     server.registerTool('todo_add', {
       title: '加待办（经收件箱）',
       description: '给主人加一条待办。主人明确说「记得提醒我/要做 X/加个待办」时直接用；只是表达未来要做但尚未授权记录时，先主动提议，主人同意后再用。',
       inputSchema: { item: z.string().describe('待办事项，一句话') },
-    }, wrap('todo_add', async ({ item }) => inbox.addEntry({ kind: 'todo', content: item, client }), receiptText, null, 'todo'));
+    }, wrap('todo_add', async ({ item }) => inbox.addEntry({
+      kind: 'todo', content: item, client, admission: admission('todo_add', 'todo'),
+    }), receiptText, null, 'todo'));
 
     server.registerTool('collections_upsert', {
       title: '加收藏条目（经收件箱）',
@@ -557,25 +568,33 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
         name: z.string().describe('收藏名（collections/ 下的目录名）'),
         row: z.record(z.string(), z.any()).describe('结构化字段，如 {name, city, cuisine, notes}'),
       },
-    }, wrap('collections_upsert', async ({ name, row }) => inbox.addEntry({ kind: 'collection', payload: { name, row }, client }), receiptText, null, 'collection'));
+    }, wrap('collections_upsert', async ({ name, row }) => inbox.addEntry({
+      kind: 'collection', payload: { name, row }, client, admission: admission('collections_upsert', 'collection'),
+    }), receiptText, null, 'collection'));
 
     server.registerTool('remember', {
       title: '记住关于主人的事实（经收件箱）',
       description: '记录关于主人的稳定事实/偏好（跨 agent 共享记忆）。主人明确说「记住我…/我的偏好是…」时直接用；对话出现新的稳定事实/偏好但尚未授权记录时，先主动提议，主人同意后再用。临时性、一次性的信息不要用这个。',
       inputSchema: { fact: z.string().describe('稳定事实或偏好，一句话') },
-    }, wrap('remember', async ({ fact }) => inbox.addEntry({ kind: 'memory', content: fact, client }), receiptText, null, 'memory'));
+    }, wrap('remember', async ({ fact }) => inbox.addEntry({
+      kind: 'memory', content: fact, client, admission: admission('remember', 'memory'),
+    }), receiptText, null, 'memory'));
 
     server.registerTool('todo_done', {
       title: '标待办完成（经收件箱）',
       description: '把主人的某条待办标为已完成（挪进「已完成」小节）。主人说「X 做完了/完成了/搞定了」时用。item 写主人指的那条（原话即可，keeper 会对着清单精确匹配）。',
       inputSchema: { item: z.string().describe('主人说的哪条待办，原话') },
-    }, wrap('todo_done', async ({ item }) => inbox.addEntry({ kind: 'todo_done', content: item, client }), receiptText, null, 'todo_done'));
+    }, wrap('todo_done', async ({ item }) => inbox.addEntry({
+      kind: 'todo_done', content: item, client, admission: admission('todo_done', 'todo_done'),
+    }), receiptText, null, 'todo_done'));
 
     server.registerTool('remove', {
       title: '删除库中内容（经收件箱）',
       description: '删除知识库中的某一页。仅当主人明确要求删除时使用（例：「把 X 那页删了」）——不要因为内容过时/你认为没用就主动删。keeper 会校验目标并执行；git 历史永远可找回；骨架区（governance/skills）禁删。',
       inputSchema: { what: z.string().describe('主人要删什么，原话或页路径（如 knowledge/xxx）') },
-    }, wrap('remove', async ({ what }) => inbox.addEntry({ kind: 'remove', content: what, client }), receiptText, null, 'remove'));
+    }, wrap('remove', async ({ what }) => inbox.addEntry({
+      kind: 'remove', content: what, client, admission: admission('remove', 'remove'),
+    }), receiptText, null, 'remove'));
 
     server.registerTool('inbox_list', {
       title: '查收件箱',
@@ -613,14 +632,14 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
         privacy: z.enum(['private', 'sensitive']).optional().describe('private（默认）/ sensitive（仅高信任可读）'),
       },
     }, wrap('schema_propose', async ({ id, path: zpath, purpose, privacy }) =>
-      schemaPropose({ instanceDir, inbox, client, id, path: zpath, purpose, privacy }),
+      schemaPropose({ instanceDir, inbox, client, admission: admission('schema_propose', 'schema'), id, path: zpath, purpose, privacy }),
       (r) => `✅ 已提议新建 zone「${r.zoneId}」→ ${r.path}（状态 held，主频道会浮出待批，主人点选「建这个 zone / 扔掉别建」即可）`));
 
     server.registerTool('schema_apply', {
       title: '批准并落地一个 zone 提案',
       description: '把某条 schema 提案件直接落地（追加 zones.md + 建目录 + doctor 校验；doctor 报错自动回滚）。通常主人在主频道点选批准即可，无需手工调本工具；id 用 inbox_list 查、须是 kind=schema 的提案件。',
       inputSchema: { id: z.string().describe('schema 提案件的 inbox id（inbox_list 可查）') },
-    }, wrap('schema_apply', async ({ id }) => schemaApply({ instanceDir, inbox, writer, id }),
+    }, wrap('schema_apply', async ({ id }) => schemaApply({ instanceDir, inbox, writer, nativeReg, id }),
       (r) => `✅ 已落地 zone「${r.zoneId}」→ ${r.changedPaths.join('、')}（提案件已移除，doctor 0 error）`,
       (r) => ({ event: 'schema_apply', zone_id: r?.zoneId })));
 
@@ -732,7 +751,7 @@ async function pageSetTier({ instanceDir, writer, indexStore, page, tier }) {
 
 // schema_propose 实现：冲突/形状校验（zod 已过 id 正则/privacy 枚举，这里查与现有 zones 的 id/path 冲突 + path 形状）
 // → 人话一行 + ```json 块（提案全量）写进件正文，创建即 held + 带两点选候选（批准=schema_apply / 扔掉=forbidden）。
-function schemaPropose({ instanceDir, inbox, client, id, path: zpath, purpose, privacy = 'private' }) {
+function schemaPropose({ instanceDir, inbox, client, admission, id, path: zpath, purpose, privacy = 'private' }) {
   const v = validateSchemaProposal({ instanceDir, payload: { id, path: zpath, purpose, privacy } });
   if (!v.ok) throw new Error(v.reason);
   const proposal = { id: v.id, path: v.path, purpose: v.purpose, privacy: v.privacy };
@@ -745,30 +764,60 @@ function schemaPropose({ instanceDir, inbox, client, id, path: zpath, purpose, p
       { label: '扔掉别建', decision: { disposition: 'forbidden', reject_reason: '主人不要这个 zone' } },
     ],
   };
-  const receipt = inbox.addEntry({ kind: 'schema', content, client, status: 'held', optionsBlock });
+  const receipt = inbox.addEntry({ kind: 'schema', content, client, admission, status: 'held', optionsBlock });
   return { ...receipt, zoneId: v.id };
 }
 
 // schema_apply 工具入口：定位件（kind 必须 schema）→ writer.transact 内 applySchema + 移除件 + 一并 commit。
 // 与 keeper approved_decision 入口共用 executor.applySchema（doctor 校验 + errors>0 回滚 throw）。
-async function schemaApply({ instanceDir, inbox, writer, id }) {
+async function schemaApply({ instanceDir, inbox, writer, nativeReg = new Map(), id }) {
   const hit = inbox.listEntries().entries.find((e) => e.id === id);
   if (!hit) throw new Error(`找不到收件 ${id}`);
   if (hit.kind !== 'schema') throw new Error(`不是 schema 提案件（kind=${hit.kind}），schema_apply 只落地 schema 件`);
   let out;
   await writer.transact(async (commit) => {
-    const applied = await applySchema({ instanceDir, entry: { rel: hit.path } });
     const abs = path.join(instanceDir, hit.path);
     const savedRaw = readFileSync(abs, 'utf8'); // 存原文：commit 失败回滚时，未 tracked 的提案件 git checkout 恢复不了，交回滚助手写回
+    const proof = nativeReg.get(id);
+    const native = proof === nativeToken({ id, rel: hit.path, kind: hit.kind, client: hit.client, raw: savedRaw });
+    if (typeof nativeReg.isConsumed === 'function' && nativeReg.isConsumed(id)) {
+      throw new Error('该 schema 提案已执行/消费，拒绝从历史 inbox 重放');
+    }
+    if (proof && !native) throw new Error('schema 提案内容与 native proof 不符，拒绝应用被篡改的 payload');
+    let claimed = null;
+    let applied = null;
     try {
+      // 直达工具与 keeper 同一 at-most-once 协议：服务端亲生提案先在 git 外持久 claim，
+      // 再落 schema 副作用。崩溃后历史 inbox 不能靠旧 native proof 复燃。
+      if (native) {
+        if (typeof nativeReg.consume === 'function') {
+          claimed = nativeReg.consume(id, proof);
+          if (!claimed) throw new Error('schema 提案的 native proof 已被消费，拒绝继续');
+        } else {
+          if (!nativeReg.delete(id)) throw new Error('schema 提案的 native proof 已被消费，拒绝继续');
+          claimed = { token: proof, approval: null };
+        }
+      }
+      applied = await applySchema({ instanceDir, entry: { rel: hit.path } });
       rmSync(abs);
       await commit({ paths: [...applied.changedPaths, hit.path], message: `schema: 落地 zone ${applied.zoneId}（${id}）` });
       finalizeSchemaRollback(applied.rollbackToken); // 成功落地 → 作废 rollback token（防成功后残留授权被后续误调删掉真 zone）
     } catch (e) {
       // commit 失败（如提案件未 tracked → git add pathspec 报错）→ 凭 applySchema 发的 token 回滚已落盘的写，避免半落地孤儿 zone；
       // 提案件由 rollbackSchemaWrites 用 entryRaw 复原（tracked→checkout，untracked→写回），杜绝数据丢失。
-      await rollbackSchemaWrites({ instanceDir, changedPaths: applied.changedPaths, rollbackToken: applied.rollbackToken, entryRel: hit.path, entryRaw: savedRaw });
-      throw e;
+      let recoveryError = null;
+      if (applied) {
+        try {
+          await rollbackSchemaWrites({ instanceDir, changedPaths: applied.changedPaths, rollbackToken: applied.rollbackToken, entryRel: hit.path, entryRaw: savedRaw });
+        } catch (rollbackError) { recoveryError = rollbackError; }
+      }
+      if (claimed) {
+        try {
+          if (typeof nativeReg.restore === 'function') nativeReg.restore(id, claimed.token, claimed.approval);
+          else nativeReg.set(id, claimed.token);
+        } catch (proofError) { recoveryError = recoveryError ?? proofError; }
+      }
+      throw recoveryError ? new Error(`${e.message}；schema 回滚失败：${recoveryError.message}`) : e;
     }
     out = applied;
   });
@@ -885,7 +934,7 @@ if (isMain) {
     // notifier 已在 createApp 之前建好（enrollment 通知复用同一实例）；keeper/夜班共用它。
     // 夜班（M4.4 D3）只在 provider 在场时挂：它的提案执行依赖 keeper 循环（tick 里勾 maybeRun），
     // 降级模式（无 key）下 keeper、夜班和 core calibration 都不跑——文档口径不变。
-    // 三者复用 createApp 建立的 inbox/writer，确保进程内批准账本与单写者队列严格一致。
+    // 三者复用 createApp 建立的 inbox/writer，确保同一份持久批准账本与单写者队列严格一致。
     const serviceInbox = app.locals.inbox;
     const nightly = createNightly({
       instanceDir,

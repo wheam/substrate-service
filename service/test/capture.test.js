@@ -60,6 +60,10 @@ test('POST /capture：设备 token 秒回受理，件带 url/text/note', async (
   const raw = readFileSync(path.join(work, j.path), 'utf8');
   assert.match(raw, /kind: capture/);
   assert.match(raw, /client: app-ios/);
+  assert.match(raw, /admission_trust: capture/);
+  assert.match(raw, /admission_source: static/);
+  assert.match(raw, /admission_ingress: capture/);
+  assert.match(raw, /admission_capabilities: \["collection:insert","page:create","todo:add"\]/);
   assert.match(raw, /hint: 想试这个方法/);
   assert.match(raw, /example\.com\/article/);
   assert.match(raw, /一篇讲手冲的文章/);

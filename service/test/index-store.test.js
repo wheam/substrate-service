@@ -12,6 +12,7 @@ import { readTier } from '../src/tier.js';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -282,10 +283,11 @@ test('缺陷8：大量敏感命中 + 1 条公开命中，低信任仍拿到公�
 test('keeper 建页：新页写 content_id，且索引增量刷新后可检索到新页', async () => {
   const { work, indexPath } = gitInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const indexStore = createIndexStore({ instanceDir: work, indexPath });
   const keeper = createKeeper({
-    instanceDir: work, writer, provider: fakeProvider({
+    instanceDir: work, writer, nativeReg, provider: fakeProvider({
       disposition: 'canonical', zone: 'knowledge', action: 'new_page',
       target: 'espresso-basics', title: '意式浓缩要点', summary: '意式浓缩', confidence: 0.95,
     }), notifier: fakeNotifier(), audit: () => {}, doctor: false, indexStore,
@@ -315,10 +317,11 @@ test('keeper 建页：新页写 content_id，且索引增量刷新后可检索�
 test('缺陷3：keeper upsert_row 后索引增量刷新纳入新 csv 行', async () => {
   const { work, indexPath } = gitInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const indexStore = createIndexStore({ instanceDir: work, indexPath });
   const keeper = createKeeper({
-    instanceDir: work, writer, provider: fakeProvider({
+    instanceDir: work, writer, nativeReg, provider: fakeProvider({
       disposition: 'canonical', zone: 'collections', action: 'upsert_row',
       target: 'restaurants', fields: { name: '松露主题餐厅', city: '样例城', cuisine: '法餐' },
       summary: '收藏餐厅', confidence: 0.95,
@@ -414,10 +417,11 @@ test('隔离-rejected 增量：updatePage 只纳入 tier: rejected 的 inbox 件
 test('端到端：keeper 拒收低价值件 → 隔离-rejected 入索引；默认检索落空、include=rejected 可查', async () => {
   const { work, indexPath } = gitInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const indexStore = createIndexStore({ instanceDir: work, indexPath });
   const keeper = createKeeper({
-    instanceDir: work, writer, provider: fakeProvider({
+    instanceDir: work, writer, nativeReg, provider: fakeProvider({
       disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'x',
       summary: '闲聊无留存价值', confidence: 0.9, reject_reason: '一次性闲聊，无留存价值',
     }), notifier: fakeNotifier(), audit: () => {}, doctor: false, indexStore,
@@ -459,9 +463,10 @@ test('缺陷2b：拒→复核→复位——resolveEntry 清 tier 行并刷索�
   const { work, indexPath } = gitInstance();
   const writer = createWriter({ instanceDir: work });
   const indexStore = createIndexStore({ instanceDir: work, indexPath });
-  const inbox = createInbox({ instanceDir: work, writer, indexStore });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, indexStore, nativeReg, admissionProvider: testAdmissionForKind });
   const keeper = createKeeper({
-    instanceDir: work, writer, provider: fakeProvider({
+    instanceDir: work, writer, nativeReg, provider: fakeProvider({
       disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'x',
       summary: '闲聊无留存价值', confidence: 0.9, reject_reason: '一次性闲聊，无留存价值',
     }), notifier: fakeNotifier(), audit: () => {}, doctor: false, indexStore,

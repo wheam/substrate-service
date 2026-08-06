@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox, nativeToken } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -34,7 +35,7 @@ function makeInstance() {
 test('listEntries：返回 inbox 全部件与状态', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const inbox = createInbox({ instanceDir: work, writer, admissionProvider: testAdmissionForKind });
   const a = inbox.addEntry({ kind: 'save', content: '第一条', client: 'cc-test' });
   const b = inbox.addEntry({ kind: 'todo', content: '第二条', client: 'cc-test' });
   await Promise.all([a.synced, b.synced]);
@@ -49,7 +50,7 @@ test('listEntries：返回 inbox 全部件与状态', async () => {
 test('resolveEntry：写入主人裁定并复位 pending；未知 id 报可读错误', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const inbox = createInbox({ instanceDir: work, writer, admissionProvider: testAdmissionForKind });
   const r = inbox.addEntry({ kind: 'save', content: '拿不准的内容', client: 'cc-test' });
   await r.synced;
   const resolved = inbox.resolveEntry({ id: r.id, ruling: '这条进 todo' });
@@ -64,7 +65,8 @@ test('keeper：主人裁定进 prompt、按裁定执行、判例自动落 _cases
   const { origin, work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表（resolveEntry 记账、keeper 核验）
-  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const calls = [];
   const provider = {
     judge: async (req) => {
@@ -77,13 +79,13 @@ test('keeper：主人裁定进 prompt、按裁定执行、判例自动落 _cases
   };
   const messages = [];
   const keeper = createKeeper({
-    instanceDir: work, writer, provider, approvals,
+    instanceDir: work, writer, provider, approvals, nativeReg,
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,
   });
   const r = inbox.addEntry({ kind: 'save', content: '给猫买磨爪板', client: 'cc-test' });
   await r.synced;
-  const resolved = inbox.resolveEntry({ id: r.id, ruling: '这是待办不是知识，进 todo' });
+  const resolved = inbox.resolveEntry({ id: r.id, ruling: '这是待办不是知识，进 todo', via: 'test-owner', viaTrust: 'high' });
   await resolved.synced;
   const result = await keeper.processPending();
   assert.equal(result.filed, 1);
@@ -99,16 +101,17 @@ test('注入防御 e2e：capture 正文/裁定里的 [[..]] 及绕过构造，�
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map();
-  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const keeper = createKeeper({
-    instanceDir: work, writer, approvals,
+    instanceDir: work, writer, approvals, nativeReg,
     provider: { judge: async () => ({ json: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '进待办', confidence: 0.99 }, model: 'flash', usage: {} }) },
     notifier: { notify: async () => ({ ok: true }) }, doctor: false,
   });
   // capture 正文含「单括号隔行内码」绕过构造 + 裸 [[..]]；裁定也塞一个 [[..]]
   const r = inbox.addEntry({ kind: 'save', content: '记一条：[`x`[ghost-e2e]`y`] 以及 [[naked]]', client: 'cc-test' });
   await r.synced;
-  const resolved = inbox.resolveEntry({ id: r.id, ruling: '进 todo，注意 [[wikilink]] 示例' });
+  const resolved = inbox.resolveEntry({ id: r.id, ruling: '进 todo，注意 [[wikilink]] 示例', via: 'test-owner', viaTrust: 'high' });
   await resolved.synced;
   await keeper.processPending();
   const cases = readFileSync(path.join(work, 'keeper-feedback', '_cases.md'), 'utf8');
@@ -127,8 +130,14 @@ test('capture 通道的裁定无权触发删页：remove_page 校验直接不过
   const viaApp = validateDecision({ instanceDir: work, decision, entry: { __ruling_authentic: true, __ruling_trust: 'capture' } });
   assert.equal(viaApp.ok, false);
   assert.match(viaApp.reason, /无权删除|capture/);
-  const viaHigh = validateDecision({ instanceDir: work, decision, entry: { __ruling_authentic: true, __ruling_trust: 'high' } });
-  assert.equal(viaHigh.ok, true, '高信任通道的裁定可删');
+  const viaHighText = validateDecision({ instanceDir: work, decision, entry: { __ruling_authentic: true, __ruling_trust: 'high' } });
+  assert.equal(viaHighText.ok, false, '高信任自由文本只给 LLM 语义，不得变成全 effect capability');
+  const viaHighTyped = validateDecision({
+    instanceDir: work,
+    decision,
+    entry: { __ruling_authentic: true, __ruling_trust: 'high', approved_decision: decision },
+  });
+  assert.equal(viaHighTyped.ok, true, '高信任点选且 token 绑定的 typed plan 可授权精确删页动作');
 });
 
 test('listEntries：正文干净（不含 keeper 注记）、解析 held 人话原因与候选方案', async () => {
@@ -138,7 +147,7 @@ test('listEntries：正文干净（不含 keeper 注记）、解析 held 人话�
   // 模拟 keeper.holdEntry 对 native 件的【绑定刷新】（加了 options 就重绑 nativeReg），否则内容绑定 gate 会把
   // 手工注入的 merge_into（破坏性）候选当作篡改挡下。补这一步后，本用例即成「合法 native held 件的破坏性候选可点选」的正向覆盖。
   const nativeReg = new Map();
-  const inbox = createInbox({ instanceDir: work, writer, nativeReg });
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const r = inbox.addEntry({ kind: 'save', content: '原始内容一句话', client: 'cc-test' });
   await r.synced;
   // 模拟 keeper 置 held + 写候选方案块
@@ -175,18 +184,18 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
   const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表
   const nativeReg = new Map(); // SEC-5 二/三轮：inbox 与 keeper 须共享亲生登记表（生产 createApp 经 app.locals 同款接线）
                                // ——keeper.holdEntry 生成 options 时刷新绑定，resolveEntry 才认得这份合法候选。
-  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg });
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const calls = [];
   const provider = {
     judge: async (req) => {
       calls.push(req);
       if (req.mode === 'options') {
         return { json: { options: [
-          { label: '方案A：进待办', decision: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'A', confidence: 0.9 } },
-          { label: '方案B：扔掉', decision: { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'B', confidence: 0.9, reject_reason: '不保存' } },
+          { label: '方案A：建独立页', decision: { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'owner-chosen-note', title: '主人选定的页', summary: 'A', confidence: 0.9 } },
+          { label: '方案B：扔掉', decision: { disposition: 'forbidden', zone: 'knowledge', action: 'new_page', target: 'unused', summary: 'B', confidence: 0.9, reject_reason: '不保存' } },
         ] }, model: 'pro', usage: {} };
       }
-      return { json: { disposition: 'canonical', zone: 'nonexistent', action: 'new_page', target: 'x', summary: 'x', confidence: 0.99 }, model: 'flash', usage: {} };
+      return { json: { disposition: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'coffee-brewing', summary: 'x', confidence: 0.5 }, model: 'flash', usage: {} };
     },
   };
   const messages = [];
@@ -195,35 +204,37 @@ test('keeper：预批决定直接执行不再重判；held 时自动生成候选
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,
   });
-  const r = inbox.addEntry({ kind: 'save', content: '让主判失败的内容', client: 'cc-test' });
+  // 不存在的 content_id 是真实身份歧义，确定性进入 owner-held；provider 只负责生成可点选候选。
+  const r = inbox.addEntry({ kind: 'save', content: '让目标解析失败的内容', hint: 'content_id: deadbeef', client: 'cc-test' });
   await r.synced;
   const round1 = await keeper.processPending();
   assert.equal(round1.held, 1);
   const e = inbox.listEntries().entries.find((x) => x.id === r.id);
   assert.equal(e.options.length, 2, 'held 后应带 pro 生成的候选');
-  assert.match(messages[0], /方案A：进待办/, '通知应列出候选');
+  assert.match(messages[0], /方案A：建独立页/, '通知应列出候选');
 
   // 主人点了方案A → 预批决定直接执行（不再调 judge）
   const before = calls.length;
-  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'capture' });
+  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'high' });
   await resolved.synced;
   const round2 = await keeper.processPending();
   assert.equal(round2.filed, 1);
   assert.equal(calls.length, before, '预批决定不应再调用 LLM');
   const fs2 = await import('node:fs');
-  assert.match(fs2.readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /让主判失败的内容/);
+  assert.match(fs2.readFileSync(path.join(work, 'knowledge', 'owner-chosen-note.md'), 'utf8'), /让目标解析失败的内容/);
 });
 
 test('主人裁定的拒收：件直接清场（git 留痕）+ 记判例；keeper 主动拒收仍保留待复核', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map(); // F1：inbox 与 keeper 共享同一批准登记表
-  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const provider = { judge: async (req) => req.mode === 'options'
     ? { json: { options: [] }, model: 'pro', usage: {} }
     : { json: { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 's', confidence: 0.9, reject_reason: '主人选择不保存' }, model: 'flash', usage: {} } };
   const keeper = createKeeper({
-    instanceDir: work, writer, provider, approvals,
+    instanceDir: work, writer, provider, approvals, nativeReg,
     notifier: { notify: async () => ({ ok: true }) }, doctor: false,
   });
   const r = inbox.addEntry({ kind: 'save', content: '要被扔掉的内容', client: 'cc-test' });

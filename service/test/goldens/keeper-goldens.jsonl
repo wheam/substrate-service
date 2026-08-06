@@ -19,9 +19,9 @@
 {"id":"collection-restaurant","category":"collection","input":{"kind":"collection","payload":{"name":"restaurants","row":{"name":"新川菜馆","city":"样例城","cuisine":"川菜"}}},"expect":{"outcome":"filed","disposition":"canonical","zone":"collections","action":"upsert_row"}}
 {"id":"todo-done-tdd","category":"todo-done","input":{"kind":"todo_done","content":"读完《测试驱动开发》"},"expect":{"outcome":"filed","disposition":"canonical","zone":"todo","action":"todo_done"}}
 {"id":"reference-link","category":"reference","input":{"kind":"capture","content":"https://example.com/fts5-guide 一篇讲 SQLite FTS5 的好文。","hint":"存个引用回头看"},"expect":{"outcome":"filed","disposition":"reference","zone":"knowledge","action":"new_page"}}
-// ==== 代表性判例：模糊件该 held 不猜 ====
-{"id":"held-both","category":"ambiguous","input":{"kind":"save","content":"这条又像一个决定又像随手的感慨，说不清。"},"expect":{"outcome":"held"}}
-{"id":"held-vague","category":"ambiguous","input":{"kind":"save","content":"说不清该归到哪里，先放着吧。"},"expect":{"outcome":"held"}}
+// ==== 代表性判例：模糊但无害的件旁置 candidate，不把模型置信度转嫁给主人 ====
+{"id":"held-both","category":"ambiguous","input":{"kind":"save","content":"这条又像一个决定又像随手的感慨，说不清。"},"expect":{"outcome":"filed","disposition":"canonical","tier":"candidate","zone":"knowledge","action":"new_page"}}
+{"id":"held-vague","category":"ambiguous","input":{"kind":"save","content":"说不清该归到哪里，先放着吧。"},"expect":{"outcome":"filed","disposition":"canonical","tier":"candidate","zone":"knowledge","action":"new_page"}}
 // ==== 代表性判例：低价值 / 越界该拒 ====
 {"id":"reject-chitchat","category":"reject","input":{"kind":"save","content":"哈哈今天天气真好。"},"expect":{"outcome":"rejected","disposition":"forbidden"}}
 {"id":"reject-gossip","category":"reject","input":{"kind":"save","content":"邻居老王昨天和老婆吵架了，声音好大。"},"expect":{"outcome":"rejected","disposition":"forbidden"}}

@@ -10,7 +10,7 @@ import { createInbox } from '../src/inbox.js';
 import { createKeeper, caseLogSafe } from '../src/keeper.js';
 import { rollbackUncommitted, validateDecision } from '../src/executor.js';
 import { readTier } from '../src/tier.js';
-import { createTools } from '../src/tools.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -93,13 +93,13 @@ function setup({ providerScript, doctor = false }) {
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map();
   const nativeReg = new Map();
-  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg });
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const provider = fakeProvider(providerScript);
   const notifier = fakeNotifier();
   const auditLog = [];
   const audit = (e) => auditLog.push(e);
   const keeper = createKeeper({ instanceDir: work, writer, provider, notifier, audit, doctor, approvals, nativeReg });
-  return { origin, work, inbox, keeper, provider, notifier, auditLog };
+  return { origin, work, writer, approvals, nativeReg, inbox, keeper, provider, notifier, auditLog };
 }
 
 function registerSkillsZone(work) {
@@ -255,7 +255,7 @@ test('doctor 回滚并发安全：闸门运行期间的新收件不被统一回�
 test('rollbackUncommitted：能退 staged-new，并保留并发 inbox 新件与裁定改写', async () => {
   const { work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const inbox = createInbox({ instanceDir: work, writer, admissionProvider: testAdmissionForKind });
   const tracked = inbox.addEntry({ kind: 'save', content: '待裁定原件', client: 'cc-test' });
   await tracked.synced;
 
@@ -299,26 +299,28 @@ test('collection kind → collections.py upsert 真写主表', async () => {
   assert.match(readFileSync(path.join(work, 'collections', 'restaurants', 'data.csv'), 'utf8'), /new-place,新地方,样例城/);
 });
 
-test('两轮低置信 → held 不猜、通知待定夺、件保留', async () => {
+test('两轮低置信且模型想改既有页 → 自动旁置独立 candidate，不问主人', async () => {
   const { work, inbox, keeper, provider, notifier } = setup({
     providerScript: [
-      { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.5 },
-      { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.6 },
+      { disposition: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'coffee-brewing', summary: 'x', confidence: 0.5 },
+      { disposition: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'coffee-brewing', summary: 'x', confidence: 0.6 },
     ],
   });
+  const existingBefore = readFileSync(path.join(work, 'knowledge', 'coffee-brewing.md'), 'utf8');
   const receipt = inbox.addEntry({ kind: 'save', content: '像决定也像随想的一句话', client: 'cc-test' });
   await receipt.synced;
   const result = await keeper.processPending();
-  assert.equal(result.held, 1);
-  assert.equal(provider.calls.length, 3, '升级重判一次 + held 后生成候选一次');
+  assert.equal(result.filed, 1);
+  assert.equal(provider.calls.length, 2, '只升级重判一次，不再调候选问人');
   assert.equal(provider.calls[1].escalate, true);
-  assert.equal(provider.calls[2].mode, 'options');
-  const raw = readFileSync(path.join(work, receipt.path), 'utf8');
-  assert.match(raw, /status: held/);
-  assert.match(notifier.messages[0], /🤔.*待你定夺/s);
+  assert.equal(readFileSync(path.join(work, 'knowledge', 'coffee-brewing.md'), 'utf8'), existingBefore, '低置信不污染既有页');
+  const candidate = path.join(work, 'knowledge', `inbox-${receipt.id}.md`);
+  assert.match(readFileSync(candidate, 'utf8'), /^tier: candidate$/m);
+  assert.ok(!existsSync(path.join(work, receipt.path)), '收件已安全落库，不留 owner-held');
+  assert.equal(notifier.messages.some((m) => m.includes('待你定夺')), false);
 });
 
-test('决定不合法（zone 不存在）→ held + 可读理由；LLM 从不碰文件', async () => {
+test('决定不合法（zone 不存在）→ retryable held、不打扰主人；LLM 从不碰文件', async () => {
   const { work, inbox, keeper, notifier } = setup({
     providerScript: [{ disposition: 'canonical', zone: 'nonexistent', action: 'new_page', target: 'x', summary: 'x', confidence: 0.99 }],
   });
@@ -326,8 +328,11 @@ test('决定不合法（zone 不存在）→ held + 可读理由；LLM 从不碰
   await receipt.synced;
   const result = await keeper.processPending();
   assert.equal(result.held, 1);
-  assert.match(readFileSync(path.join(work, receipt.path), 'utf8'), /status: held/);
-  assert.match(notifier.messages[0], /nonexistent|不存在|校验/);
+  const raw = readFileSync(path.join(work, receipt.path), 'utf8');
+  assert.match(raw, /status: held/);
+  assert.match(raw, /held_class: retryable/);
+  assert.match(raw, /zone 不存在：nonexistent/);
+  assert.equal(notifier.messages.length, 0, '引擎可重试错误不应伪装成主人决策题');
 });
 
 test('disposition=forbidden → rejected + 理由留在件里', async () => {
@@ -420,13 +425,12 @@ test('Skill 原位更新：content_id 直接解析真实嵌套路径，整页替
   assert.doesNotMatch(raw, /旧内容|keeper 归档/, '完整 Skill 更新应原位替换，不应追加第二份文档');
   assert.ok(!existsSync(path.join(work, 'skills', 'example-operator.md')), '不得生成错误的扁平 Skill 页面');
   assert.ok(!existsSync(path.join(work, receipt.path)), '成功后 inbox 件应清场');
-  const readBack = await createTools({ instanceDir: work }).readPage({ path: rel, trust: 'high' });
-  assert.match(readBack.content, /这是更新后的完整内容/, 'read_page 应立即读到最新 Skill 内容');
+  assert.match(readFileSync(path.join(work, rel), 'utf8'), /这是更新后的完整内容/, '磁盘应立即读到最新 Skill 内容');
 
   const byPath = inbox.addEntry({
     kind: 'save',
     content: next.replace('这是更新后的完整内容。', '这是按完整 canonical 路径更新的内容。'),
-    hint: `请原位更新 \`${rel}\`，不要扁平化。`,
+    hint: `path: ${rel}`,
     client: 'cc-test',
   });
   await byPath.synced;
@@ -492,14 +496,14 @@ test('new_page 带 links：真实页写成 [[wikilink]]，不存在的丢弃', a
 });
 
 test('notifyLevel=quiet：已存不播报，held/rejected 照常', async () => {
-  const { work, inbox, provider, notifier } = setup({
+  const { work, writer, approvals, nativeReg, inbox, provider, notifier } = setup({
     providerScript: [
       { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '进待办', confidence: 0.95 },
       { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'x', confidence: 0.95, reject_reason: '闲聊无留存价值' },
     ],
   });
   const quietKeeper = createKeeper({
-    instanceDir: work, writer: createWriter({ instanceDir: work }), provider, notifier, doctor: false, notifyLevel: 'quiet',
+    instanceDir: work, writer, provider, notifier, doctor: false, notifyLevel: 'quiet', approvals, nativeReg,
   });
   const a = inbox.addEntry({ kind: 'todo', content: '安静存一条', client: 'cc-test' });
   await a.synced;
@@ -528,17 +532,14 @@ test('埋点：filed 的审计条目记 disposition=accepted + kind', async () =
 
 test('埋点：held 的审计条目记 disposition=held', async () => {
   const { inbox, keeper, auditLog } = setup({
-    providerScript: [
-      { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.5 },
-      { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'x', summary: 'x', confidence: 0.6 },
-    ],
+    providerScript: [{ disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'unused', summary: 'x', confidence: 0.9 }],
   });
-  const receipt = inbox.addEntry({ kind: 'capture', content: '拿不准的一句', client: 'cc-test' });
+  const receipt = inbox.addEntry({ kind: 'save', content: '需更新某个对象', hint: 'content_id: deadbeef', client: 'cc-test' });
   await receipt.synced;
   await keeper.processPending();
   const rec = auditLog.find((e) => e.tool === 'keeper' && e.entry === receipt.id);
   assert.equal(rec.disposition, 'held');
-  assert.equal(rec.kind, 'capture');
+  assert.equal(rec.kind, 'save');
 });
 
 test('埋点：rejected 的审计条目记 disposition=rejected', async () => {

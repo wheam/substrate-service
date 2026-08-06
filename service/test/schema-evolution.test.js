@@ -15,6 +15,7 @@ import { parseZones } from '../src/acl.js';
 import { runDoctor, validateSchemaProposal } from '../src/executor.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -151,7 +152,7 @@ test('A4 nudge 浮出包含该 schema 提案件（复用主频道浮出）', asy
 test('B1 apply：zones.md 多一条（parseZones 读得到）、目录+README 存在、提案件消失、audit event:schema_apply', async () => {
   const { work } = makeInstance();
   const auditLog = [];
-  const { baseUrl } = await startApp(work, { audit: (e) => auditLog.push(e) });
+  const { baseUrl, app } = await startApp(work, { audit: (e) => auditLog.push(e) });
   const client = await mcpClient(baseUrl, 'w-high');
   await client.callTool({ name: 'schema_propose', arguments: { id: 'health', path: 'health/', purpose: '健康与运动记录', privacy: 'sensitive' } });
   const eid = schemaEntryId(work);
@@ -171,6 +172,7 @@ test('B1 apply：zones.md 多一条（parseZones 读得到）、目录+README �
   assert.match(readFileSync(path.join(work, 'health', 'README.md'), 'utf8'), /# health[\s\S]*健康与运动记录/);
   // 提案件消失
   assert.equal(readSchemaEntry(work), null, '落地后提案件应移除');
+  assert.equal(app.locals.nativeReg.isConsumed(eid), true, '直达 schema_apply 也须持久消费 native proof');
   // audit 有 event:schema_apply
   assert.ok(auditLog.some((e) => e.event === 'schema_apply' && e.zone_id === 'health'), 'audit 记 event:schema_apply');
   await client.close();
@@ -178,7 +180,7 @@ test('B1 apply：zones.md 多一条（parseZones 读得到）、目录+README �
 
 test('B2 doctor 报 error → zones.md 回滚原样、目录不存在、工具报错含「回滚」、提案件仍在', async () => {
   const { work } = makeInstance();
-  const { baseUrl } = await startApp(work);
+  const { baseUrl, app } = await startApp(work);
   const client = await mcpClient(baseUrl, 'w-high');
   await client.callTool({ name: 'schema_propose', arguments: { id: 'health', path: 'health/', purpose: '健康记录' } });
   const eid = schemaEntryId(work);
@@ -187,6 +189,8 @@ test('B2 doctor 报 error → zones.md 回滚原样、目录不存在、工具�
   const r = await client.callTool({ name: 'schema_apply', arguments: { id: eid } });
   assert.equal(r.isError, true, 'doctor 报错时 apply 应失败');
   assert.match(r.content[0].text, /回滚/, '报错含「回滚」');
+  assert.equal(app.locals.nativeReg.has(eid), true, 'schema 写入失败并回滚后须恢复原 proof，允许同一提案重试');
+  assert.equal(app.locals.nativeReg.isConsumed(eid), false);
   // zones.md 逐字回滚原样、无 health
   assert.equal(readFileSync(path.join(work, 'governance', 'zones.md'), 'utf8'), zonesBefore, 'zones.md 逐字回滚');
   assert.ok(!parseZones(work).some((z) => z.id === 'health'), 'zones 不含 health');
@@ -259,11 +263,12 @@ function keeperSetup(work) {
   const writer = createWriter({ instanceDir: work });
   // F1：inbox 与 keeper 共享同一批准登记表（生产 createApp 同款接线）——resolveEntry 记账、keeper 核验。
   const approvals = new Map();
-  const inbox = createInbox({ instanceDir: work, writer, approvals });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const provider = throwingProvider();
   const messages = [];
   const keeper = createKeeper({
-    instanceDir: work, writer, provider, approvals,
+    instanceDir: work, writer, provider, approvals, nativeReg,
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     doctor: false,
   });
@@ -275,7 +280,7 @@ test('C1 点选「建」(option:0) → zone 落地、件清场；provider 从未
   const { inbox, provider, keeper } = keeperSetup(work);
   const r = proposeViaInbox(inbox, { id: 'health', path: 'health/', purpose: '健康记录' });
   await r.synced;
-  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'capture' });
+  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'high' });
   await resolved.synced;
   const result = await keeper.processPending();
   assert.equal(result.filed, 1, '应落地为 filed');
@@ -505,7 +510,7 @@ test('D6(F3) keeper 点选通路遇 apply 抛错（doctor fail）→ 件 re-held
   const { inbox, provider, keeper } = keeperSetup(work);
   const r = proposeViaInbox(inbox, { id: 'health', path: 'health/', purpose: '健康记录' });
   await r.synced;
-  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'capture' });
+  const resolved = inbox.resolveEntry({ id: r.id, option: 0, via: 'app-ios', viaTrust: 'high' });
   await resolved.synced;
   const zonesBefore = readFileSync(path.join(work, 'governance', 'zones.md'), 'utf8');
   makeDoctorFail(work); // applySchema 内的 doctor 必败 → 回滚 + throw

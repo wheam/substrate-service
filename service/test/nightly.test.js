@@ -13,6 +13,7 @@ import { createNightly } from '../src/nightly.js';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
+import { testAdmissionForKind } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 
@@ -753,14 +754,15 @@ test('4a keeper tick 每轮勾一次 nightly.maybeRun（F4：已移出归档锁 
 test('4b(F4) 夜班移出归档锁：nightly 在途时 processPending 仍受理新 pending（不被 running 门挡）', async () => {
   const { work } = makeGitInstance();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer });
+  const nativeReg = new Map();
+  const inbox = createInbox({ instanceDir: work, writer, nativeReg, admissionProvider: testAdmissionForKind });
   const filingProvider = { judge: async () => ({ json: { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: 's', confidence: 0.99 }, model: 'flash', usage: {} }) };
   // 受控 barrier 的 nightly：maybeRun 卡在 barrier 直到 release——模拟长扫描/慢 push 在途。
   let entered = false, release;
   const barrier = new Promise((r) => { release = r; });
   const nightly = { maybeRun: async () => { entered = true; await barrier; return { ran: true }; } };
   const keeper = createKeeper({
-    instanceDir: work, writer, provider: filingProvider,
+    instanceDir: work, writer, nativeReg, provider: filingProvider,
     notifier: { notify: async () => ({ ok: true }) }, doctor: false, nightly,
   });
   // tick1：空 pending → processPending 同步跑到 maybeRun 并卡在 barrier。F4 下此时归档锁 running 应已释放。

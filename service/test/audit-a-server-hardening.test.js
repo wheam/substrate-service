@@ -157,7 +157,12 @@ test('SEC-1：enrollment 发的 token 仍能认证（shape 校验放行合法两
 test('SEC-4：enrolled-capture 可投 /capture（deliver-only 的投递权保留）', async () => {
   const res = await postCapture(enrolledCaptureToken, { text: 'SEC-4 第三方投递' });
   assert.equal(res.status, 200);
-  assert.equal((await res.json()).ok, true);
+  const receipt = await res.json();
+  assert.equal(receipt.ok, true);
+  const raw = readFileSync(path.join(work, receipt.path), 'utf8');
+  assert.match(raw, /admission_trust: capture/);
+  assert.match(raw, /admission_source: enrolled/);
+  assert.match(raw, /admission_ingress: capture/);
 });
 
 test('SEC-4：enrolled-capture 打 GET /capture/status → 403（不得读在途件全文）', async () => {

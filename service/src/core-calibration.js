@@ -7,7 +7,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { readTier } from './tier.js';
 import { containsCredential } from './secrets.js';
-import { CORE_PROPOSAL_PREVIEW_CHARS, ID_FORMAT, nativeToken, parseEntryBody } from './inbox.js';
+import { CORE_PROPOSAL_PREVIEW_CHARS, ID_FORMAT, createAdmission, nativeToken, parseEntryBody } from './inbox.js';
 
 export const CORE_REL = 'memory/about-owner/_core.md';
 export const CORE_MAX_CHARS = 3000;
@@ -324,15 +324,49 @@ export function createCoreCalibration({
       const raw = readFileSync(abs, 'utf8');
       const native = nativeReg.get(hit.id) === nativeToken({ id: hit.id, rel: hit.path, kind: hit.kind, client: hit.client, raw });
       if (native) return { skipped: true, reason: 'proposal-exists', id: hit.id };
-      // nativeReg 随进程重启清空；旧 held core 若继续占位会永久不可点、又挡住重建。这里只行政关闭
-      // core-calibrator 自己命名、形状合法的 inbox 件，不读取/执行其正文，也不碰任何内容页。
+      // 正常重启后持久 registry 仍会命中并复用现有提案；只有遗留版本、registry 状态缺失/损坏，或
+      // 文件被篡改时才会走这里行政关闭失去 proof 的 core-calibrator 提案。不会读取/执行其正文或碰内容页。
       if (writer && ID_FORMAT.test(hit.id) && /^inbox\/_[-a-zA-Z0-9.]+\.md$/.test(hit.path)) {
+        const staleProof = nativeReg.get(hit.id);
+        const staleApproval = approvals.get(hit.id);
+        let claimed = null;
+        let claimedApproval = null;
         await writer.transact(async (commit) => {
-          rmSync(abs);
-          await commit({ paths: [hit.path], message: `core: 关闭重启后失票提案 ${hit.id}` });
+          try {
+            if (!existsSync(abs) || readFileSync(abs, 'utf8') !== raw) {
+              throw new Error(`core 提案 ${hit.id} 在关闭期间已变化，放弃旧快照`);
+            }
+            // 即使当前文件与 proof 不匹配，也要在删除这个失票副本前持久消费 id 对应的旧 proof。
+            // 否则 Git 恢复原始提案后，旧 proof 会重新变成有效授权。
+            if (staleProof) {
+              if (typeof nativeReg.consume === 'function') {
+                claimed = nativeReg.consume(hit.id, staleProof);
+                if (!claimed) throw new Error('core 提案 proof 在关闭前已不存在');
+              } else {
+                if (!nativeReg.delete(hit.id)) throw new Error('core 提案 proof 在关闭前已不存在');
+                claimed = { token: staleProof, approval: null };
+              }
+            }
+            if (staleApproval && approvals.get(hit.id) === staleApproval) {
+              approvals.delete(hit.id);
+              claimedApproval = staleApproval;
+            }
+            rmSync(abs);
+            await commit({ paths: [hit.path], message: `core: 关闭重启后失票提案 ${hit.id}` });
+          } catch (e) {
+            let recoveryError = null;
+            try { if (!existsSync(abs)) writeFileSync(abs, raw); }
+            catch (fileError) { recoveryError = fileError; }
+            try {
+              if (claimed) {
+                if (typeof nativeReg.restore === 'function') nativeReg.restore(hit.id, claimed.token, claimed.approval);
+                else nativeReg.set(hit.id, claimed.token);
+              }
+              if (claimedApproval) approvals.set(hit.id, claimedApproval);
+            } catch (proofError) { recoveryError = recoveryError ?? proofError; }
+            throw recoveryError ? new Error(`${e.message}；core 提案关闭回滚失败：${recoveryError.message}`) : e;
+          }
         });
-        approvals.delete(hit.id);
-        nativeReg.delete(hit.id);
         staleClosed = true;
         audit({ tool: 'core_calibration', event: 'stale_proposal_closed', id: hit.id });
       }
@@ -379,6 +413,10 @@ export function createCoreCalibration({
       };
       const receipt = inbox.addEntry({
         kind: 'core', client: 'core-calibrator', status: 'held', queuedWrite: true,
+        admission: createAdmission({
+          identity: { trust: 'system', source: 'core-calibrator', channel: 'internal' },
+          ingress: 'core_calibration', kind: 'core',
+        }),
         content: `${PROPOSAL_INTRO}\n\n${body}`,
         optionsBlock,
       });

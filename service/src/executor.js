@@ -1,7 +1,7 @@
 // keeper 的确定性执行器：LLM 只出决定，落盘永远走这里（直改文件或调实例 vendored 脚本）。
 import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, rmSync } from 'node:fs';
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { newContentId, readContentId } from './content-id.js';
@@ -26,6 +26,7 @@ const TIER_BEARING_ACTIONS = new Set(['new_page', 'merge_into']);
 const EPISTEMIC_TYPES = new Set(['fact', 'preference', 'decision', 'opinion', 'excerpt', 'to-verify']);
 // 骨架/流水区永久禁删（keeper 对 inbox 的清理走内部通路，不经 remove_page）
 const NO_DELETE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
+const SERVICE_ZONES = new Set(['governance', 'skills', 'inbox', 'keeper-feedback']);
 const CANONICAL_SKILL_RE = /^skills\/([a-z0-9][a-z0-9._-]*)\/SKILL\.md$/;
 const INCOMING_SKILL_RE = /^skills\/_incoming\/([a-z0-9][a-z0-9._-]*)\/SKILL\.md$/;
 
@@ -231,6 +232,70 @@ function skillDocumentWithContentId(raw, contentId) {
   return `---\ncontent_id: ${contentId}\n${fm.join('\n')}\n---\n${rest}`;
 }
 
+function hasCapability(entry, capability) {
+  if (entry?.__capabilities?.includes(capability)) return true;
+  // 只有主人明确点选、且 approval token 绑定了完整 decision 的 typed plan 才能补足该计划所需 effect。
+  // 自由文本 ruling 只作为 LLM 语义材料，绝不能变成“高信任主人说过一句话 = 所有 capability”——
+  // 否则模型误判可把“建独立页、不要改旧页”变成 remove_page。capture/低信任裁定同样不升级权限。
+  return !!entry?.__ruling_authentic && entry.__ruling_trust === 'high'
+    && !!entry?.approved_decision && typeof entry.approved_decision === 'object';
+}
+
+function capabilityError(entry, capability, effect) {
+  return hasCapability(entry, capability)
+    ? null
+    : { ok: false, holdClass: 'security', reason: `未授权 effect「${effect}」：AdmissionContext 缺 capability ${capability}` };
+}
+
+const policyDenied = (reason) => ({ ok: false, holdClass: 'security', reason });
+
+function parseCsvLine(line) {
+  const cells = [];
+  let cell = '', quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === '"' && line[i + 1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else cell += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ',') { cells.push(cell); cell = ''; }
+    else cell += ch;
+  }
+  cells.push(cell);
+  return cells;
+}
+
+function collectionIdExists(instanceDir, collection, id) {
+  const lines = readFileSync(path.join(instanceDir, 'collections', collection, 'data.csv'), 'utf8').split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return false;
+  const header = parseCsvLine(lines[0]);
+  const idCol = header.indexOf('id');
+  if (idCol < 0) return null;
+  return lines.slice(1).some((line) => parseCsvLine(line)[idCol] === id);
+}
+
+function findTodoMatches(instanceDir, needleRaw) {
+  const rel = 'todo/owner.md';
+  const text = readFileSync(path.join(instanceDir, rel), 'utf8');
+  const needle = String(needleRaw ?? '').trim();
+  const lines = text.split('\n');
+  const matches = [];
+  let inSection = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^## (进行中|待办)/.test(lines[i])) { inSection = true; continue; }
+    if (/^## /.test(lines[i])) { inSection = false; continue; }
+    if (!inSection) continue;
+    const itemText = lines[i].replace(/^(\d+\.|-)\s+/, '').trim();
+    if (itemText && (itemText === needle || itemText.includes(needle))) matches.push({ i, itemText });
+  }
+  return { rel, text, lines, needle, matches };
+}
+
+function validConfidence(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
 // 决定合法性校验（代码层，模型说什么不算数）
 export function validateDecision({ instanceDir, decision, entry }) {
   const d = decision ?? {};
@@ -245,16 +310,18 @@ export function validateDecision({ instanceDir, decision, entry }) {
     }
   }
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
-  if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无意义（无本地），需主人定夺' };
+  if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无落点，需在 AdmissionContext 内重新规划' };
   // replace_skill 是 keeper 代码根据【服务端亲生/主人已认证】件中的显式 path/content_id 意图派生出的内部动作，
   // 不在模型 ACTIONS 白名单里。模型直接产同名动作、或 target 与代码解析到的真实页不一致，一律拒。
   if (d.action === 'replace_skill') {
     if (d.disposition !== 'canonical') return { ok: false, reason: 'replace_skill 只接受 canonical disposition' };
-    if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: 'replace_skill 缺 confidence 或 summary' };
+    if (!validConfidence(d.confidence) || !d.summary) return { ok: false, reason: 'replace_skill 缺合法 confidence（0..1 有限数）或 summary' };
     const intent = entry?.__page_intent;
     if (!intent || intent.kind !== 'existing' || !intent.trusted) {
       return { ok: false, reason: 'replace_skill 只接受代码解析并认证过的现有页更新意图' };
     }
+    const cap = capabilityError(entry, 'skill:replace', 'replace canonical Skill');
+    if (cap) return cap;
     if (d.zone !== 'skills' || d.target !== intent.rel || !CANONICAL_SKILL_RE.test(intent.rel)) {
       return { ok: false, reason: 'replace_skill 只能原位替换 skills/<name>/SKILL.md 的真实路径' };
     }
@@ -278,7 +345,7 @@ export function validateDecision({ instanceDir, decision, entry }) {
   // 经高信任主人点选后，才能走 calibrate_core 整页替换。decision 只指向可见草案并绑定 hash，不能夹带正文。
   if (d.action === 'calibrate_core') {
     if (d.disposition !== 'canonical') return { ok: false, reason: 'calibrate_core 只接受 canonical disposition' };
-    if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: 'calibrate_core 缺 confidence 或 summary' };
+    if (!validConfidence(d.confidence) || !d.summary) return { ok: false, reason: 'calibrate_core 缺合法 confidence（0..1 有限数）或 summary' };
     if (entry?.kind !== 'core') return { ok: false, reason: `calibrate_core 仅用于 core 提案件；本件 kind=${entry?.kind ?? '未知'}` };
     if (!entry?.__native) return { ok: false, reason: 'calibrate_core 只接受服务端亲生且未被篡改的 core 提案' };
     if (!entry?.__ruling_authentic) return { ok: false, reason: 'calibrate_core 需已认证的主人点选批准' };
@@ -295,7 +362,7 @@ export function validateDecision({ instanceDir, decision, entry }) {
     return { ok: true, verdict: 'file', zone };
   }
   if (!ACTIONS.has(d.action)) return { ok: false, reason: `action 不合法：${d.action}` };
-  if (typeof d.confidence !== 'number' || !d.summary) return { ok: false, reason: '缺 confidence 或 summary' };
+  if (!validConfidence(d.confidence) || !d.summary) return { ok: false, reason: '缺合法 confidence（0..1 有限数）或 summary' };
   // 分层白名单（spec §6.1）：模型只能产出 canonical|candidate；缺省视为 canonical（向后兼容）。
   // 非法值（如被注入产出 tier: rejected / admin）→ 拒（落 held），rejected 只能由 keeper 判 forbidden 后代码落。
   if (d.tier !== undefined && d.tier !== null && !DECISION_TIERS.has(d.tier)) {
@@ -320,6 +387,7 @@ export function validateDecision({ instanceDir, decision, entry }) {
     // 此为防御性二道门，挡住任何绕过 keeper 认证直调 validateDecision 的未来路径）。工具入口 schema_apply
     // 由 bearer+high 授权、直调 applySchema 不经此校验，不受影响。
     if (!entry?.__ruling_authentic) return { ok: false, reason: 'schema_apply 需已认证的主人批准（点选提案候选）' };
+    if (entry?.__ruling_trust !== 'high') return { ok: false, reason: 'schema_apply 只能由高信任客户端批准' };
     const payload = extractSchemaPayload(entry);
     if (!payload || d.target !== payload.id) {
       return { ok: false, reason: `schema_apply 的 target（${d.target}）须指向本提案件的 zone id（payload.id）` };
@@ -330,14 +398,31 @@ export function validateDecision({ instanceDir, decision, entry }) {
   if (!zone) return { ok: false, reason: `zone 不存在：${d.zone}（可用：${zones.map((z) => z.id).join('、')}）` };
 
   if (d.action === 'todo_add') {
+    const cap = capabilityError(entry, 'todo:add', 'todo add');
+    if (cap) return cap;
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_add 只能进 todo 区' };
   } else if (d.action === 'todo_done') {
+    const cap = capabilityError(entry, 'todo:complete', 'todo complete');
+    if (cap) return cap;
+    if (entry?.kind !== 'todo_done' && !entry?.__ruling_authentic) {
+      return policyDenied(`todo_done 只接受专用 todo_done ingress 或已认证主人裁定；本件 kind=${entry.kind}`);
+    }
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_done 只能作用于 todo 区' };
     if (!d.target?.trim()) return { ok: false, reason: 'todo_done 缺 target（待办条目原文）' };
+    const todo = findTodoMatches(instanceDir, d.target);
+    if (todo.matches.length !== 1) {
+      return { ok: false, holdClass: 'owner', reason: `todo_done 目标须唯一匹配，「${todo.needle}」命中 ${todo.matches.length} 条——请主人指明是哪条` };
+    }
   } else if (d.action === 'remove_page') {
+    // 先给真实 capture 裁定返回通道限权理由，不被泛化 capability 报错掩盖。
+    if (entry?.__ruling_authentic && entry?.__ruling_trust === 'capture') {
+      return { ok: false, reason: 'capture 通道（App）的裁定无权删除页面——删页请在高信任客户端（CC/Hermes）发起' };
+    }
+    const cap = capabilityError(entry, 'page:remove', 'page remove');
+    if (cap) return cap;
     if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
     // 硬校验爆炸半径（spec §7）：remove_page 只允许「删除件（kind=remove）」或「主人裁定过的件」。
-    // F1：裁定的真实性只认进程内批准登记表（keeper 查表命中才置 entry.__ruling_authentic），不再信文件里
+    // F1：裁定的真实性只认持久批准登记表（keeper 查表命中才置 entry.__ruling_authentic），不再信文件里
     // 裸的 owner_ruling / ruling_via_trust（git pull 可伪造这些 frontmatter 字段绕过本门）。普通 capture/save
     // 伪造件即便带 owner_ruling，未经 resolveEntry 记账 → __ruling_authentic=false → 在此拦下。
     const rulingMarked = !!entry?.__ruling_authentic;
@@ -347,17 +432,14 @@ export function validateDecision({ instanceDir, decision, entry }) {
     // __native 由 keeper.processEntry 按【内容绑定 token】复算置（nativeReg.get(id)===nativeToken(当前件)），只有本
     // 进程 addEntry 亲手造【且未被篡改】的合法删除件才 __native=true；git pull 伪造件从不经 addEntry、即便复用某个
     // 公开的历史 native id，其正文/kind 与登记 token 不符 → 失配 → nativeRemove=false → 挡下（二轮加固：一轮只按
-    // id 判 native 被公开 id 复用打穿）。重启语义：nativeReg 是进程内状态、重启即空——重启前造的 remove 件重启后处理
-    // 会因非 native 落 held（安全失败，主人重发 remove 即可），与 approvals 批准登记表的重启语义同族、一致。
+    // id 判 native 被公开 id 复用打穿）。生产 nativeReg 在实例 git 外持久化，因此正常重启后的合法 remove 件
+    // 仍可验证；状态缺失/损坏时则安全失败，不会因文件自报 kind=remove 获得权限。
     const nativeRemove = entry?.kind === 'remove' && !!entry?.__native;
     if (!nativeRemove && !rulingMarked) {
       return { ok: false, reason: `remove_page 仅用于服务端生成的删除件（kind=remove）或主人明确裁定；本件 kind=${entry?.kind ?? '未知'} 且无认证的主人裁定，不予删除（需主人确认）` };
     }
     // 通道限权也只认 registry 里的 viaTrust（keeper 置 entry.__ruling_trust）：capture 通道（App 最低档）
     // 的裁定无权删页——伪造件改写文件里的 ruling_via_trust 无效。
-    if (entry?.__ruling_trust === 'capture') {
-      return { ok: false, reason: 'capture 通道（App）的裁定无权删除页面——删页请在高信任客户端（CC/Hermes）发起' };
-    }
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
     const slug = d.target.replace(/\.md$/, '');
     const rel = slug.startsWith(zone.path) ? `${slug}.md` : path.posix.join(zone.path, `${slug}.md`);
@@ -369,7 +451,7 @@ export function validateDecision({ instanceDir, decision, entry }) {
     // 夜班维护合并（M4.4 D3）会删源页——与 remove_page 同级硬校验：只认主人裁定过的件（点选提案候选
     // 即写 owner_ruling），数据/模型输出永不触发；且不设 kind 旁路（它还会改写目标页，比纯删更宽的改动面）。
     if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许合并删页）` };
-    // F1：与 remove_page 同——只认认证过的批准（进程内登记表），不信裸 owner_ruling/ruling_via_trust。
+    // F1：与 remove_page 同——只认认证过的持久批准，不信裸 owner_ruling/ruling_via_trust。
     const rulingMarked = !!entry?.__ruling_authentic;
     if (!rulingMarked) {
       return { ok: false, reason: 'merge_pages 会删源页，仅在主人明确裁定（点选提案）后执行；本件无认证的主人裁定，不予执行' };
@@ -395,13 +477,53 @@ export function validateDecision({ instanceDir, decision, entry }) {
       return { ok: false, reason: `收藏不存在：${d.target}` };
     }
     if (!d.fields || typeof d.fields !== 'object') return { ok: false, reason: 'upsert_row 缺 fields' };
+    if (!hasCapability(entry, 'collection:upsert')) {
+      const insertCap = capabilityError(entry, 'collection:insert', 'collection insert');
+      if (insertCap) return insertCap;
+      const id = String(d.fields.id || slugify(d.fields.name ?? `${d.target}-${Date.now().toString(36)}`));
+      if (!id || id.length > 200 || /[\r\n\0]/.test(id)) {
+        return policyDenied('无法为 insert-only collection 写入确定安全 id');
+      }
+      // 校验与执行必须使用同一个 id；否则两次 Date.now() 可让预检与真实 upsert 错位。
+      d.fields = { ...d.fields, id };
+      const exists = collectionIdExists(instanceDir, d.target, id);
+      if (exists === null) return policyDenied(`收藏 ${d.target} 无 id 列，无法证明本次是 insert-only`);
+      if (exists) {
+        return policyDenied(`未授权覆盖 collection 既有行：${d.target}/${id}（capture 仅有 insert capability）`);
+      }
+    }
   } else if (d.action === 'new_page' || d.action === 'merge_into') {
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
     const rel = pageRel(zone, d.target);
     if (path.basename(rel) === 'README.md' || path.basename(rel).startsWith('_')) {
       return { ok: false, reason: `普通 keeper 写动作不允许触碰结构页：${rel}` };
     }
+    if (SERVICE_ZONES.has(d.zone) && d.zone !== 'skills') {
+      return policyDenied(`服务区 ${d.zone} 不接受普通 keeper 内容写入`);
+    }
+    if (d.zone === 'todo') {
+      return policyDenied('todo 是 typed zone：只能经 todo_add/todo_done effect 修改，不接受普通 Markdown 建页或合并');
+    }
+    if (d.zone === 'collections') {
+      return policyDenied('collections 是 typed zone：只能经 collection insert/upsert effect 修改，不接受普通 Markdown 建页或合并');
+    }
+    if (d.zone === 'raw' && d.action === 'merge_into') {
+      return policyDenied('raw 是原始素材追加区：只允许新建存档，不修改已有原始页');
+    }
+    if (d.zone === 'skills' && d.action === 'merge_into') {
+      return policyDenied('canonical Skill 不接受普通 merge_into；须走显式完整文档替换或 _incoming staging');
+    }
+    const effectCap = d.action === 'new_page'
+      ? capabilityError(entry, 'page:create', `create page ${rel}`)
+      : capabilityError(entry, 'page:append', `append page ${rel}`);
+    if (effectCap) return effectCap;
+    if (zone.privacy === 'sensitive') {
+      const sensitiveCap = capabilityError(entry, 'zone:sensitive-write', `write sensitive zone ${zone.id}`);
+      if (sensitiveCap) return sensitiveCap;
+    }
     if (d.zone === 'skills' && d.action === 'new_page') {
+      const stageCap = capabilityError(entry, 'skill:stage', 'stage Skill');
+      if (stageCap) return stageCap;
       const hit = rel.match(INCOMING_SKILL_RE);
       if (!hit) return { ok: false, reason: '新 Skill 必须先写入 skills/_incoming/<name>/SKILL.md' };
       const doc = parseSkillDocument(entry?.body);
@@ -412,6 +534,113 @@ export function validateDecision({ instanceDir, decision, entry }) {
     if (badTarget(d.target)) return { ok: false, reason: `target 不合法：${d.target}` };
   }
   return { ok: true, verdict: 'file', zone };
+}
+
+const PRIMARY_OPERATION_KEYS = new Set(['action', 'zone', 'target', 'content_source', 'title', 'page_type', 'links']);
+const REFERENCE_OPERATION_KEYS = new Set(['action', 'zone', 'target', 'source_operation']);
+
+function operationWithSharedDecision(decision, operation) {
+  return {
+    disposition: decision.disposition,
+    tier: decision.tier,
+    summary: decision.summary,
+    confidence: decision.confidence,
+    epistemic_type: decision.epistemic_type,
+    ...operation,
+  };
+}
+
+// 有界复合计划 v1：唯一目标是表达「把收件正文归档一次 + 在同区已有页加一条确定性引用」。
+// 它不是通用 patch DSL：第二步没有 body/content/patch 字段，执行器只会生成 wikilink。
+// 旧的单 action decision 原样走 validateDecision，完全向后兼容。
+export function validateDecisionPlan({ instanceDir, decision, entry }) {
+  const operations = decision?.operations;
+  if (operations === undefined) {
+    const checked = validateDecision({ instanceDir, decision, entry });
+    if (!checked.ok || checked.verdict !== 'file') return checked;
+    if (decision.action === 'new_page' || decision.action === 'merge_into') {
+      const rel = pageRel(checked.zone, decision.target);
+      const exists = existsSync(path.join(instanceDir, rel));
+      if (decision.action === 'new_page' && exists) {
+        return { ok: false, holdClass: 'retryable', reason: `计划的新页已存在：${rel}，需重新规划为合并或查重` };
+      }
+      if (decision.action === 'merge_into' && !exists) {
+        return { ok: false, holdClass: 'retryable', reason: `计划的合并目标不存在：${rel}，需重新规划为新建` };
+      }
+    }
+    return checked;
+  }
+  if (!Array.isArray(operations) || operations.length !== 2) {
+    return { ok: false, reason: 'operations 复合计划必须恰好 2 步' };
+  }
+  const [primary, reference] = operations;
+  if (!primary || typeof primary !== 'object' || Array.isArray(primary)
+      || !reference || typeof reference !== 'object' || Array.isArray(reference)) {
+    return { ok: false, reason: 'operations 每一步必须是对象' };
+  }
+  if (Object.keys(primary).some((k) => !PRIMARY_OPERATION_KEYS.has(k))) {
+    return { ok: false, holdClass: 'security', reason: '复合计划第 1 步含非白名单字段（禁止自带 body/content/patch）' };
+  }
+  if (Object.keys(reference).some((k) => !REFERENCE_OPERATION_KEYS.has(k))) {
+    return { ok: false, holdClass: 'security', reason: '复合计划第 2 步含非白名单字段（禁止自带 body/content/patch）' };
+  }
+  if (!['new_page', 'merge_into'].includes(primary.action) || primary.content_source !== 'entry_body') {
+    return { ok: false, reason: '复合计划第 1 步只能是 new_page|merge_into 且 content_source=entry_body' };
+  }
+  if (reference.action !== 'append_reference' || reference.source_operation !== 0) {
+    return { ok: false, reason: '复合计划第 2 步只能是 append_reference 且 source_operation=0' };
+  }
+  if (decision.action !== primary.action || decision.zone !== primary.zone || decision.target !== primary.target) {
+    return { ok: false, holdClass: 'security', reason: '复合计划顶层 action/zone/target 必须与第 1 步完全一致' };
+  }
+  if (primary.zone !== reference.zone) {
+    return { ok: false, holdClass: 'security', reason: '复合计划不允许跨 zone' };
+  }
+  if (SERVICE_ZONES.has(primary.zone) || primary.zone === 'skills' || primary.zone === 'raw') {
+    return policyDenied(`zone ${primary.zone} 不允许普通复合计划`);
+  }
+
+  const firstDecision = operationWithSharedDecision(decision, primary);
+  const firstValidation = validateDecision({ instanceDir, decision: firstDecision, entry });
+  if (!firstValidation.ok || firstValidation.verdict !== 'file') return firstValidation;
+  const zone = firstValidation.zone;
+  const sourceRel = pageRel(zone, primary.target);
+  const sourceExists = existsSync(path.join(instanceDir, sourceRel));
+  if (primary.action === 'new_page' && sourceExists) {
+    return { ok: false, reason: `复合计划的新页已存在：${sourceRel}，需重新规划` };
+  }
+  if (primary.action === 'merge_into' && !sourceExists) {
+    return { ok: false, reason: `复合计划的合并源页不存在：${sourceRel}，需重新规划` };
+  }
+
+  if (badTarget(reference.target)) return { ok: false, reason: `append_reference target 不合法：${reference.target}` };
+  const targetRel = pageRel(zone, reference.target);
+  if (targetRel === sourceRel) return { ok: false, reason: 'append_reference 目标不能与被引用页相同' };
+  if (path.basename(targetRel) === 'README.md' || path.basename(targetRel).startsWith('_')) {
+    return policyDenied(`append_reference 不允许触碰结构页：${targetRel}`);
+  }
+  const targetAbs = path.join(instanceDir, targetRel);
+  if (!existsSync(targetAbs) || !statSync(targetAbs).isFile()) {
+    return { ok: false, reason: `append_reference 目标页不存在：${targetRel}` };
+  }
+  const appendCap = capabilityError(entry, 'page:append', `append reference to ${targetRel}`);
+  if (appendCap) return appendCap;
+  if (zone.privacy === 'sensitive') {
+    const sensitiveCap = capabilityError(entry, 'zone:sensitive-write', `write sensitive zone ${zone.id}`);
+    if (sensitiveCap) return sensitiveCap;
+  }
+  const targetRaw = readFileSync(targetAbs, 'utf8');
+  return {
+    ok: true,
+    verdict: 'file',
+    zone,
+    plan: {
+      firstDecision,
+      sourceRel,
+      targetRel,
+      targetHash: createHash('sha256').update(targetRaw).digest('hex'),
+    },
+  };
 }
 
 export async function applyDecision({ instanceDir, entry, decision, zone }) {
@@ -428,6 +657,54 @@ export async function applyDecision({ instanceDir, entry, decision, zone }) {
     case 'calibrate_core': return applyCoreCalibration({ instanceDir, entry }); // 特权整页替换；正文只取主人可见 core 草案
     default: throw new Error(`未知 action：${decision.action}`);
   }
+}
+
+function referenceLink(zone, sourceRel) {
+  const withinZone = sourceRel.startsWith(zone.path) ? sourceRel.slice(zone.path.length) : sourceRel;
+  return `[[${withinZone.replace(/\.md$/, '')}]]`;
+}
+
+function appendReference(instanceDir, entry, zone, plan) {
+  const targetAbs = path.join(instanceDir, plan.targetRel);
+  let text = readFileSync(targetAbs, 'utf8');
+  const currentHash = createHash('sha256').update(text).digest('hex');
+  if (currentHash !== plan.targetHash) throw new Error(`append_reference 目标在计划后已变化：${plan.targetRel}`);
+  const link = referenceLink(zone, plan.sourceRel);
+  if (text.includes(link)) {
+    return { changedPaths: [], detail: `${plan.targetRel} 已含 ${link}（幂等）` };
+  }
+  text = text.replace(/^updated: .*$/m, `updated: ${today()}`);
+  text = `${text.replace(/\s*$/, '')}\n\n- ${link}\n`;
+  writeFileSync(targetAbs, text);
+  return { changedPaths: [plan.targetRel], detail: `${plan.targetRel} 追加 ${link}` };
+}
+
+function assertReferenceTargetUnchanged(instanceDir, plan) {
+  const targetAbs = path.join(instanceDir, plan.targetRel);
+  if (!existsSync(targetAbs) || !statSync(targetAbs).isFile()) {
+    throw new Error(`append_reference 目标在计划后消失：${plan.targetRel}`);
+  }
+  const currentHash = createHash('sha256').update(readFileSync(targetAbs, 'utf8')).digest('hex');
+  if (currentHash !== plan.targetHash) throw new Error(`append_reference 目标在计划后已变化：${plan.targetRel}`);
+}
+
+export async function applyDecisionPlan({ instanceDir, entry, decision, validation }) {
+  const checked = validation ?? validateDecisionPlan({ instanceDir, decision, entry });
+  if (!checked.ok || checked.verdict !== 'file') throw new Error(checked.reason || '决定计划未通过校验');
+  if (!checked.plan) return applyDecision({ instanceDir, entry, decision, zone: checked.zone });
+  // 复合计划的全部既有目标先验完再开始第 1 次写，避免“先建页、后发现索引页已变”。
+  assertReferenceTargetUnchanged(instanceDir, checked.plan);
+  const first = await applyDecision({
+    instanceDir,
+    entry,
+    decision: checked.plan.firstDecision,
+    zone: checked.zone,
+  });
+  const second = appendReference(instanceDir, entry, checked.zone, checked.plan);
+  return {
+    changedPaths: [...new Set([...(first.changedPaths ?? []), ...(second.changedPaths ?? [])])],
+    detail: `${first.detail}；${second.detail}`,
+  };
 }
 
 // applySchema（D2b）：工具入口与 keeper approved_decision 入口共用。确定性三步 + doctor 校验 + errors>0 显式回滚。
@@ -621,20 +898,8 @@ function todoAdd(instanceDir, entry) {
 
 // 有界改动：把「进行中/待办」里唯一匹配的一条挪进「已完成」（- 原文 ✅ 日期，实例既有格式）
 function todoDone(instanceDir, decision) {
-  const rel = 'todo/owner.md';
+  const { rel, lines, needle, matches } = findTodoMatches(instanceDir, decision.target);
   const abs = path.join(instanceDir, rel);
-  const text = readFileSync(abs, 'utf8');
-  const needle = decision.target.trim();
-  const lines = text.split('\n');
-  const matches = [];
-  let inSection = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^## (进行中|待办)/.test(lines[i])) { inSection = true; continue; }
-    if (/^## /.test(lines[i])) { inSection = false; continue; }
-    if (!inSection) continue;
-    const itemText = lines[i].replace(/^(\d+\.|-)\s+/, '').trim();
-    if (itemText && (itemText === needle || itemText.includes(needle))) matches.push({ i, itemText });
-  }
   if (matches.length !== 1) {
     throw new Error(`todo_done 目标须唯一匹配，「${needle}」命中 ${matches.length} 条——请主人指明是哪条`);
   }
@@ -720,6 +985,22 @@ function mergeInto(instanceDir, entry, decision, zone) {
   const abs = path.join(instanceDir, rel);
   if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`目标页不存在：${rel}`);
   let text = readFileSync(abs, 'utf8');
+  const incoming = entry.body.trim();
+  // 精确重复是“目标已满足”，不是需要主人裁定的冲突。消费收件但不重复追加；
+  // 只认独立完整文本块，不把标题/长句里碰巧包含的一小段当成重复，也不做模糊去重。
+  const normalized = text.replace(/\r\n/g, '\n');
+  const needle = incoming.replace(/\r\n/g, '\n');
+  let exactBlock = false;
+  for (let at = needle ? normalized.indexOf(needle) : -1; at >= 0; at = normalized.indexOf(needle, at + 1)) {
+    const end = at + needle.length;
+    if ((at === 0 || normalized[at - 1] === '\n') && (end === normalized.length || normalized[end] === '\n')) {
+      exactBlock = true;
+      break;
+    }
+  }
+  if (exactBlock) {
+    return { changedPaths: [], detail: `${rel} 已含完全相同正文（幂等）` };
+  }
   // 分层不降级（spec §6.1）：目标页现档（无 tier 视同 canonical）与本次决定档取较高者——
   // 已 canonical 的页不因一次 candidate 合并被拉低；反向可晋升（canonical 内容并入 candidate 页 → 升 canonical）。
   const curTier = readTier(text);
@@ -730,7 +1011,7 @@ function mergeInto(instanceDir, entry, decision, zone) {
   if (effTier !== 'canonical' || hasExplicitTier(text)) text = setTierLine(text, effTier);
   // 溯源随归档注记行走，不上页级 frontmatter——一页可混多种认知类型，页头钉死单一 source/type 会说谎（spec §3.3）。
   const typeNote = decision.epistemic_type ? `，type: ${decision.epistemic_type}` : '';
-  text += `\n\n---\n\n**${today()} keeper 归档**（inbox ${entry.id}，来自 ${entry.client}，confidence ${decision.confidence}${typeNote}）：\n\n${entry.body.trim()}\n`;
+  text += `\n\n---\n\n**${today()} keeper 归档**（inbox ${entry.id}，来自 ${entry.client}，confidence ${decision.confidence}${typeNote}）：\n\n${incoming}\n`;
   writeFileSync(abs, text);
   return { changedPaths: [rel], detail: rel };
 }

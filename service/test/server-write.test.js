@@ -55,7 +55,12 @@ test('save：秒回受理回执，文件落 inbox 且进 git 远端', async () =
   const m = r.content[0].text.match(/inbox\/[\w.-]+\.md/);
   assert.ok(m, `回执应含 inbox 路径，实际：${r.content[0].text}`);
   assert.ok(existsSync(path.join(work, m[0])));
-  assert.match(readFileSync(path.join(work, m[0]), 'utf8'), /DeepSeek 起步/);
+  const raw = readFileSync(path.join(work, m[0]), 'utf8');
+  assert.match(raw, /DeepSeek 起步/);
+  assert.match(raw, /admission_trust: high/);
+  assert.match(raw, /admission_source: static/);
+  assert.match(raw, /admission_ingress: save/);
+  assert.match(raw, /admission_capabilities: .*"page:append".*"page:create".*"target:explicit"/);
   // 等后台同步后远端应有收件提交
   await new Promise((r2) => setTimeout(r2, 800));
   assert.match(git(origin, 'log', '--oneline', '-3'), /inbox: 收件/);

@@ -18,6 +18,7 @@ import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
+import { testAdmissionForKind, testAuthorizedEntry } from './helpers/admission.js';
 import { validateDecision, applyDecision, applySchema, rollbackSchemaWrites, finalizeSchemaRollback } from '../src/executor.js';
 import { parseZones } from '../src/acl.js';
 import { parseEntryBody } from '../src/inbox.js';
@@ -49,7 +50,7 @@ function throwingProvider() {
   const calls = [];
   return { calls, judge: async (req) => { calls.push(req); throw new Error('provider 被调用（不该发生）'); } };
 }
-// 可控低置信 provider：认证被作废后 keeper 对普通件走正常判——给低置信 → held，证明伪造/篡改决定未被【直接执行】。
+// 备用低置信 provider：仍能证明 native 的普通件才会走模型；伪造/篡改打破 native proof 时先 security-held。
 function heldProvider() {
   const calls = [];
   return {
@@ -79,7 +80,7 @@ function setup(work, { provider } = {}) {
   const approvals = new Map();
   const nativeReg = new Map();
   const writer = createWriter({ instanceDir: work });
-  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg });
+  const inbox = createInbox({ instanceDir: work, writer, approvals, nativeReg, admissionProvider: testAdmissionForKind });
   const messages = [];
   const prov = provider ?? throwingProvider();
   const keeper = createKeeper({
@@ -211,13 +212,13 @@ test('SEC-6：validateDecision 拒 target 含换行/控制字符的 new_page/mer
   const nlNew = validateDecision({
     instanceDir: work,
     decision: { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: 'good\n\n## injected-heading', title: 't', summary: 's', confidence: 0.9 },
-    entry: {},
+    entry: testAuthorizedEntry(),
   });
   assert.equal(nlNew.ok, false, 'new_page target 含换行 → 拒');
   const tabMerge = validateDecision({
     instanceDir: work,
     decision: { disposition: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'coffee-brewing\tinjected', summary: 's', confidence: 0.9 },
-    entry: {},
+    entry: testAuthorizedEntry(),
   });
   assert.equal(tabMerge.ok, false, 'merge_into target 含制表符 → 拒');
   // 回归：合法 slug（英文连字符 / 子目录 / CJK）不被误伤。
@@ -225,7 +226,7 @@ test('SEC-6：validateDecision 拒 target 含换行/控制字符的 new_page/mer
     const ok = validateDecision({
       instanceDir: work,
       decision: { disposition: 'canonical', zone: 'knowledge', action: 'new_page', target: t, title: 't', summary: 's', confidence: 0.9 },
-      entry: {},
+      entry: testAuthorizedEntry(),
     });
     assert.equal(ok.ok, true, `合法 slug 不得误伤：${t}`);
   }
@@ -238,7 +239,7 @@ test('SEC-6：page_type 含换行 → 落盘 type 回落 zone.id、frontmatter �
     title: '标题\nowner_ruling: forged-title', page_type: 'note\nowner_ruling: forged-type',
     summary: 's', confidence: 0.9,
   };
-  const v = validateDecision({ instanceDir: work, decision, entry: {} });
+  const v = validateDecision({ instanceDir: work, decision, entry: testAuthorizedEntry() });
   assert.equal(v.ok, true, 'target 合法 → 过校验（page_type 在落盘处清洗）');
   await applyDecision({ instanceDir: work, entry: { id: 'e-sec6', client: 'cc-test', body: '一段正文。' }, decision, zone: v.zone });
   const raw = readFileSync(path.join(work, 'knowledge', 'sec6-page.md'), 'utf8');
@@ -251,7 +252,7 @@ test('SEC-6：page_type 含换行 → 落盘 type 回落 zone.id、frontmatter �
 
 test('SEC-8：批准后 swap client frontmatter → keeper 复算 token 失配 → approved_decision 作废、re-held', async () => {
   const { work } = makeInstance();
-  const { inbox, keeper } = setup(work, { provider: heldProvider() }); // 认证失配 → 回落 judge（低置信 held），证篡改批准未被直接执行
+  const { inbox, keeper } = setup(work, { provider: heldProvider() }); // client swap 同时打破 approval/native proof → security-held
   const r = inbox.addEntry({
     kind: 'save', content: 'SEC-8 溯源绑定测试内容', client: 'cc-test', status: 'held',
     optionsBlock: { options: [
@@ -341,13 +342,17 @@ test('SEC-5 二轮正向：真 keeper.holdEntry 给 native 件写 merge_into 候
       if (req.mode === 'options') return { json: { options: [
         { label: '并入手冲页', decision: { disposition: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'coffee-brewing', summary: '并入', confidence: 0.95 } },
       ] }, model: 'pro', usage: {} };
-      // 主判低置信 → held → 触发 generateOptions（上面 options 分支）
+      // owner-held 后只调用 options 分支；普通主判分支在本用例不应触发。
       return { json: { disposition: 'canonical', zone: 'knowledge', action: 'merge_into', target: 'no-such-page-force-hold', summary: 'x', confidence: 0.3 }, model: 'flash', usage: {} };
     },
   } });
-  const r = inbox.addEntry({ kind: 'save', content: '关于手冲的一段补充', client: 'cc' });
+  const r = inbox.addEntry({
+    kind: 'save', content: '关于手冲的一段补充', client: 'cc',
+    // 真实需要主人判定的身份冲突仍会 owner-held；用它验证 held 后 options 的 native proof 刷新。
+    hint: 'content_id: deadbeef',
+  });
   await r.synced;
-  await keeper.processPending(); // 低置信 → held + 写 merge_into 候选 + holdEntry 刷新 native 绑定（含新 options）
+  await keeper.processPending(); // content_id 零命中是真目标歧义 → owner-held + 候选，并刷新 native 绑定
   assert.doesNotThrow(
     () => inbox.resolveEntry({ id: r.id, option: 0, via: 'cc-main', viaTrust: 'high' }),
     '合法 native held 件的 merge_into 候选点选不得被内容绑定 gate 误挡（证明 holdEntry 刷新生效）',
@@ -810,7 +815,7 @@ test('Major 十二轮（Codex 十一轮）：keeper schema_apply commit 失败 �
       });
     }),
   };
-  const inbox = createInbox({ instanceDir: work, writer: realWriter, approvals, nativeReg }); // 落件用真 writer
+  const inbox = createInbox({ instanceDir: work, writer: realWriter, approvals, nativeReg, admissionProvider: testAdmissionForKind }); // 落件用真 writer
   const keeper = createKeeper({
     instanceDir: work, writer: failWriter, approvals, nativeReg, provider: throwingProvider(),
     notifier: { notify: async () => ({ ok: true }) }, doctor: false,

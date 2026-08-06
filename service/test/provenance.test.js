@@ -12,6 +12,7 @@ import { mkdtempSync, cpSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { validateDecision, applyDecision } from '../src/executor.js';
+import { testAuthorizedEntry } from './helpers/admission.js';
 
 const fixtureDir = fileURLToPath(new URL('./fixture/instance', import.meta.url));
 function tmpInstance(tag) {
@@ -22,7 +23,7 @@ function tmpInstance(tag) {
 
 // 生产同序：先 validateDecision（就地归一 epistemic_type/tier），再 applyDecision 落盘。
 function fileIt(dir, decision, entry) {
-  const v = validateDecision({ instanceDir: dir, decision, entry });
+  const v = validateDecision({ instanceDir: dir, decision, entry: testAuthorizedEntry(entry) });
   assert.ok(v.ok, `本用例前置：decision 应校验通过（实际 reason=${v.reason ?? ''}）`);
   return applyDecision({ instanceDir: dir, entry, decision, zone: v.zone });
 }
@@ -52,7 +53,7 @@ test('epistemic_type 非法值 → 归一 null、不拒件；落盘省略该行�
     target: 'note-x', title: 'x', epistemic_type: 'made-up-type',
     summary: 's', confidence: 0.9,
   };
-  const v = validateDecision({ instanceDir: dir, decision, entry: {} });
+  const v = validateDecision({ instanceDir: dir, decision, entry: testAuthorizedEntry() });
   assert.equal(v.ok, true, '非法 epistemic_type 绝不拒件（元数据容错）');
   assert.equal(decision.epistemic_type, null, '就地归一 null（审计里 decision = 落盘事实）');
   await applyDecision({ instanceDir: dir, entry: { id: 'e2', client: 'hermes', body: '一段正文。' }, decision, zone: v.zone });
@@ -68,7 +69,7 @@ test('epistemic_type 缺省 → 归一 null、不拒件（假 provider/旧金标
     disposition: 'canonical', zone: 'knowledge', action: 'new_page',
     target: 'note-y', title: 'y', summary: 's', confidence: 0.9,
   };
-  const v = validateDecision({ instanceDir: dir, decision, entry: {} });
+  const v = validateDecision({ instanceDir: dir, decision, entry: testAuthorizedEntry() });
   assert.equal(v.ok, true, '缺 epistemic_type 字段照样过校验');
   assert.equal(decision.epistemic_type, null, '缺省归一 null');
 });

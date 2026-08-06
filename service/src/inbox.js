@@ -1,6 +1,6 @@
 // inbox 隔离区：一切写入先落这里（写路径无 LLM，秒回受理回执），keeper 审核后才进正式区。
 // 凭据红线在落盘之前扫——命中即拒收，密钥永不进 git。
-import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { containsCredential } from './secrets.js';
@@ -23,6 +23,106 @@ export function normKind(k) {
 // 首段长度上限放到 12：只为防伪造件灌长文本，不过拟合当前时间戳位数（base36 毫秒到 2059 年也才 9 位）。
 export const ID_FORMAT = /^[a-z0-9]{1,12}-[a-f0-9]{4}$/;
 
+// AdmissionContext = 写入入口在认证完成后签发的最小权限信封。它随 inbox 件落盘供 keeper 做
+// effect-level 校验，但【是否可信】仍只认 nativeReg 的内容绑定 token；git pull 伪造这些字段不会获得权限。
+// capability 由服务端按「入口 × 身份」确定，LLM 只能在其中选动作，confidence 永远不能扩权。
+export const ADMISSION_CAPABILITIES = new Set([
+  'page:create', 'page:append', 'target:explicit', 'zone:sensitive-write',
+  'todo:add', 'todo:complete', 'collection:insert', 'collection:upsert', 'page:remove',
+  'skill:stage', 'skill:replace', 'schema:propose', 'core:propose',
+]);
+
+function safeAdmissionAtom(value, fallback) {
+  const s = String(value ?? '').trim();
+  return /^[a-zA-Z0-9._:-]{1,80}$/.test(s) ? s : fallback;
+}
+
+export function normalizeAdmission(admission, { kind = '' } = {}) {
+  const a = admission && typeof admission === 'object' ? admission : {};
+  const capabilities = [...new Set(Array.isArray(a.capabilities) ? a.capabilities : [])]
+    .filter((c) => ADMISSION_CAPABILITIES.has(c)).sort();
+  return {
+    trust: safeAdmissionAtom(a.trust, 'unknown'),
+    source: safeAdmissionAtom(a.source, 'unknown'),
+    channel: safeAdmissionAtom(a.channel, 'default'),
+    ingress: safeAdmissionAtom(a.ingress, normKind(kind) || 'unknown'),
+    capabilities,
+  };
+}
+
+// 唯一 capability 铸造表。网络入口必须把已认证 identity 传进来；缺 identity 得到零权限，绝不隐式 high。
+// capture 是软投递入口：只允许新增型副作用，不允许指定/追加既有页、完成待办、覆盖行或碰 sensitive/Skill。
+export function createAdmission({ identity, ingress, kind = ingress } = {}) {
+  const trust = identity?.trust ?? 'unknown';
+  const source = identity?.source ?? 'unknown';
+  const channel = identity?.channel ?? 'default';
+  const caps = [];
+  if (ingress === 'capture' && ['high', 'low', 'capture'].includes(trust)) {
+    caps.push('page:create', 'todo:add', 'collection:insert');
+  } else if (trust === 'high') {
+    // save 是高信任通用“请存下”入口：除页面 create/append 外，也允许与 capture 同族的
+    // 非覆盖型 typed add（todo / collection insert）。否则同一内容经低权 capture 能自动归类，
+    // 经 high save 反而会卡 policy repair，权限会出现反直觉倒挂。
+    if (ingress === 'save') caps.push(
+      'page:create', 'page:append', 'target:explicit', 'zone:sensitive-write', 'skill:stage', 'skill:replace',
+      'todo:add', 'collection:insert',
+    );
+    else if (ingress === 'remember') caps.push('page:create', 'page:append', 'zone:sensitive-write');
+    else if (ingress === 'todo_add') caps.push('todo:add');
+    else if (ingress === 'todo_done') caps.push('todo:complete');
+    else if (ingress === 'collections_upsert') caps.push('collection:upsert');
+    else if (ingress === 'remove') caps.push('page:remove');
+    else if (ingress === 'schema_propose') caps.push('schema:propose');
+  } else if (trust === 'system' && ingress === 'core_calibration') {
+    caps.push('core:propose');
+  }
+  return normalizeAdmission({ trust, source, channel, ingress, capabilities: caps }, { kind });
+}
+
+function firstFrontmatter(raw) {
+  const block = String(raw ?? '').match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? '';
+  const out = {};
+  for (const line of block.split(/\r?\n/)) {
+    const m = line.match(/^(\w[\w-]*): (.*)$/);
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
+export function admissionFromRaw(raw, { kind = '' } = {}) {
+  const fm = firstFrontmatter(raw);
+  let capabilities = [];
+  try { capabilities = JSON.parse(fm.admission_capabilities ?? '[]'); } catch { capabilities = []; }
+  return normalizeAdmission({
+    trust: fm.admission_trust,
+    source: fm.admission_source,
+    channel: fm.admission_channel,
+    ingress: fm.admission_ingress,
+    capabilities,
+  }, { kind: fm.kind ?? kind });
+}
+
+// token 只排除 status/keeper_held_at/owner_ruling 等合法状态迁移字段；所有会影响执行的 ingress 数据都绑定。
+function executionEnvelope(raw, fallback = {}) {
+  const fm = firstFrontmatter(raw);
+  const kind = normKind(fm.kind ?? fallback.kind);
+  const admission = admissionFromRaw(raw, { kind });
+  const parsed = parseEntryBody(String(raw ?? ''));
+  const optBlocks = [...String(raw ?? '').matchAll(/<!--keeper-options\r?\n([\s\S]*?)\r?\n-->/g)];
+  return {
+    id: fm.id ?? fallback.id ?? '',
+    rel: fallback.rel ?? '',
+    kind,
+    client: fm.client ?? fallback.client ?? '',
+    received_at: fm.received_at ?? '',
+    hint: fm.hint ?? '',
+    collection: fm.collection ?? '',
+    admission,
+    content: parsed.content,
+    options: optBlocks.length ? optBlocks.at(-1)[1] : '',
+  };
+}
+
 // inbox_list 预览窗口（listEntries 返回 content.slice(0, N)）。schema payload 提取共用它做「payload 必须完整落在预览窗口内」硬门禁
 // （十二轮 Codex）——保证「主人在 inbox_list 预览里看得到的」==「applySchema/schema_apply 实际落地的」，杜绝把 payload 埋在
 // 预览截断之外偷偷落地（纯截断 Major）。
@@ -36,13 +136,13 @@ export const CORE_PROPOSAL_PREVIEW_CHARS = 4000;
 // schema_apply 等副作用、放宽到「非 forbidden 全 gate」 → 四轮 Codex 指出 forbidden 也非无副作用（主人裁定 reject 会写
 // keeper-feedback/_cases.md 判例考卷、被伪造件注入攻击者字段污染 few-shot）→ 收口为【全部候选一律 native】。
 
-// F1（Critical）进程内批准登记表：resolveEntry 是【唯一】合法批准入口（MCP inbox_resolve / App
-// /capture/resolve 都经它、都在本进程）。它敲定 ruling+approvedDecision 后向 approvals Map 记一笔
+// F1（Critical）持久批准登记表：resolveEntry 是【唯一】合法批准入口（MCP inbox_resolve / App
+// /capture/resolve 都经它）。它敲定 ruling+approvedDecision 后向 git 外 approvals 子表记一笔
 // id→{token, viaTrust}；keeper 只在登记表命中且 token 匹配时才认「主人批准」，绝不信文件里裸的
-// owner_ruling / owner-decision 块（git pull 可伪造任何 frontmatter/正文）。createApp 建这一个 Map、
-// 经 app.locals.approvals 同时给 inbox 与 keeper。缺省 new Map()：单独构造的 inbox（无共享 Map）
+// owner_ruling / owner-decision 块（git pull 可伪造任何 frontmatter/正文）。createApp 从 native registry
+// 取得同一个持久子表，经 app.locals.approvals 同时给 inbox 与 keeper。缺省 new Map()：单独构造的 inbox（无共享 Map）
 // 记的账无人核验 = 安全失败（相关件重判/re-held），不会误放行。
-// token 覆盖 id+ruling+decision + rel + 被批文件正文（G1）；viaTrust（capture/high…）另存 Map value——
+// token 覆盖 id+ruling+decision + rel + 被批文件正文（G1）；viaTrust（capture/high…）另存记录字段——
 // 通道限权（capture 无权删页）是认证相关决定，同样只认 registry，不认文件里的 ruling_via_trust（伪造件可随意改写它）。
 // G1（Critical）approve-then-swap：旧 token 只绑 id+ruling+decision，keeper/executor 之后又【重读可变文件】
 // 拿 payload（schema applySchema）/body（new_page/merge_into）——批准落定后经 git pull 换掉正文/payload
@@ -57,8 +157,11 @@ export const CORE_PROPOSAL_PREVIEW_CHARS = 4000;
 // SEC-8（审计 B）：client（frontmatter 溯源字段，落进新页 source_agent）原不进 token——批准落定后经 pull 换 client
 // 即伪造溯源（不可执行、仅溯源欺骗）。故 client 也绑进哈希（尾部追加）；client 是 resolveEntry 从不改写的稳定字段，
 // 绑它安全；swap client → 哈希失配 → 不认证 → re-held。两处调用点（resolveEntry 记账 / keeper 复算）须同源传值。
-export function approvalToken({ id, ruling, decision, rel = '', kind = '', content = '', client = '' }) {
-  const norm = `${id}\n${oneline(ruling)}\n${decision ? JSON.stringify(decision) : ''}\n${rel}\n${kind}\n${content}\n${client}`;
+export function approvalToken({ id, ruling, decision, rel = '', kind = '', content = '', client = '', hint = '', admission = null, raw = null }) {
+  const envelope = raw == null
+    ? { id, rel, kind: normKind(kind), client: oneline(client), received_at: '', hint: oneline(hint), collection: '', admission: normalizeAdmission(admission, { kind }), content, options: '' }
+    : executionEnvelope(raw, { id, rel, kind, client });
+  const norm = `${JSON.stringify(envelope)}\n${oneline(ruling)}\n${decision ? JSON.stringify(decision) : ''}`;
   return crypto.createHash('sha256').update(norm).digest('hex');
 }
 
@@ -66,14 +169,6 @@ export function approvalToken({ id, ruling, decision, rel = '', kind = '', conte
 // 块【原文】。两者跨 keeper 注记稳定——rewriteEntry 追加的 `\n---\n**keeper …` 注记落在 content 截断点之后、
 // 也不在 options 正则的目标块内；故同一件在「addEntry 写盘 → keeper 复算 → resolveEntry 复算」三处算出同一 token。
 // 绑 options【原文子串】（而非 parse→再 stringify）避免序列化归一漂移，三处按同一 fileText/raw 取到逐字节相同的块。
-function nativeBindMaterial(raw) {
-  const s = String(raw ?? '');
-  const content = parseEntryBody(s).content;
-  const optBlocks = [...s.matchAll(/<!--keeper-options\r?\n([\s\S]*?)\r?\n-->/g)];
-  const optionsRaw = optBlocks.length ? optBlocks[optBlocks.length - 1][1] : '';
-  return { content, optionsRaw };
-}
-
 // SEC-2/SEC-5 加固（审计 B 二轮 + Codex 异源对抗 review 实证）：服务端亲生件的【内容绑定】token。
 // 为什么不能只按 id 判定 native（一轮 Set<id> 的洞）：inbox 件 id 是【公开的】——addEntry 落盘即 commit+push、
 // git log 可见。攻击者复用任意历史 native id 伪造 `kind:remove` 件即命中「id 集合」→ 绕过 SEC-2 零交互删页；
@@ -82,22 +177,31 @@ function nativeBindMaterial(raw) {
 // 不同即 token 失配 → 非 native；复用得【逐字节完全一致】才命中，但那等于重放主人原本就授权的同一动作
 // （re-delete 已删页=no-op / 同一 options 同一选择），无新增能力。与 approvalToken 同族、同 parseEntryBody 归一。
 export function nativeToken({ id, rel = '', kind = '', client = '', raw = '' }) {
-  const { content, optionsRaw } = nativeBindMaterial(raw);
-  const norm = `${id}\n${rel}\n${normKind(kind)}\n${oneline(client)}\n${content}\n${optionsRaw}`;
+  const norm = JSON.stringify(executionEnvelope(raw, { id, rel, kind, client }));
   return crypto.createHash('sha256').update(norm).digest('hex');
 }
 
-// nativeReg（进程内 Map<id, nativeToken>）：语义/重启行为同 approvals 登记表（进程内、重启即空、安全失败）。
-// addEntry 记账（id→token）、keeper/resolveEntry 复算比对、终态（filed / 主人裁定清场）删账。createApp 建这一个
-// Map、经 app.locals.nativeReg 同时给 inbox 与 keeper/nightly（缺省 new Map()：单独构造的 inbox 记的账无人核验
-// = 安全失败，不会误放行）。
-export function createInbox({ instanceDir, writer, indexStore = null, approvals = new Map(), nativeReg = new Map() }) {
+// HTTP/MCP 写入口按“本地落盘即受理”秒回，不会 await receipt.synced。给原 promise 挂一个
+// 只记录状态、不吞掉其 rejection 的观察器，避免 git add/commit 级故障变成 Node 未处理拒绝；
+// 显式 await receipt.synced 的内部 worker/测试仍会收到同一个 rejection。
+function observeBackgroundSync(sync, id) {
+  const promise = Promise.resolve(sync);
+  void promise.catch(() => {
+    console.error(`inbox ${id} 后台 git 同步失败（本地收件与 proof 已保留，等待 keeper/运维重试）`);
+  });
+  return promise;
+}
+
+// nativeReg：生产 createApp 注入 git 外持久 registry，使 pending 件跨进程重启仍能证明来自认证入口；
+// addEntry 记账（id→token）、keeper/resolveEntry 复算比对、终态（filed / 主人裁定清场）删账。
+// 测试/独立构造仍可注入 Map，但 inbox 与 keeper 必须共享同一实例，否则安全失败、不会误放行。
+export function createInbox({ instanceDir, writer, indexStore = null, approvals = new Map(), nativeReg = new Map(), admissionProvider = null }) {
   // status/optionsBlock（M4.4 D2）：提案件创建即 status:'held'（直达主人，不经 keeper LLM）并带确定性候选块，
   // 走与 keeper held 同一条点选预批通路（resolveEntry({option}) → owner-decision → keeper 直执行）。缺省保持旧行为。
   // queuedWrite（G4）：把「写入」也放进 writer.transact，与 commit 在同一队列串行点成对发生。夜班（nightly）
   // 提案走这条——否则 writeFileSync 在队列外先落盘，并发 keeper 的 paths:['.'] 提交可能把半写的提案文件卷进
   // 无关 commit（git 历史不整洁）。缺省 false：save/capture/resolve 等其余写路径行为不变。
-  function addEntry({ kind, content = '', hint, client, payload, status = 'pending', optionsBlock = null, queuedWrite = false }) {
+  function addEntry({ kind, content = '', hint, client, payload, admission, status = 'pending', optionsBlock = null, queuedWrite = false }) {
     if (!KINDS.has(kind)) throw new Error(`未知的 kind：${kind}`);
     const scanTarget = `${content}\n${payload ? JSON.stringify(payload) : ''}\n${hint ?? ''}`;
     // 凭据模式要求连续字符——把 key 用空格/换行/零宽字符切碎（`sk-ab cd ef…` / `sk-abcdefghij\n0123…` /
@@ -117,6 +221,8 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
 
     const id = `${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;
     const receivedAt = new Date().toISOString();
+    const suppliedAdmission = admission ?? admissionProvider?.({ kind, client, hint, payload });
+    const admitted = normalizeAdmission(suppliedAdmission, { kind });
     // `_` 前缀 = doctor 的结构页豁免（流水条目不做孤儿/互链/索引检查）
     const filename = `_${receivedAt.slice(0, 10)}-${id}.md`;
     const relPath = `inbox/${filename}`;
@@ -133,6 +239,11 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
       `kind: ${kind}`,
       ...(hint ? [`hint: ${oneline(hint)}`] : []),
       ...(payload?.name ? [`collection: ${oneline(payload.name)}`] : []),
+      `admission_trust: ${admitted.trust}`,
+      `admission_source: ${admitted.source}`,
+      `admission_channel: ${admitted.channel}`,
+      `admission_ingress: ${admitted.ingress}`,
+      `admission_capabilities: ${JSON.stringify(admitted.capabilities)}`,
       // status:'held' 的提案件同时落 keeper_held_at 机器标记：resolveEntry 只信 frontmatter 这个键算 held→裁定
       // 耗时（held_ms 曲线），令提案件的这条曲线同样有效（正文伪造无法进 frontmatter）。
       ...(status === 'held' ? [`keeper_held_at: ${receivedAt}`] : []),
@@ -148,24 +259,37 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
 
     const abs = path.join(instanceDir, relPath);
     const fileText = fm + body;
-    // SEC-2/SEC-5 加固：登记「服务端亲生件」的【内容绑定】token——按最终写盘文本算（keeper/resolveEntry 读回
-    // 同一文本复算同款 token 命中即 native；被 git pull 换掉正文/kind/options 即失配 → 非 native）。伪造件从不
-    // 经 addEntry、复用公开 id 也因内容不符而失配。见 nativeToken 注释。语义/重启同 approvals（进程内、重启即空）。
-    nativeReg.set(id, nativeToken({ id, rel: relPath, kind, client, raw: fileText }));
+    const proof = nativeToken({ id, rel: relPath, kind, client, raw: fileText });
     const message = `inbox: 收件 ${id} (${kind} via ${client})`;
     mkdirSync(path.join(instanceDir, 'inbox'), { recursive: true });
+
+    // 文件是被授权对象、registry 是它的证明：必须先把对象完整写下，再签发证明。若 registry 持久化失败，
+    // 立即撤销刚创建的文件，让调用方看到明确失败；不能留下「有 proof 没文件」的幽灵权限，也不能留下
+    // 「有文件但本次受理其实失败」的孤儿件。后续 git 同步失败则不同：文件+proof 已构成本地 durable 受理，
+    // 只进入 sync_pending/运维重试，绝不能回滚后让客户端重复投递。
+    const acceptLocally = () => {
+      writeFileSync(abs, fileText, { flag: 'wx' });
+      try {
+        // SEC-2/SEC-5：登记「服务端亲生件」的内容绑定 token。keeper/resolveEntry 从最终文件复算；
+        // git pull 换掉正文/kind/options 或伪造件复用公开 id 都会失配。生产 registry 在 git 外持久化。
+        nativeReg.set(id, proof);
+      } catch (e) {
+        try { rmSync(abs, { force: true }); } catch { /* 无 proof 的残件仍是 fail closed，原错误更可诊断 */ }
+        throw e;
+      }
+    };
 
     const receipt = { id, path: relPath, status };
     if (queuedWrite) {
       // G4：write 与 commit 同进 transact——写与提交边界一致，并发的整树提交不会卷进半写文件。
-      receipt.synced = writer.transact(async (commit) => {
-        writeFileSync(abs, fileText);
+      receipt.synced = observeBackgroundSync(writer.transact(async (commit) => {
+        acceptLocally();
         return commit({ paths: [relPath], message });
-      });
+      }), id);
     } else {
       // 落盘即受理；git 同步在后台单写者队列里完成，不阻塞回执
-      writeFileSync(abs, fileText);
-      receipt.synced = writer.commitAndPush({ paths: [relPath], message });
+      acceptLocally();
+      receipt.synced = observeBackgroundSync(writer.commitAndPush({ paths: [relPath], message }), id);
     }
     return receipt;
   }
@@ -188,6 +312,8 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
         const nativeCore = kind === 'core' && nativeReg.get(id) === nativeToken({ id, rel, kind, client, raw });
         return {
           id, path: rel, kind, status: get('status'),
+          held_class: get('held_class') || undefined,
+          retry_exhausted: get('retry_exhausted') === 'true' || undefined,
           received_at: get('received_at'), hint: get('hint') || undefined,
           client, excerpt: parsed.content.slice(0, 120),
           content: parsed.content.slice(0, nativeCore ? CORE_PROPOSAL_PREVIEW_CHARS : INBOX_PREVIEW_CHARS),
@@ -223,8 +349,8 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
       // gate），四轮收口为全部候选一律 native。
       // 一轮只按 id 判 native 被公开 id 复用打穿（Codex/自验 PoC）；此处内容绑定校验——伪造件复用 id 但正文/options 不符
       // → 失配；【当前 native held 件的 options 被 git pull 篡改】（id 不变）→ 重算 token 与登记值不符 → 同样拒。
-      // 合法候选只在亲生且未篡改件上出现。重启语义：nativeReg 进程内、重启即空——重启后合法 held 件的候选点选会被挡；
-      // 主人可改用文字裁定（无 option、keeper 重判、非攻击者可控）表达丢弃/裁决，或重新触发。安全失败、同 approvals。
+      // 合法候选只在亲生且未篡改件上出现。生产 registry 位于 git 外并跨重启保留；若状态损坏/缺失则安全失败，
+      // 候选点选会被挡，主人仍可在高信任通道用文字裁定有意识地接管。
       if (nativeReg.get(id) !== nativeToken({ id, rel: hit.path, kind: hit.kind, client: hit.client, raw: optRaw })) {
         throw new Error('该件疑似伪造或被篡改（内容绑定校验不符），拒绝点选候选——请复核来源或改用文字裁定');
       }
@@ -233,6 +359,7 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
     }
     if (!ruling?.trim()) throw new Error('ruling 不能为空');
     let raw = readFileSync(abs, 'utf8');
+    const originalRaw = raw;
     // held→被裁定耗时（供使用仪表的 held 半衰期曲线）：只信 keeper 写进【frontmatter】的机器可辨标记
     // keeper_held_at——它在文件首个 ---…--- 块内，正文数据无法伪造进去（旧版全文扫 **keeper held**
     // 文本注记会被捕获正文里巧合/恶意的同款字样污染）。keeper 每次 held 覆盖该字段 → 天然取最后一次。
@@ -251,7 +378,11 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
       .replace(/^tier: .*\n/m, '')
       .replace(/^owner_ruling: .*\n/m, '')
       .replace(/^ruling_via: .*\n/m, '')
-      .replace(/^ruling_via_trust: .*\n/m, '');
+      .replace(/^ruling_via_trust: .*\n/m, '')
+      .replace(/^held_class: .*\n/m, '')
+      .replace(/^retry_count: .*\n/m, '')
+      .replace(/^retry_after: .*\n/m, '')
+      .replace(/^retry_exhausted: .*\n/m, '');
     const rulingLines = [
       `owner_ruling: ${oneline(ruling)}`,
       ...(via ? [`ruling_via: ${oneline(via)}`, `ruling_via_trust: ${oneline(viaTrust ?? '')}`] : []),
@@ -265,13 +396,20 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
     // F1/G1：记账进批准登记表。token 覆盖 id+ruling+decision + rel + 被批文件正文（按最终落盘 raw 算——
     // status/owner_ruling/owner-decision 改动已写完）。keeper 读回同一文件复算同款 token 比对；批准后正文/payload
     // 被 pull-swap 换掉即失配 → 不认证。viaTrust 另存（通道限权只认这里）。同 id 覆盖取最后一次裁定（再批即新账）。
-    approvals.set(id, {
-      // SEC-8（审计 B）：token 追加 client=hit.client（与 keeper 复算处 entry.client 同源同值）——绑溯源字段，
-      // 防 approve-then-swap 改 client 伪造新页 source_agent。
-      token: approvalToken({ id, ruling, decision: approvedDecision, rel: hit.path, kind: hit.kind, content: parseEntryBody(raw).content, client: hit.client }),
-      viaTrust: viaTrust ?? null,
-      viaChannel: viaChannel ?? null,
-    });
+    try {
+      approvals.set(id, {
+        // SEC-8（审计 B）：token 追加 client=hit.client（与 keeper 复算处 entry.client 同源同值）——绑溯源字段，
+        // 防 approve-then-swap 改 client 伪造新页 source_agent。
+        token: approvalToken({ id, ruling, decision: approvedDecision, rel: hit.path, kind: hit.kind, client: hit.client, raw }),
+        viaTrust: viaTrust ?? null,
+        viaChannel: viaChannel ?? null,
+      });
+    } catch (e) {
+      // 批准 proof 与 owner_ruling/decision 文件必须同生：proof 持久化失败时恢复原件，
+      // 不能留下“看似已裁定、重启后却会被模型重新解释”的半批准状态。
+      writeFileSync(abs, originalRaw);
+      throw e;
+    }
     // 缺陷2b：复位后刷新派生索引——件现为 status:pending（不再满足隔离-rejected 双条件），updatePage 会
     // DELETE 掉它此前作为 rejected 入的旧行、不再重插。索引在 git 之外、可随时重建，故刷新失败绝不影响复位
     // 落盘，只记日志（与 keeper.refreshIndex 同规矩：索引故障不阻断写路径）。
@@ -280,7 +418,10 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
       catch (e) { console.error(`复位后索引刷新失败（不影响复位）：${e.message}`); }
     }
     const receipt = { id, path: hit.path, status: 'pending', ruling: oneline(ruling), held_at: heldAt, resolved_at: resolvedAt, held_ms: heldMs };
-    receipt.synced = writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` });
+    receipt.synced = observeBackgroundSync(
+      writer.commitAndPush({ paths: [hit.path], message: `inbox: 主人裁定 ${id}` }),
+      id,
+    );
     return receipt;
   }
 
@@ -297,7 +438,11 @@ function oneline(v) {
 // 正文里的机器块起始标记中和成可见字面量（&lt;!--…）：既非注释、也不被 options 正则解析，主人反而看得见。合法用户绝不会写这个
 // 内部标记，中和只影响伪造/越权内容。
 function neutralizeMachineMarkers(text) {
-  return String(text).replace(/<!--(\s*(?:keeper-options|owner-decision))/gi, '&lt;!--$1');
+  return String(text)
+    .replace(/<!--(\s*(?:keeper-options|owner-decision))/gi, '&lt;!--$1')
+    // parseEntryBody 用这条分隔符识别服务端 keeper 注记；用户正文若能原样携带它，后半段会被误当
+    // 机器注记静默截掉。入口处只实体化 keeper 后的空格，渲染仍可读、解析器不再误认。
+    .replace(/(^|\r?\n)---\r?\n\*\*keeper\s/gi, '$1---\n**keeper&#32;');
 }
 
 // 单趟【三态】扫描器：把文本切成有序 segments（kind: 'text' | 'comment' | 'fence'），拼接 [start,end) == 原文。
