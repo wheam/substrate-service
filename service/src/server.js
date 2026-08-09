@@ -25,6 +25,7 @@ import { createIndexStore } from './index-store.js';
 import { createRecall } from './recall.js';
 import { normalizeInclude } from './tier.js';
 import { createNativeRegistry } from './native-registry.js';
+import { createNudgeState, nudgeCredentialKey } from './nudge-state.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
@@ -46,7 +47,7 @@ const validIdentity = (id) =>
   !!id && typeof id === 'object' && typeof id.client === 'string'
   && (id.trust === 'high' || id.trust === 'low' || id.trust === 'capture');
 
-export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 14_400_000, nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json'),
+export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 259_200_000, nudgeStatePath = path.resolve(instanceDir, '..', 'nudge-state.json'), nudgeNow = () => Date.now(), nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json'),
   // M4.8 enrollment 面：notify = 单向播报函数（接文本；来自 createNotifier().notify，enrollment 通知不依赖 provider）；
   // enrollCodeTtlMs = 铸码有效期（进渲染文本/通知的「N 分钟」）；publicUrl = 对外基址（拼 curl/mcp add，来自 env）；
   // enrollment = 账本实例（默认落 volume、实例 git 之外；reservedClients 传静态表的 client 名，enrollment 铸码不得撞名）。
@@ -75,6 +76,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   const inbox = createInbox({ instanceDir, writer, indexStore, approvals, nativeReg });
   // recall（读侧智能）需要 LLM：无 provider（如缺 DEEPSEEK_API_KEY）时不注册该工具，与 keeper 同一档降级。
   const recall = provider ? createRecall({ indexStore, provider, instanceDir }) : null;
+  const nudgeState = createNudgeState({ statePath: nudgeStatePath, ttlMs: nudgeTtlMs, now: nudgeNow });
+  const identityCredentialKeys = new WeakMap();
   const app = express();
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
   app.locals.inbox = inbox; // 夜班/core calibration 复用同一门面（尤其共享 native/approval 账本）
@@ -95,12 +98,16 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     if (!token) return null;
     if (Object.hasOwn(tokens, token)) {
       const id = tokens[token];             // 原对象引用（含启动期打的 source='static'）
-      return validIdentity(id) ? id : null;
+      if (!validIdentity(id)) return null;
+      identityCredentialKeys.set(id, nudgeCredentialKey(token));
+      return id;
     }
     // enrollment.identify 每次返回新对象，可安全打来源标记（SEC-4：与静态 capture 区分为 deliver-only）。
     const enr = enrollment.identify(token);
     if (enr) enr.source = 'enrolled';
-    return validIdentity(enr) ? enr : null;
+    if (!validIdentity(enr)) return null;
+    identityCredentialKeys.set(enr, nudgeCredentialKey(token));
+    return enr;
   };
   app.use(express.json({ limit: '1mb' }));
 
@@ -129,18 +136,16 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   // 主频道「主动浮出」的服务端半边（spec §4；push/pull 之争已裁决为拉）：primary 客户端每次工具
   // 成功响应尾部 piggyback 一行待裁提示。stateless transport 没有 server→client 推送通道，而主频道
   // agent 只在主人对话时在场——把提示搭在既有响应上，浮出恰好发生在主人已在的对话里，零轮询成本。
-  // 防重复：held id 集合为 key，同 key 在 TTL 内只发一次（进程级状态，重启即重置，丢的只是提示）。
-  // key = token 身份（identify() 返回的 identity 对象；tokens[token] 引用在进程内每 token 恒等）。
-  // 不能用 client 显示名做 key：TOKENS_JSON 里显示名可重复，同名两把 primary token 会共享防重复
-  // 状态——A 收到提示后 B 在 TTL 内被吞。audit 里仍记 client 显示名（那是给人看的）。
-  const nudgeState = new Map(); // identity -> { key, at }
+  // 防重复：held id 集合为 key，同 key 在 TTL 内只发一次。状态持久化到实例 git 外的 volume，
+  // Railway 重启/重新部署不会把同一提案重新提醒；新提案令 held key 改变，会立即浮出。
+  // 隔离键是 token 的 sha256，不保存 token 明文，也不能用可重复的 client 显示名（同名 token 会互吞）。
   const nudgeFor = (identity) => {
     try {
       const s = heldSummary();
-      if (!s) { nudgeState.delete(identity); return null; }
-      const prev = nudgeState.get(identity);
-      if (prev && prev.key === s.key && Date.now() - prev.at < nudgeTtlMs) return null;
-      nudgeState.set(identity, { key: s.key, at: Date.now() });
+      const credentialKey = identityCredentialKeys.get(identity);
+      if (!credentialKey) return null;
+      if (!s) { nudgeState.clear(credentialKey); return null; }
+      if (!nudgeState.shouldEmit(credentialKey, s.key)) return null;
       return { text: `\n\n---\n${s.line}。请按主频道房规浮出：inbox_list 查详情，主人表态后用 inbox_resolve 回传原话。`, count: s.count };
     } catch { return null; } // inbox 读挂不碎工具主路径
   };
@@ -871,9 +876,12 @@ if (isMain) {
     KEEPER_INTERVAL_MS = 60_000,
     KEEPER_MIN_CONFIDENCE = 0.75,
     KEEPER_NOTIFY_LEVEL = 'all',
-    NUDGE_TTL_MS = 14_400_000,
+    NUDGE_TTL_MS = 259_200_000, // 同一批待裁件默认 72 小时最多主动浮出一次（状态跨部署持久化）
     NIGHTLY_INTERVAL_MS = 604_800_000, // 夜班默认 7 天一轮；0=禁用
     CORE_CALIBRATION_RETRY_MS = 3_600_000, // 核心蒸馏失败后同一来源至少等 1 小时再试
+    CORE_CALIBRATION_QUIET_MS = 1_800_000, // 来源停止变化 30 分钟后再合批判断
+    CORE_CALIBRATION_MAX_DIRTY_MS = 86_400_000, // 持续变化最多等待 24 小时
+    CORE_CALIBRATION_COOLDOWN_MS = 259_200_000, // 上一提案落定后 72 小时内不自动再提
     PUBLIC_URL,                        // M4.8：对外基址（拼 /enroll 里的 curl / mcp add 示例）
     RAILWAY_PUBLIC_DOMAIN,             // Railway 注入的域名（无 scheme）——PUBLIC_URL 缺省时回落它
     ENROLL_CODE_TTL_MS = 900_000,      // M4.8：enrollment 码有效期（默认 15 分钟）
@@ -948,6 +956,9 @@ if (isMain) {
       instanceDir, inbox: serviceInbox, provider, writer: app.locals.writer, notifier, audit,
       approvals: app.locals.approvals, nativeReg: app.locals.nativeReg,
       retryMs: Number(CORE_CALIBRATION_RETRY_MS),
+      quietMs: Number(CORE_CALIBRATION_QUIET_MS),
+      maxDirtyMs: Number(CORE_CALIBRATION_MAX_DIRTY_MS),
+      cooldownMs: Number(CORE_CALIBRATION_COOLDOWN_MS),
     });
     const keeper = createKeeper({
       instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly, coreCalibration,

@@ -129,7 +129,7 @@ function executionEnvelope(raw, fallback = {}) {
 export const INBOX_PREVIEW_CHARS = 2000;
 // core 草案本身就是待主人审阅的完整可执行 payload，允许到 _core 硬上限 3000 再加固定说明；
 // 只给 kind=core 放宽，不扩大普通 capture/schema 的响应面与既有契约。
-export const CORE_PROPOSAL_PREVIEW_CHARS = 4000;
+export const CORE_PROPOSAL_PREVIEW_CHARS = 20_000;
 
 // SEC-5（审计 B §4 + 二/三/四轮加固）：【一切】隐藏候选——点选它须件是【服务端亲生且未被篡改】（nativeToken 内容绑定
 // 校验命中，见下方 nativeToken；gate 在 resolveEntry 点选分支）。收窄轨迹：二轮只 gate 破坏性删/改页 → 三轮 Codex 指出漏
@@ -307,7 +307,7 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
         const id = get('id');
         const rel = `inbox/${f}`;
         const client = get('client');
-        // core 的 4k 专用预览只给本进程服务端亲生且未被篡改的提案。伪造件、以及重启后失去 native
+        // core 的专用完整差异预览只给本进程服务端亲生且未被篡改的提案。伪造件、以及重启后失去 native
         // 登记的旧件仍只回普通 2k，避免攻击者仅靠手写 kind:core 扩大提示注入响应面。
         const nativeCore = kind === 'core' && nativeReg.get(id) === nativeToken({ id, rel, kind, client, raw });
         return {

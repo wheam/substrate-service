@@ -7,7 +7,9 @@ import { parseZones } from './acl.js';
 import { newContentId, readContentId } from './content-id.js';
 import { parseEntryBody, scanSegments, INBOX_PREVIEW_CHARS } from './inbox.js';
 import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
-import { applyCoreCalibration, extractCoreDraft } from './core-calibration.js';
+import {
+  applyCoreCalibration, collectCoreSources, currentCore, extractCoreDraft,
+} from './core-calibration.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
 // schema_apply（M4.4 D2b）：落地一个 zone 提案。内容只认提案件正文的 json 块，decision 只能「指向」件（白名单原则）。
@@ -355,7 +357,24 @@ export function validateDecision({ instanceDir, decision, entry }) {
     let draft;
     try { draft = extractCoreDraft(entry); }
     catch (e) { return { ok: false, reason: `core 可见草案校验失败：${e.message}` }; }
+    if (draft.version !== 2) {
+      return { ok: false, staleCore: true, reason: 'core 提案是旧格式，未绑定基础 core 与 canonical 来源，必须废止后重建' };
+    }
     if (d.draft_hash !== draft.hash) return { ok: false, reason: 'calibrate_core 的隐藏决定与主人可见草案 hash 不符' };
+    if (d.base_core_hash !== draft.meta.base_core_hash || d.source_hash !== draft.meta.source_hash) {
+      return { ok: false, reason: 'calibrate_core 的隐藏决定与主人可见 metadata 不符' };
+    }
+    let liveSourceHash;
+    try { liveSourceHash = collectCoreSources(instanceDir).sourceHash; }
+    catch (e) { return { ok: false, reason: `读取 core canonical 来源失败：${e.message}` }; }
+    const liveCoreHash = currentCore(instanceDir).hash;
+    if (liveCoreHash !== d.base_core_hash || liveSourceHash !== d.source_hash) {
+      return {
+        ok: false,
+        staleCore: true,
+        reason: 'core 提案生成后，基础 core 或 canonical 分类页已经变化；旧草案已过期，必须废止后按最新来源重建',
+      };
+    }
     const zones = parseZones(instanceDir);
     const zone = zones.find((z) => z.id === 'memory');
     if (!zone) return { ok: false, reason: 'memory zone 不存在' };

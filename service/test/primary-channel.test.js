@@ -1,7 +1,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, cpSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -168,6 +168,27 @@ test('防重复：同一 held 集合第二次 callTool 不再附', async () => {
   const second = await client.callTool({ name: 'search', arguments: { query: '咖啡' } });
   assert.ok(!second.content[0].text.includes('📥'), '同集合本会话只浮出一次');
   await client.close();
+});
+
+test('防重复状态跨 Server 重启持久化，且状态文件不保存 token 明文', async () => {
+  const work = freshWork();
+  writeHeld(work, 'held-1');
+  const firstServer = await startApp(work);
+  const firstClient = await mcpClient(firstServer.baseUrl, 'tok-primary');
+  const first = await firstClient.callTool({ name: 'search', arguments: { query: '咖啡' } });
+  assert.match(first.content[0].text, /📥/);
+  await firstClient.close();
+  await new Promise((resolve) => firstServer.server.close(resolve));
+
+  const statePath = path.resolve(work, '..', 'nudge-state.json');
+  const persisted = readFileSync(statePath, 'utf8');
+  assert.ok(!persisted.includes('tok-primary'), '持久提醒状态只能保存 token 单向 hash');
+
+  const restarted = await startApp(work);
+  const restartedClient = await mcpClient(restarted.baseUrl, 'tok-primary');
+  const second = await restartedClient.callTool({ name: 'search', arguments: { query: '咖啡' } });
+  assert.ok(!second.content[0].text.includes('📥'), '同一 held 集合在重启后仍处于冷却期');
+  await restartedClient.close();
 });
 
 test('集合变化重发：新增一个 held 件后再调，附且计数=2', async () => {

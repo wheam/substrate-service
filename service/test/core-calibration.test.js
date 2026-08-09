@@ -9,11 +9,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
+import { nativeToken } from '../src/inbox.js';
 import { createKeeper } from '../src/keeper.js';
 import { createTools } from '../src/tools.js';
 import { validateDecision } from '../src/executor.js';
 import {
-  CORE_MAX_CHARS, CORE_REL, collectCoreSources, createCoreCalibration, scanCoreThreats,
+  CORE_MAX_CHARS, CORE_REL, collectCoreSources, createCoreCalibration, currentCore, scanCoreThreats,
 } from '../src/core-calibration.js';
 import { testAdmissionForKind } from './helpers/admission.js';
 
@@ -50,7 +51,7 @@ function fakeProvider(json) {
   };
 }
 
-function setup(json) {
+function setup(json, calibrationOptions = {}) {
   const { base, work } = makeInstance();
   const writer = createWriter({ instanceDir: work });
   const approvals = new Map();
@@ -60,7 +61,8 @@ function setup(json) {
   const notifier = { messages: [], notify: async (message) => { notifier.messages.push(message); return { ok: true }; } };
   const statePath = path.join(base, 'core-calibration-state.json');
   const coreCalibration = createCoreCalibration({
-    instanceDir: work, inbox, provider, writer, approvals, nativeReg, notifier, statePath, retryMs: 60_000,
+    instanceDir: work, inbox, provider, writer, approvals, nativeReg, notifier, statePath,
+    retryMs: 60_000, quietMs: 0, cooldownMs: 0, ...calibrationOptions,
   });
   const keeper = createKeeper({
     instanceDir: work, writer, provider, notifier, approvals, nativeReg, coreCalibration, doctor: false,
@@ -107,6 +109,9 @@ test('分类页变化→完整可见 core 提案→primary 批准→整页替换
   const entry = inbox.listEntries().entries.find((e) => e.id === proposed.id);
   assert.equal(entry.kind, 'core');
   assert.equal(entry.status, 'held');
+  assert.match(entry.content, /CORE_PROPOSAL_META_V2/);
+  assert.match(entry.content, /CORE_DRAFT_V2/);
+  assert.match(entry.options[0].label, /新增 \d+，移除 \d+/);
   assert.ok(entry.content.length > 2000, 'core 专用预览应能超过普通 2k 窗口');
   assert.match(entry.content, new RegExp(filler.at(-1).slice(-30).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
     '主人预览必须包含草案最后一条，不能只看到截断前半');
@@ -235,13 +240,125 @@ test('重启后失去 nativeReg 的旧 core 提案会被行政关闭并重建，
   });
   const restarted = createCoreCalibration({
     instanceDir: first.work, inbox, provider, writer: first.writer, approvals, nativeReg,
-    statePath: first.statePath, retryMs: 60_000,
+    statePath: first.statePath, retryMs: 60_000, quietMs: 0, cooldownMs: 0,
   });
   const rebuilt = await restarted.maybeRun();
   assert.equal(rebuilt.skipped, false);
   assert.notEqual(rebuilt.id, proposal.id);
   const cores = inbox.listEntries().entries.filter((e) => e.kind === 'core');
   assert.deepEqual(cores.map((e) => e.id), [rebuilt.id]);
+});
+
+test('旧格式亲生 core 提案也会被 supersede 后按 v2 重建，不沿用缺失的 stale 绑定', async () => {
+  const s = setup({
+    sections: { identity: [], communication: ['主人偏好简洁回答。'], collaboration_safety: [], environment: [] },
+  });
+  const first = await s.coreCalibration.maybeRun();
+  const hit = s.inbox.listEntries().entries.find((entry) => entry.id === first.id);
+  const abs = path.join(s.work, hit.path);
+  const legacyRaw = readFileSync(abs, 'utf8').replace(/CORE_PROPOSAL_META_V2\n[\s\S]*?\nCORE_DRAFT_V2\n/, '');
+  writeFileSync(abs, legacyRaw);
+  s.nativeReg.set(first.id, nativeToken({
+    id: first.id, rel: hit.path, kind: hit.kind, client: hit.client, raw: legacyRaw,
+  }));
+
+  const rebuilt = await s.coreCalibration.maybeRun();
+  assert.equal(rebuilt.skipped, false);
+  assert.notEqual(rebuilt.id, first.id);
+  const entries = s.inbox.listEntries().entries.filter((entry) => entry.kind === 'core');
+  assert.deepEqual(entries.map((entry) => entry.id), [rebuilt.id]);
+  assert.match(entries[0].content, /CORE_PROPOSAL_META_V2/);
+});
+
+test('非实质来源变化只更新 state v2，不生成待裁提案', async () => {
+  const s = setup({ material: false, reason: '只是一次性设备细节，留在分类页按需读取' });
+  const result = await s.coreCalibration.maybeRun();
+  assert.equal(result.reason, 'not-material');
+  assert.equal(s.provider.calls.length, 1);
+  assert.equal(s.inbox.listEntries().entries.filter((entry) => entry.kind === 'core').length, 0);
+  const state = s.coreCalibration.readState();
+  assert.equal(state.version, 2);
+  assert.ok(Object.keys(state.page_hashes).length > 0);
+  assert.equal(state.refresh_pending, false);
+});
+
+test('30 分钟 quiet window 合批，提案落定后 72 小时 cooldown 阻止连续重提', async () => {
+  let clock = Date.parse('2026-08-10T00:00:00.000Z');
+  const s = setup({
+    material: true,
+    sections: { identity: [], communication: ['主人偏好简洁回答。'], collaboration_safety: [], environment: [] },
+  }, {
+    now: () => clock,
+    quietMs: 30 * 60_000,
+    maxDirtyMs: 24 * 60 * 60_000,
+    cooldownMs: 72 * 60 * 60_000,
+  });
+
+  const waiting = await s.coreCalibration.maybeRun();
+  assert.equal(waiting.reason, 'quiet-window');
+  assert.equal(s.provider.calls.length, 0);
+  clock += 30 * 60_000;
+  const first = await s.coreCalibration.maybeRun();
+  assert.equal(first.skipped, false);
+
+  const resolved = s.inbox.resolveEntry({
+    id: first.id, option: 1, via: 'hermes-primary', viaTrust: 'high', viaChannel: 'primary',
+  });
+  await resolved.synced;
+  await s.keeper.processPending();
+
+  const page = path.join(s.work, 'memory', 'about-owner', 'communication-preferences.md');
+  writeFileSync(page, readFileSync(page, 'utf8') + '\n- 一项新的长期偏好。\n');
+  const cooled = await s.coreCalibration.maybeRun();
+  assert.equal(cooled.reason, 'cooldown');
+  clock += 72 * 60 * 60_000;
+  const second = await s.coreCalibration.maybeRun();
+  assert.equal(second.skipped, false);
+  assert.notEqual(second.id, first.id);
+});
+
+test('批准后来源已变化时旧提案被 supersede，旧 core 不落盘并立即按最新来源重建', async () => {
+  const s = setup({
+    material: true,
+    sections: { identity: [], communication: ['主人偏好简洁回答。'], collaboration_safety: [], environment: [] },
+  });
+  const before = readFileSync(path.join(s.work, CORE_REL), 'utf8');
+  const first = await s.coreCalibration.maybeRun();
+  const page = path.join(s.work, 'memory', 'about-owner', 'communication-preferences.md');
+  writeFileSync(page, readFileSync(page, 'utf8') + '\n- 主人又增加了一项长期偏好。\n');
+  const resolved = s.inbox.resolveEntry({
+    id: first.id, option: 0, via: 'hermes-primary', viaTrust: 'high', viaChannel: 'primary',
+  });
+  await resolved.synced;
+
+  const result = await s.keeper.processPending();
+  assert.equal(result.filed, 0);
+  assert.equal(result.superseded, 1);
+  assert.equal(readFileSync(path.join(s.work, CORE_REL), 'utf8'), before);
+  const fresh = s.inbox.listEntries().entries.filter((entry) => entry.kind === 'core');
+  assert.equal(fresh.length, 1);
+  assert.notEqual(fresh[0].id, first.id);
+  assert.equal(fresh[0].status, 'held');
+  assert.equal(s.provider.calls.length, 2, 'stale refresh 应绕过 quiet/cooldown 立即按最新来源再判断');
+});
+
+test('v1 state 聚合 hash 未变化时原地迁移逐页 hash，不制造升级假提案', async () => {
+  const s = setup({
+    sections: { identity: [], communication: ['不应调用模型。'], collaboration_safety: [], environment: [] },
+  });
+  const sources = collectCoreSources(s.work);
+  const core = currentCore(s.work);
+  writeFileSync(s.statePath, `${JSON.stringify({
+    version: 1,
+    last_considered_source_hash: sources.sourceHash,
+    last_considered_core_hash: core.hash,
+  }, null, 2)}\n`);
+  const result = await s.coreCalibration.maybeRun();
+  assert.equal(result.reason, 'unchanged');
+  assert.equal(s.provider.calls.length, 0);
+  const state = s.coreCalibration.readState();
+  assert.equal(state.version, 2);
+  assert.deepEqual(state.page_hashes, sources.pageHashes);
 });
 
 test('危险模型输出在写前被拒，旧 _core 原样保留且不生成提案', async () => {

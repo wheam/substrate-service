@@ -896,6 +896,15 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     }
 
     if (!v.ok) {
+      if (v.staleCore && entry.kind === 'core' && coreCalibration?.supersede) {
+        await coreCalibration.supersede(entry, v.reason);
+        emit(entry, 'superseded', rel, v.reason);
+        audit({
+          tool: 'keeper', entry: entry.id, kind: entry.kind, verdict: 'superseded',
+          disposition: 'superseded', reason: v.reason, ms: Date.now() - t0,
+        });
+        return 'superseded';
+      }
       // 只销本轮看到的批准；若主人已在模型等待期间重新裁定，保留新 proof，由下一轮按新快照处理。
       assertEntryCurrent(entry, rel);
       if (!rec || approvals.get(entry.id) === rec) approvals.delete(entry.id);
@@ -915,7 +924,12 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
           // preflight，且必须在任何页面写入之前全部通过；复合计划的 target hash 也在这里重取。
           const freshValidation = validateDecisionPlan({ instanceDir, decision, entry });
           if (!freshValidation.ok || freshValidation.verdict !== 'file') {
-            throw new Error(`执行前 preflight 失败：${freshValidation.reason ?? freshValidation.verdict}`);
+            const error = new Error(`执行前 preflight 失败：${freshValidation.reason ?? freshValidation.verdict}`);
+            if (freshValidation.staleCore) {
+              error.code = 'STALE_CORE_PROPOSAL';
+              error.staleReason = freshValidation.reason;
+            }
+            throw error;
           }
           // 先持久 claim 再做任何业务副作用。若进程随后崩溃，tombstone 会让历史 inbox
           // fail closed；正常异常路径则在文件回滚完成后恢复 proof，允许同一计划安全重试。
@@ -979,6 +993,15 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       if (applied?.rollbackCoreToken) {
         rollbackCoreCalibration({ instanceDir, rollbackToken: applied.rollbackCoreToken, entryRel: rel, entryRaw: entry.raw });
       }
+      if (e.code === 'STALE_CORE_PROPOSAL' && entry.kind === 'core' && coreCalibration?.supersede) {
+        await coreCalibration.supersede(entry, e.staleReason ?? e.message);
+        emit(entry, 'superseded', rel, e.staleReason ?? e.message);
+        audit({
+          tool: 'keeper', entry: entry.id, kind: entry.kind, verdict: 'superseded',
+          disposition: 'superseded', reason: e.staleReason ?? e.message, ms: Date.now() - t0,
+        });
+        return 'superseded';
+      }
       await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`, { holdClass: 'retryable' });
       audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', held_class: 'retryable', error: e.message, ms: Date.now() - t0 });
       return 'held';
@@ -1005,7 +1028,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
   async function processPending() {
     if (running) return { skipped: true };
     running = true;
-    const result = { processed: 0, filed: 0, rejected: 0, held: 0, errors: 0 };
+    const result = { processed: 0, filed: 0, rejected: 0, held: 0, superseded: 0, errors: 0 };
     try {
       for (const rel of listPending()) {
         try {

@@ -109,9 +109,12 @@
 | `KEEPER_INTERVAL_MS` | | `60000`（60 秒） | keeper 扫 inbox 的轮询间隔。 |
 | `KEEPER_MIN_CONFIDENCE` | | `0.75` | keeper 自动归档的置信阈值；低于此则转 `held` 待主人裁定。 |
 | `KEEPER_NOTIFY_LEVEL` | | `all` | 通知档：`all` 全播报；`quiet` 静音「✅ 已存」成功播报（doctor 报错仍必达）。 |
-| `NUDGE_TTL_MS` | | `14400000`（4 小时） | 主频道待裁提示的防重复 TTL：同一批 `held` 件在此窗口内，工具响应尾部只提醒一次。 |
+| `NUDGE_TTL_MS` | | `259200000`（72 小时） | 主频道待裁提示的防重复 TTL：同一批 `held` 件在此窗口内，工具响应尾部只提醒一次；状态持久化在 volume（git 外），重新部署不会重置。新提案令集合变化，会立即提醒。 |
 | `NIGHTLY_INTERVAL_MS` | | `604800000`（7 天） | 夜班养护（去重/合并薄页/断链）确定性扫描间隔，产出走 inbox 的预批提案；`0`=禁用。仅在 provider 在场（`DEEPSEEK_API_KEY` 有值）时才挂。 |
 | `CORE_CALIBRATION_RETRY_MS` | | `3600000`（1 小时） | about-owner 核心摘要蒸馏失败后，对同一批分类页的最短重试间隔；成功时仍只生成主频道可审阅的 held 提案，不自动改 `_core.md`。 |
+| `CORE_CALIBRATION_QUIET_MS` | | `1800000`（30 分钟） | canonical 分类页停止变化多久后才合批判断，避免连续整理时一页一提。 |
+| `CORE_CALIBRATION_MAX_DIRTY_MS` | | `86400000`（24 小时） | 来源持续变化时的最长等待；达到上限即判断，防止一直没有 quiet window。 |
+| `CORE_CALIBRATION_COOLDOWN_MS` | | `259200000`（72 小时） | 上一份核心摘要提案落定后的自动重提冷却。来源或基础 core 令现有提案过期时，stale-safe 重建不受此冷却限制。 |
 | `FEISHU_WEBHOOK_URL` | | —（缺=只打日志） | 飞书自定义机器人 webhook，哑兜底通知。缺 → 通知只落服务日志。 |
 | `FEISHU_WEBHOOK_SECRET` | | — | 飞书 webhook 加签密钥（机器人开了「签名校验」才需要）。 |
 | `AUDIT_FILE` | | —（缺=只进 stdout） | 审计另存到卷上文件的路径。缺 → 审计只进 stdout（即 Railway 日志）。 |
