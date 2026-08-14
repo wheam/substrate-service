@@ -10,13 +10,15 @@ import {
 test('在线 instructions 与常驻 digest 复用同一份主动行为契约', () => {
   assert.ok(INSTRUCTIONS.includes(BEHAVIOR_RULES), 'MCP instructions 应包含共享行为契约');
   assert.ok(DIGEST_RULES.includes(BEHAVIOR_RULES), 'digest 应包含同一份共享行为契约');
-  for (const anchor of ['读库再答', '捕获信号', '主动提议保存', '敏感边界']) {
+  for (const anchor of ['读库再答', '缺口闭环', '捕获信号', '主动提议保存', '敏感边界']) {
     assert.match(BEHAVIOR_RULES, new RegExp(anchor), `共享行为契约缺少「${anchor}」`);
   }
   assert.match(BEHAVIOR_RULES, /recall/, '自然语言问题应路由到 recall');
   assert.match(BEHAVIOR_RULES, /不要等主人明确说.*查知识库/s, '应明确要求不要等待显式查库口令');
   assert.match(BEHAVIOR_RULES, /每轮答复前.*扫一遍/s, '应给模型稳定的逐轮捕获节奏');
   assert.match(BEHAVIOR_RULES, /没有相应写入工具.*高信任渠道/s, '只读客户端应有可执行的写入兜底');
+  assert.match(BEHAVIOR_RULES, /recall 返回 gaps.*最小信息/s, '检索缺口应进入最小信息闭环');
+  assert.match(BEHAVIOR_RULES, /当前运行宿主.*不得拿当前宿主状态替代/s, '不得把宿主状态冒充为另一个实体');
 });
 
 test('instructionsFor：high 信任附常驻宿主自装指引，low 不附', () => {
