@@ -1,6 +1,6 @@
 # Substrate Service — 服务化访问层方案（总览）
 
-> 状态：IMPLEMENTED / 个人 alpha（M0–M4.9 已完成并在生产日用）
+> 状态：IMPLEMENTED / 个人 alpha（严格治理主线已日用；轻治理可信直写已实现、待部署试用）
 > 演化路线：**01 个人版**（M0–M3；含私人细节，未公开）→ **[03 MCP 版](03-next-version-spec.md)**（M4.x，已实现）→ **[02 长期产品化](02-productization.md)**（未来）
 > 本仓库包含 `substrate-service` 的实现与公开设计文档；个人知识库实例始终放在独立私有仓库。
 
@@ -27,8 +27,9 @@
  Hermes ×N ───────────── 原生 MCP 客户端 ────┼────► │  https://kb.<域名>（公网服务）  │
  （未来任意支持 MCP 的 AI）──────────────────┘      │  ├─ MCP server（读写工具）      │
                                                    │  ├─ /capture（App 投递端点）   │
-        无 VPN、无隧道、设备零依赖                    │  ├─ inbox/ 隔离区（一切写先进） │
-        故障面 = 服务本身是否在线                     │  ├─ keeper（守门维护 agent）    │
+        无 VPN、无隧道、设备零依赖                    │  ├─ trusted-direct（显式授权） │
+        故障面 = 服务本身是否在线                     │  ├─ inbox（默认/歧义写入）     │
+                                                   │  ├─ keeper（路由+治理+养护）   │
                                                    │  └─ 实例（markdown + git）     │
                                                    └───────────┬──────────────────┘
                                                                └─ push → GitHub 私库
@@ -40,7 +41,7 @@
 | 现在 | 之后 |
 |---|---|
 | 每台机器完整 clone + sync 对齐 | 只有服务端持有实例；其它机器零本地状态 |
-| 宪法靠每个 agent 自觉遵守 | 一切写入过 keeper，**服务端强制** |
+| 宪法靠每个 agent 自觉遵守 | 副作用边界**服务端强制**；默认 Keeper，个人轻治理需显式授权 |
 | 行为规则靠逐台 wire-context 注入 | server instructions **连接即下发** |
 | git 同步是用户要懂的事 | git 是服务背后的备份实现细节 |
 | 撞车协议 | 单写者，基本不再触发（留作后备） |
@@ -61,17 +62,17 @@
 
 ## 已定的关键决策（含理由，供回看）
 
-1. **公网 HTTPS + token，不用 VPN/隧道**——可靠性与"设备零依赖"优先；安全靠 token 分级 + 架构自带的两道界（写入只进隔离区、敏感 zone 按客户端 ACL）。库本体反正已整库存在 GitHub 私库，云端副本没有跨越新的信任边界。
+1. **公网 HTTPS + token，不用 VPN/隧道**——可靠性与"设备零依赖"优先；安全靠 token 分级、默认 inbox 隔离、敏感 zone ACL，以及可信直写的窄 effect 白名单。库本体反正已整库存在 GitHub 私库，云端副本没有跨越新的信任边界。
 2. **keeper 自研，不复用任何现有 agent 框架**——它是系统的信任根和未来产品的核心资产，必须可控、可测、可换模型。
 3. **keeper 架构 = LLM 只判断，代码才执行**——LLM 产出结构化决定（JSON），写入永远走确定性脚本；判断可用 golden 判例集回归。
 4. **keeper 归属：逻辑上每个实例一个，物理上无状态工人池**——个性化（规则、判例、反馈）全存在该实例仓库里（可带走）；计算按任务池化（轻、便宜、可横向扩）。keeper 属于"库"不属于"人"（共享库有自己的 keeper 上下文）。
-5. **一切写入先进 inbox 隔离区，写路径无 LLM**——捕获永远秒回；投递型 token 泄露的写入爆炸半径被限制为收件箱垃圾，碰不到库本体；其它 token 每客户端独立、可单独吊销。
+5. **默认写入先进 inbox；可信直写是窄例外**——capture 与未授权客户端永远只进隔离区；只有显式授权的 high client 能对明确普通 Markdown 页做 create/append，仍经凭据扫描、effect policy、doctor、Git 与回滚。Skill/治理/删除/覆盖没有旁路。
 6. **行为契约（该存/该提示存/该读库/查无不编）经 MCP server instructions 下发**——从"逐台接线"变"连接即得"；不支持 instructions 的客户端保留 digest 注入兜底。
 
 ## 实现状态
 
 - **引擎仓库**：[`substrate`](https://github.com/wheam/substrate) 继续提供格式、治理规则与实例脚手架。
-- **服务仓库**：本仓库已完成 M0–M4.9，支持 MCP 读写、keeper、capture、分层检索、夜班和自助接入。
+- **服务仓库**：支持 MCP 读写、keeper、capture、分层检索、夜班、自助接入、Skill 晋升，以及少数可信 agent 的可回退轻治理档。
 - **实例仓库**：每位用户自备独立私有 git 仓库，服务端只持有其工作副本。
 - **部署**：支持 [Railway 模板](https://railway.com/deploy/AlyM7t) 与本地单机运行。
 
@@ -90,3 +91,5 @@
 - **[03-next-version-spec.md](03-next-version-spec.md)** —— MCP 版 v0.3 spec：定位为「受治理的 agent 记忆（GAM）」开源参考实现；成功判据、两条硬原则（装得极简 / 用得零负担）、能力增量（分层 lossless、服务端读侧智能 + 可抛索引、溯源置信、schema 演化、审批式夜班、抗注入、判例考卷 + 仪表）、主频道 agent、安装模型、**数据模型与契约（frontmatter 字段 / inbox 状态机 / 工具面 / 迁移）**、**安全与隐私威胁册**、M4.x 里程碑、决策记录。
 - **04-team-brain.md** —— 团队版（**未来方向 / 分支**，gate 在个人版之后）：受治理的团队大脑，把 GAM 从个人扩到团队。**含团队私有策略，未随开源仓库发布。**
 - **[05-pattern-gam.md](05-pattern-gam.md)** —— **Governed Agent Memory（受治理的 agent 记忆）模式说明（对外版）**：能单独读懂的模式参考——一段式定义、四特色、机制骨架（隔离 inbox → LLM 只出决定 → 确定性执行器 → 判例法 → 文件即真相 → 服务端集中治理 → 全程审计 + git 外持久批准/proof 账本）、与 capture-first 竞品的一句差异（审批式治理 vs 静默改）。`substrate` 是它的开源参考实现。
+- **[07-light-governance.md](07-light-governance.md)** —— 个人双 Agent 场景的轻治理试用档：明确普通页可信直写，目标不明/高风险仍进 Keeper；含授权、工具契约、安全边界和一键回退。
+- **[06-skill-promotion.md](06-skill-promotion.md)** —— Skill 完整目录从 `_incoming` 暂存、owner 内容绑定审核到原子晋升的操作与安全契约；含 MCP 接口、状态语义、幂等/回滚、审计字段和结构化错误码。

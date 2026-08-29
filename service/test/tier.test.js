@@ -71,6 +71,7 @@ test('normalizeInclude：数组/逗号串，去重、只留合法附加档（can
   assert.deepEqual(normalizeInclude(undefined), []);
   assert.deepEqual(normalizeInclude('candidate'), ['candidate']);
   assert.deepEqual(normalizeInclude('candidate,rejected'), ['candidate', 'rejected']);
+  assert.deepEqual(normalizeInclude('staging,candidate'), ['staging', 'candidate']);
   assert.deepEqual(normalizeInclude(' rejected , candidate '), ['rejected', 'candidate']);
   assert.deepEqual(normalizeInclude(['candidate', 'candidate']), ['candidate'], '去重');
   assert.deepEqual(normalizeInclude('canonical,bogus'), [], 'canonical/非法值不作为附加档');

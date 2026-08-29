@@ -75,14 +75,14 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   await client.close();
 });
 
-test('tools/list：高信任 = 5 读 + 11 写/治理；低信任只有读且无 sensitive 通路', async () => {
+test('tools/list：高信任含 Skill 检查/晋升提案；低信任只有读且无 sensitive 通路', async () => {
   const client = await mcpClient('test-token-high');
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
     'collections_search', 'collections_upsert', 'get_context', 'inbox_list', 'inbox_resolve',
-    'page_set_tier', 'read_page', 'remember', 'remove', 'save', 'schema_apply', 'schema_propose', 'search',
-    'todo_add', 'todo_done', 'todo_list',
+    'page_set_tier', 'promote_skill', 'read_page', 'remember', 'remove', 'save', 'schema_apply',
+    'schema_propose', 'search', 'skill_inspect', 'todo_add', 'todo_done', 'todo_list',
   ]);
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
   assert.match(byName.search.description, /不要等主人明确说.*查知识库/s, 'search 描述应推动主动检索');

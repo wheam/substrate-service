@@ -9,6 +9,7 @@ const INGRESS_BY_KIND = {
   todo_done: 'todo_done',
   capture: 'capture',
   schema: 'schema_propose',
+  skill: 'promote_skill',
 };
 
 // 测试必须显式铸 AdmissionContext；生产缺身份时零权限，不能为了旧测试给 createInbox 隐式 high。
@@ -29,7 +30,7 @@ export function testAdmissionForKind({ kind }) {
 export const ALL_TEST_CAPABILITIES = [
   'page:create', 'page:append', 'target:explicit', 'zone:sensitive-write',
   'todo:add', 'todo:complete', 'collection:insert', 'collection:upsert', 'page:remove',
-  'skill:stage', 'skill:replace', 'schema:propose', 'core:propose',
+  'skill:stage', 'skill:replace', 'skill:propose', 'schema:propose', 'core:propose',
 ];
 
 // validateDecision 是 fail-closed 的 effect policy；直接单测若要穿过权限层去测路径/tier

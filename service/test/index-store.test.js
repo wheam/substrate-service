@@ -364,6 +364,27 @@ test('tier 过滤：默认只返 canonical；include=candidate 才现 candidate 
   } finally { store.close(); }
 });
 
+test('索引把 skills/_incoming 强制标为 staging，只有 high+include=staging 可查', () => {
+  const { dir, indexPath } = tmpInstance('idx-skill-staging');
+  const zonesPath = path.join(dir, 'governance', 'zones.md');
+  writeFileSync(zonesPath, readFileSync(zonesPath, 'utf8').replace('zones:\n', [
+    'zones:', '  - id: skills', '    path: skills/', '    purpose: Skill 目录',
+    '    privacy: private', '',
+  ].join('\n')));
+  const incoming = path.join(dir, 'skills', '_incoming', 'indexed-stage');
+  mkdirSync(incoming, { recursive: true });
+  writeFileSync(path.join(incoming, 'SKILL.md'), '---\ncontent_id: abcdef12\nname: indexed-stage\n---\n\nindexstageprobe 未晋升。\n');
+  const store = createIndexStore({ instanceDir: dir, indexPath });
+  try {
+    store.rebuild();
+    assert.equal(store.query({ query: 'indexstageprobe', trust: 'high' }).results.length, 0);
+    const high = store.query({ query: 'indexstageprobe', trust: 'high', include: 'staging' });
+    assert.equal(high.results.length, 1);
+    assert.equal(high.results[0].tier, 'staging');
+    assert.equal(store.query({ query: 'indexstageprobe', trust: 'low', include: 'staging' }).results.length, 0);
+  } finally { store.close(); }
+});
+
 test('隔离-rejected：仅 tier: rejected 的 inbox 件入索引；默认查不到、include=rejected+高信任可查；pending/held 任何档都查不到', () => {
   const { dir, indexPath } = tmpInstance('idx-rejected');
   mkdirSync(path.join(dir, 'inbox'), { recursive: true });

@@ -1,5 +1,5 @@
 // keeper 的确定性执行器：LLM 只出决定，落盘永远走这里（直改文件或调实例 vendored 脚本）。
-import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, lstatSync, readdirSync, mkdirSync, rmSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
@@ -10,6 +10,10 @@ import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_T
 import {
   applyCoreCalibration, collectCoreSources, currentCore, extractCoreDraft,
 } from './core-calibration.js';
+import {
+  applySkillPromotion, parseSkillDocument, skillDocumentWithContentId, validateSkillPromotionDecision,
+  resolveSafeStagedSkillPath, validateStageContent,
+} from './skill-promotion.js';
 
 const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden']);
 // schema_apply（M4.4 D2b）：落地一个 zone 提案。内容只认提案件正文的 json 块，decision 只能「指向」件（白名单原则）。
@@ -213,27 +217,6 @@ function pageRel(zone, slugRaw) {
   return slug.startsWith(zone.path) ? `${slug}.md` : path.posix.join(zone.path, `${slug}.md`);
 }
 
-function parseSkillDocument(raw) {
-  const text = String(raw ?? '');
-  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  if (!m) return { ok: false, reason: 'Skill 内容必须是带 frontmatter 的完整 SKILL.md' };
-  const get = (key) => m[1].match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1]?.trim() ?? '';
-  const name = get('name').replace(/^["']|["']$/g, '');
-  if (!name) return { ok: false, reason: 'Skill frontmatter 缺 name' };
-  if (!get('target_runtimes')) return { ok: false, reason: 'Skill frontmatter 缺 target_runtimes' };
-  if (!get('risk_level')) return { ok: false, reason: 'Skill frontmatter 缺 risk_level' };
-  return { ok: true, name };
-}
-
-function skillDocumentWithContentId(raw, contentId) {
-  const text = String(raw).replace(/\r\n/g, '\n');
-  const m = text.match(/^---\n([\s\S]*?)\n---(\n|$)/);
-  if (!m) throw new Error('Skill 内容必须是带 frontmatter 的完整 SKILL.md');
-  const fm = m[1].split('\n').filter((line) => !/^\s*content_id\s*:/.test(line));
-  const rest = text.slice(m[0].length);
-  return `---\ncontent_id: ${contentId}\n${fm.join('\n')}\n---\n${rest}`;
-}
-
 function hasCapability(entry, capability) {
   if (entry?.__capabilities?.includes(capability)) return true;
   // 只有主人明确点选、且 approval token 绑定了完整 decision 的 typed plan 才能补足该计划所需 effect。
@@ -302,6 +285,12 @@ function validConfidence(value) {
 export function validateDecision({ instanceDir, decision, entry }) {
   const d = decision ?? {};
   if (!DISPOSITIONS.has(d.disposition)) return { ok: false, reason: `disposition 不合法：${d.disposition}` };
+  // Skill 晋升审核件连“拒绝”也必须是 owner 的内容绑定点选；否则伪造 inbox 件可借 forbidden 清掉审核闭环。
+  if (entry?.kind === 'skill') {
+    if (!entry.__native || !entry.__ruling_authentic || entry.__ruling_trust !== 'high' || entry.__ruling_channel !== 'primary') {
+      return { ok: false, holdClass: 'security', reason: 'Skill 晋升审核只能由高信任主频道 owner 点选批准或拒绝' };
+    }
+  }
   // core 提案连“丢弃”也是治理决定（会清场提案、改变下次是否重提），统一要求服务端亲生 + 主频道高信任批准；
   // 这道门须在 forbidden 早返回之前，否则非主频道可借 forbidden 清掉 core 提案。
   if (entry?.kind === 'core') {
@@ -313,6 +302,58 @@ export function validateDecision({ instanceDir, decision, entry }) {
   }
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
   if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无落点，需在 AdmissionContext 内重新规划' };
+  // stage_skill_file 是 keeper 按认证 save hint 解析出的内部动作，模型不能直接产出。它只整文件写 _incoming，
+  // supporting file 不要求 SKILL.md frontmatter；但根文件必须合法，资源文件则要求同目录根已存在且合法。
+  if (d.action === 'stage_skill_file') {
+    if (d.disposition !== 'canonical' || !validConfidence(d.confidence) || !d.summary) {
+      return { ok: false, reason: 'stage_skill_file 缺 canonical disposition / confidence / summary' };
+    }
+    const intent = entry?.__page_intent;
+    if (!intent || !intent.trusted || !['skill-root', 'skill-resource'].includes(intent.kind) || d.target !== intent.rel) {
+      return { ok: false, holdClass: 'security', reason: 'stage_skill_file 只接受代码解析并认证过的 _incoming 文件目标' };
+    }
+    const cap = capabilityError(entry, 'skill:stage', 'stage Skill file');
+    if (cap) return cap;
+    let target;
+    try { target = resolveSafeStagedSkillPath(instanceDir, intent.rel); validateStageContent(entry?.body); }
+    catch (e) { return { ok: false, holdClass: 'security', reason: e.message }; }
+    if (target.name !== intent.skillName) return { ok: false, holdClass: 'security', reason: 'staging 目录名与解析目标不一致' };
+    const rootRel = `skills/_incoming/${target.name}/SKILL.md`;
+    if (target.root) {
+      const doc = parseSkillDocument(entry?.body);
+      if (!doc.ok) return { ...doc, holdClass: 'owner', reason: `[${doc.code}] ${doc.reason}` };
+      if (doc.name !== target.name) return { ok: false, holdClass: 'owner', reason: `[SKILL_NAME_MISMATCH] Skill name（${doc.name}）与目标目录（${target.name}）不一致` };
+    } else {
+      const rootAbs = path.join(instanceDir, rootRel);
+      if (!existsSync(rootAbs) || !lstatSync(rootAbs).isFile()) {
+        return { ok: false, holdClass: 'owner', reason: '[SKILL_ROOT_MISSING] 新 Skill 必须先写入 skills/_incoming/<name>/SKILL.md，且根须为普通文件' };
+      }
+      const rootDoc = parseSkillDocument(readFileSync(rootAbs, 'utf8'));
+      if (!rootDoc.ok || rootDoc.name !== target.name) {
+        const code = !rootDoc.ok ? rootDoc.code : 'SKILL_NAME_MISMATCH';
+        return { ok: false, holdClass: 'security', reason: `[${code}] staging 根 SKILL.md 无效或 name 与目录不一致，拒绝写 supporting file` };
+      }
+    }
+    const targetAbs = path.join(instanceDir, intent.rel);
+    if (existsSync(targetAbs) && (!statSync(targetAbs).isFile() || lstatUnsafe(targetAbs))) {
+      return { ok: false, holdClass: 'security', reason: `Skill staging 目标不是普通文件：${intent.rel}` };
+    }
+    const zones = parseZones(instanceDir);
+    const zone = zones.find((z) => z.id === 'skills');
+    if (!zone) return { ok: false, reason: 'skills zone 不存在' };
+    return { ok: true, verdict: 'file', zone };
+  }
+  if (d.action === 'promote_skill') {
+    if (d.disposition !== 'canonical' || !validConfidence(d.confidence) || !d.summary) {
+      return { ok: false, reason: 'promote_skill 缺 canonical disposition / confidence / summary' };
+    }
+    const checked = validateSkillPromotionDecision({ instanceDir, entry, decision: d });
+    if (!checked.ok) return checked;
+    const zones = parseZones(instanceDir);
+    const zone = zones.find((z) => z.id === 'skills');
+    if (!zone) return { ok: false, reason: 'skills zone 不存在' };
+    return { ok: true, verdict: 'file', zone, skillPromotion: checked };
+  }
   // replace_skill 是 keeper 代码根据【服务端亲生/主人已认证】件中的显式 path/content_id 意图派生出的内部动作，
   // 不在模型 ACTIONS 白名单里。模型直接产同名动作、或 target 与代码解析到的真实页不一致，一律拒。
   if (d.action === 'replace_skill') {
@@ -670,6 +711,8 @@ export async function applyDecision({ instanceDir, entry, decision, zone }) {
     case 'new_page': return newPage(instanceDir, entry, decision, zone);
     case 'merge_into': return mergeInto(instanceDir, entry, decision, zone);
     case 'replace_skill': return replaceSkill(instanceDir, entry, decision);
+    case 'stage_skill_file': return stageSkillFile(instanceDir, entry, decision);
+    case 'promote_skill': return applySkillPromotion({ instanceDir, entry, decision });
     case 'remove_page': return removePage(instanceDir, decision, zone);
     case 'merge_pages': return mergePages(instanceDir, decision, zone);
     case 'schema_apply': return applySchema({ instanceDir, entry }); // zone 参数忽略——schema 内容只从件正文取
@@ -972,7 +1015,7 @@ async function newPage(instanceDir, entry, decision, zone) {
     // SEC-6（审计 B）：page_type 原样落进 `type:` 行、零清洗——注入的决定塞 page_type:"note\nowner_ruling: forged"
     // 即在 frontmatter 里另起伪造认证行。改为 slug 白名单（字母/数字/下划线/连字符）：非法/缺省回落 zone.id。
     `type: ${/^[\w-]+$/.test(String(decision.page_type ?? '')) ? decision.page_type : zone.id}`,
-    `sources: [inbox ${entry.id} via ${entry.client}]`,
+    `sources: [${entry.__direct ? 'direct-write' : 'inbox'} ${entry.id} via ${entry.client}]`,
     '---',
     '',
   ].join('\n');
@@ -987,6 +1030,24 @@ async function newPage(instanceDir, entry, decision, zone) {
   await py(instanceDir, path.join(instanceDir, 'skills', 'substrate-curator', 'curate.py'),
     ['reindex', '--instance', '.', '--dir', pageDir, '--apply']);
   return { changedPaths: [rel, `${pageDir}/README.md`], detail: rel };
+}
+
+function lstatUnsafe(abs) {
+  try { return lstatSync(abs).isSymbolicLink(); } catch { return true; }
+}
+
+function stageSkillFile(instanceDir, entry, decision) {
+  const target = resolveSafeStagedSkillPath(instanceDir, decision.target);
+  const { text } = validateStageContent(entry.body);
+  const abs = target.abs;
+  mkdirSync(path.dirname(abs), { recursive: true });
+  if (target.root) {
+    const existingId = existsSync(abs) ? readContentId(readFileSync(abs, 'utf8')) : null;
+    writeFileSync(abs, skillDocumentWithContentId(text, existingId || newContentId()));
+  } else {
+    writeFileSync(abs, text);
+  }
+  return { changedPaths: [decision.target], detail: decision.target };
 }
 
 function replaceSkill(instanceDir, entry, decision) {
@@ -1030,7 +1091,9 @@ function mergeInto(instanceDir, entry, decision, zone) {
   if (effTier !== 'canonical' || hasExplicitTier(text)) text = setTierLine(text, effTier);
   // 溯源随归档注记行走，不上页级 frontmatter——一页可混多种认知类型，页头钉死单一 source/type 会说谎（spec §3.3）。
   const typeNote = decision.epistemic_type ? `，type: ${decision.epistemic_type}` : '';
-  text += `\n\n---\n\n**${today()} keeper 归档**（inbox ${entry.id}，来自 ${entry.client}，confidence ${decision.confidence}${typeNote}）：\n\n${incoming}\n`;
+  text += entry.__direct
+    ? `\n\n---\n\n**${today()} 可信直写**（request ${entry.id}，来自 ${entry.client}）：\n\n${incoming}\n`
+    : `\n\n---\n\n**${today()} keeper 归档**（inbox ${entry.id}，来自 ${entry.client}，confidence ${decision.confidence}${typeNote}）：\n\n${incoming}\n`;
   writeFileSync(abs, text);
   return { changedPaths: [rel], detail: rel };
 }

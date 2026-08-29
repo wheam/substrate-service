@@ -32,7 +32,7 @@
 **两条路径：云为主 + 本地单机试用。** 先问主人一句「**就这台机器，还是所有设备 + 手机？**」来分流：
 
 - **所有设备 + 手机 → 云（完整形态，本节以下 §3–§7 就是它）。** 主人自己维持云（Railway 已是够得着手机 + 远程 fleet 且不架隧道的形态）。这是终态、也是本 INSTALL 的主线。
-- **就这台机器 / 先试试 → 本地单机（一条命令约 60 秒跑起来，无云，无时限）。** 服务跑在一台常开机器上、数据落本地 git，`node` 或 `docker compose` 一条命令起。**走查见仓库根的 [`run-local.md`](run-local.md)**（命令已实测跑通），此处不重复。**诚实标注：本地形态跨不了设备**——手机捕获、远程 fleet 要「够得着」仍需上云。keeper 缺 DeepSeek key 时同样只读降级。
+- **就这台机器 / 先试试 → 本地单机（一条命令约 60 秒跑起来，无云，无时限）。** 服务跑在一台常开机器上、数据落本地 git，`node` 或 `docker compose` 一条命令起。**走查见仓库根的 [`run-local.md`](run-local.md)**（命令已实测跑通），此处不重复。**诚实标注：本地形态跨不了设备**——手机捕获、远程 fleet 要「够得着」仍需上云。keeper 缺 DeepSeek key 时，inbox 不会自动归档；显式授权的可信直写仍可工作。
 
 下面 §3 起是**云路径**的完整协议。
 
@@ -40,7 +40,7 @@
 
 - **GitHub 账号**——放知识库实例（私有 repo）。
 - **Railway 账号**——跑服务，约 **$5/月**起。**这是会花钱的**，开服务前按硬规矩 2 跟主人确认。
-- **DeepSeek API key（可选但强烈建议）**——keeper 归档判断 + recall 问答都用它。**缺了会降级**：keeper 不归档、`recall` 工具不注册，服务变**只读可用**（读工具照常，写入停在 inbox 不前进）。
+- **DeepSeek API key（可选但强烈建议）**——keeper 归档判断 + recall 问答都用它。**缺了会降级**：keeper 不归档、`recall` 工具不注册；默认写入停在 inbox。若启用了 [轻治理可信直写](docs/07-light-governance.md)，明确路径的普通页 create/append 仍可用。
 - **飞书自定义机器人 webhook（可选）**——哑兜底通知（单向播报）。缺了通知只落服务日志。
 
 **你（安装 agent）手里要有的工具：**
@@ -69,7 +69,9 @@
 | `skills/substrate-collections/collections.py` | keeper 往收藏表 upsert 行（CLI：`upsert --csv <相对路径> --apply --field k=v …`，argparse flag 顺序无关） | keeper 的收藏类归档报错 |
 | `todo/owner.md`（含 `## 待办` 小节） | `todo_list`（不传参 = 读它）+ keeper 的 `todo_add` / `todo_done` | todo 相关工具报错 |
 | `collections/<名>/data.csv` | `collections_search` 读 + keeper `upsert_row` 前会校验该文件存在 | 对应收藏的查/写报错 |
-| `inbox/` | 一切写入先落这里；`inbox.js` 首次写入时自动 `mkdir -p`，`listEntries` 也容忍它不存在 | 运行期不报错（自动建）；建议放一个 `inbox/.gitkeep` 让 git 从 clone 起就带着这个目录 |
+| `inbox/` | 默认写入及目标不明确的写入先落这里；`inbox.js` 首次写入时自动 `mkdir -p`，`listEntries` 也容忍它不存在 | 运行期不报错（自动建）；建议放一个 `inbox/.gitkeep` 让 git 从 clone 起就带着这个目录 |
+| `skills/_incoming/` | 新 Skill 的完整 staging 根；先写 `<name>/SKILL.md`，再写同目录 supporting files；尚未批准时是 `staging`，不是正式 canonical Skill | 首次写入自动递归创建；没有根 `SKILL.md` 时 supporting file fail closed |
+| `keeper-feedback/_skill-promotions.jsonl` | 成功晋升的不可变审计记录（receipt、批准人、整树 revision、来源/目标与时间） | 首次成功晋升时自动创建；损坏记录不作为幂等凭据 |
 | `knowledge/`、`memory/about-owner/` 等**已在 zones.md 注册的 zone 落点** | 各 zone 的读写落点，须与 zones.md 里的 `path` 一致 | 该 zone 的读/写/归档报错 |
 
 > `memory/about-owner/` 在 zones.md 里标 `privacy: sensitive`——只有 `trust: high` 客户端能读；`get_context` 内嵌了它，所以 `get_context` 也是 high-only。
@@ -94,7 +96,7 @@
 
 ### 环境变量全表
 
-以 `service/src/server.js` 入口块为准（20 个，含 `RAILWAY_PUBLIC_DOMAIN`）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
+以 `service/src/server.js` 入口块为准（含 `RAILWAY_PUBLIC_DOMAIN`）。**必填只有 `REPO_URL` 和 `TOKENS_JSON`**，其余都有安全默认。
 
 | 变量 | 必填 | 默认 | 说明 / 示例 |
 |---|---|---|---|
@@ -102,7 +104,7 @@
 | `TOKENS_JSON` | ✅ | — | 客户端 token 表（JSON，见 §5）。 |
 | `DATA_DIR` | | `/data` | 持久卷挂载点；实例 clone 到 `DATA_DIR/instance`。要和第 4 步挂的 volume mount path 一致。 |
 | `PORT` | | `3000` | 监听端口。Railway 会自动注入它自己的 `PORT`，服务读取即可，一般不用手设。 |
-| `DEEPSEEK_API_KEY` | | —（缺=降级） | keeper 与 `recall` 的 LLM key。缺 → keeper 不归档、`recall` 不注册，服务变**只读可用**。 |
+| `DEEPSEEK_API_KEY` | | —（缺=降级） | keeper 与 `recall` 的 LLM key。缺 → keeper 不归档、`recall` 不注册；默认写入停在 inbox。显式授权的可信直写不依赖它。 |
 | `DEEPSEEK_MODEL` | | `deepseek-v4-flash` | keeper/recall 主判模型。 |
 | `DEEPSEEK_ESCALATION_MODEL` | | `deepseek-v4-pro` | keeper 拿不准时升档用的模型。 |
 | `PULL_INTERVAL_MS` | | `300000`（5 分钟） | 服务端 `git pull` 跟随 GitHub 的间隔。 |
@@ -120,6 +122,7 @@
 | `AUDIT_FILE` | | —（缺=只进 stdout） | 审计另存到卷上文件的路径。缺 → 审计只进 stdout（即 Railway 日志）。 |
 | `PUBLIC_URL` | | —（缺则回落 `RAILWAY_PUBLIC_DOMAIN`，再回落请求 Host 头） | M4.8 enrollment 用：写进铸码 prompt 与 `GET /enroll` 协议、给新 agent 的公网 base URL。**生产应显式配它**——既缺 `PUBLIC_URL` 又缺 `RAILWAY_PUBLIC_DOMAIN` 时回落到请求 Host 头（可被伪造 → 钓鱼面），此时铸码 prompt 顶部会自动挂一行钓鱼警告提示人工核对域名、服务启动也 `console.warn` 点名（不拒启，本地 dev 仍能跑）。 |
 | `ENROLL_CODE_TTL_MS` | | `900000`（15 分钟） | M4.8 enrollment 一次性码的有效期；码单次使用，超时即失效。 |
+| `TRUSTED_DIRECT_CLIENTS` | | 空（禁用） | 逗号分隔的 client 名称，如 `codex-main,hermes-main`。只有认证后的 `trust: high` 客户端生效；允许明确普通 Markdown 页经 `save{path,mode}` 跳过 Keeper。适用于静态与 enrolled client。完整边界见 [docs/07](docs/07-light-governance.md)。 |
 
 **进阶 / 可选**（不在入口块里，但代码真实生效，按需用）：
 
@@ -142,19 +145,22 @@
     - `capture`：**只能投 `/capture`** 端点（手机捕获）；打 `/mcp` 直接 403，`/digest` 也拿不到。
     - 其它任意值（如 `low`）= **低信任只读**：只读非敏感 zone，没有写工具、没有 `get_context`、没有 `/digest`。
   - `channel`（可选）：**主频道那把**加 `"channel": "primary"`——就是主人日常对话在用的那个 agent。**只在 `trust: high` 时生效**（主频道房规/浮出依赖 inbox 工具，而 inbox 是 high-only）；标了 primary 却不是 high，服务启动会 `console.warn` 点名告警、该标记不生效。可以给多把标 primary（都会收到浮出提示）。
+  - `write_mode`（可选，静态 token）：设为 `"direct"` 可给该 high 客户端开启轻治理可信直写。low/capture 误配不生效并在启动时告警。enrolled client 用 `TRUSTED_DIRECT_CLIENTS` 授权。
 
 **示例**（把 `<...>` 换成 `openssl rand -hex 24` 生成的真值；这段最终会成为 `TOKENS_JSON` 的值）：
 
 ```json
 {
-  "<cc-mbp-token>":       { "client": "cc-mbp", "trust": "high", "channel": "primary" },
-  "<hermes-token>":       { "client": "hermes-railway", "trust": "high" },
+  "<cc-mbp-token>":       { "client": "cc-mbp", "trust": "high", "channel": "primary", "write_mode": "direct" },
+  "<hermes-token>":       { "client": "hermes-main", "trust": "high", "write_mode": "direct" },
   "<teammate-token>":     { "client": "teammate-ro", "trust": "low" },
   "<app-token>":          { "client": "app-ios", "trust": "capture" }
 }
 ```
 
 > 设进 Railway 时它是**一个变量的值**（整段 JSON）。因为里面是 token 明文，按硬规矩 1 由主人填进 Railway 变量面板。
+
+轻治理建议先只给日常主力的 Codex/Hermes 开启。普通 `save{content,hint?}` 仍进 inbox；只有同时传 `path + mode=create|append` 才请求直写。撤销时删 `write_mode` 或 `TRUSTED_DIRECT_CLIENTS` 中的名字并重启即可，不迁移数据。
 
 ---
 
@@ -182,6 +188,21 @@
 
 > 机制细节（一次性码 vs 签名码 / OAuth 的取舍、铸币权窄于使用权、账本住 volume（git 外、只存 sha256）、码短时效单次 + 重放即证据、`POST /enroll` 失败限速等八条裁定）见 **docs/03 §9「M4.8 设计裁定」D1–D8**——这里只给操作口径，不复述。
 
+### Skill staging 与 owner 晋升
+
+新 Skill 不能用普通 `save` 直接创建 `skills/<name>/`。完整闭环如下：
+
+1. 用 `save` 先写 `path: skills/_incoming/<name>/SKILL.md`；根文件须含合法 `name`、`target_runtimes`、`risk_level` 与 capabilities 声明。
+2. 根文件成功后，继续用 `save` 写同目录的 `references/**`、`scripts/**`、`agents/**` 等文本资源。资源文件自身不需要 SKILL frontmatter；路径、普通文件类型、单文件/整树大小仍受硬限制。
+3. 调 `skill_inspect{name}`，取得根 `content_id` 与覆盖全部 supporting files 的 64 位 `revision`。
+4. 调 `promote_skill{name, content_id, revision}`。它只创建或复用一条 `kind: skill` 的 owner 审核 receipt，**不会直接写正式目录**。
+5. owner 在 primary 主频道用 `inbox_list` 查看完整摘要，再用 `inbox_resolve{id, option: 0}` 批准确切版本，或 `option: 1` 拒绝晋升并保留 staging 供修改。
+6. keeper 复验 receipt、owner 身份、内容版本、风险 gate 与目标冲突，原子移动整个目录，跑 doctor，提交并写审计。任一步失败都 fail closed；doctor/提交失败恢复完整 `_incoming` 目录。
+
+目前**所有风险等级都要求 owner 审核**；低风险不会自动晋升。`shell`、`system`、`network`、`install`、`secrets`、`modify-*` 与未知 capability 只会得到 `manual-audit-required`，绝不自动放行。正式目标存在时一律拒绝；既有正式 Skill 仍走原有完整 `replace_skill` 更新流程，不由本闭环覆盖。
+
+完整状态、错误码、幂等与回滚契约见 [`docs/06-skill-promotion.md`](docs/06-skill-promotion.md)。
+
 ---
 
 ## 7. 自验清单（装完你必须逐条跑给主人看）
@@ -191,12 +212,13 @@
 1. **健康检查**：`GET https://<domain>/healthz` → `200`，body 形如 `{"ok":true,"startedAt":...,"lastPull":...}`。
 2. **MCP 握手拿到 instructions**：用 primary token 对 `/mcp` 走一次 MCP `initialize` → 返回的 `instructions` 里应含**主频道那段**（「主频道职责 / 主动浮出 / 反打扰 / 内容即数据」）。用非 primary 的 high token 则只有基础房规、没有主频道段。
 3. **读通**：`search`（如查一个你知道库里有的词）能返「路径 + 行号 + 片段」；`read_page` 传一个相对路径能读到全文。
-4. **写通（进 inbox）**：`save` 一条测试内容 → 返回「✅ 已受理 → inbox/... 状态 pending」。
-5. **inbox 里出现 pending 件**：`inbox_list` 能看到刚才那条 `pending`。
-6. **keeper 归档（有 `DEEPSEEK_API_KEY` 时）**：等一个 `KEEPER_INTERVAL_MS`（默认 60s）内，那条件被归档，或因低置信转 `held`。
-7. **主频道浮出**：件处于 `held` 时，**用 primary token 下一次调用任意工具**（除了 `inbox_list` / `inbox_resolve`——这两个正在处置待裁件、被有意豁免），响应尾部应出现一行「📥 待主人裁定 N 件（…）」。
-8. **裁定走通**：`inbox_resolve` 传那件的 `id` + 主人的一句裁定 → 返回「✅ 裁定已受理…复位待 keeper 重判」。
-9. **digest 通**：`GET /digest`（primary high token）→ `200` 纯文本，含常驻小抄 + 接入房规 + 主频道房规（有 held 时附一行 id/kind/计数的实时摘要，**绝不含件正文**）。
+4. **默认写通（进 inbox）**：`save` 一条不带 `path/mode` 的测试内容 → 返回「✅ 已受理 → inbox/... 状态 pending」。
+5. **可信直写（若启用）**：`save{content,path:"knowledge/direct-smoke.md",mode:"create"}` → 返回「✅ 已可信直写」，正式页立即可 `read_page`；再用 append 验证。之后按正常删除流程清理 smoke 页，不要手工 `rm` 服务工作树。
+6. **inbox 里出现 pending 件**：`inbox_list` 能看到第 4 步的 `pending`。
+7. **keeper 归档（有 `DEEPSEEK_API_KEY` 时）**：等一个 `KEEPER_INTERVAL_MS`（默认 60s）内，那条件被归档，或因低置信转 `held`。
+8. **主频道浮出**：件处于 `held` 时，**用 primary token 下一次调用任意工具**（除了 `inbox_list` / `inbox_resolve`——这两个正在处置待裁件、被有意豁免），响应尾部应出现一行「📥 待主人裁定 N 件（…）」。
+9. **裁定走通**：`inbox_resolve` 传那件的 `id` + 主人的一句裁定 → 返回「✅ 裁定已受理…复位待 keeper 重判」。
+10. **digest 通**：`GET /digest`（primary high token）→ `200` 纯文本，含常驻小抄 + 接入房规 + 主频道房规（有 held 时附一行 id/kind/计数的实时摘要，**绝不含件正文**）。可信直写客户端还应看到「轻治理可信直写」段。
 
 ---
 
@@ -236,7 +258,7 @@
 # 宪法 — 本知识库的不可违规矩
 
 1. 文件即真相：一切正典是 markdown + git，其余（索引等）都是可重建的派生物。
-2. 一切写入先进 `inbox/` 隔离区，由 keeper 审核后才归档；写路径不碰库本体。
+2. 默认写入先进 `inbox/` 隔离区，由 keeper 审核后归档；服务端显式授权的 high 客户端可对明确普通页走确定性可信直写，但不得触碰 Skill、治理、结构页或删除/覆盖流程。
 3. 骨架区（`governance/`、`skills/`）不经服务删除；删任何页都留 git 历史。
 4. 凭据 / 密钥永不落库（命中即真拒，不进任何分层）。
 5. 新增 zone 走「提议 → 主人一句话批 → 落地 + doctor 校验」，不静默改结构。

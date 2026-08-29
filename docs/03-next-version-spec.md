@@ -103,6 +103,14 @@
 - 执行器逐 effect 校验 `page:create` / `page:append` / sensitive write / todo / collection / remove / Skill 等能力。新页不存在只是 `page:create` 的正常前置条件，不是主人审批条件。
 - 复合归档只开放一个有界形状：同 zone 的 `new_page|merge_into(entry_body)` + `append_reference` 两步。第二步只能由执行器生成 wikilink，禁止任意 body/patch、跨区、结构页、skills/raw/服务区；事务内重做 preflight，目标 hash 改变或 doctor 失败则整体回滚。
 
+### 3.11 个人轻治理档：Keeper 从普通知识必经门退为歧义/风险门
+
+- **适用前提**：一个 owner，实际只有少数明确可信的主力 agent；严格 keeper 成本已经高于它拦住的真实错误。
+- **做什么**：默认流程零变化；owner 可按 client 显式授权 `trusted-direct`。授权后的 `save` 只有在同时给出明确 `path + mode=create|append` 时，才跳过 LLM 语义判断，直接走确定性 effect policy、凭据扫描、doctor、Git 单写者与回滚。目标不明确则仍进 inbox。
+- **边界**：不允许 replace/delete/move；不碰 Skill、governance、结构页、todo/collections typed zone；low/capture 无法获得直写；Skill 晋升、schema、core、删除与覆盖继续走原审核闭环。它减少的是“目标已知还要等 Keeper”的税，不把服务变成任意文件系统。
+- **回退**：删 `TOKENS_JSON.write_mode=direct` 或 `TRUSTED_DIRECT_CLIENTS` 名单并重启，立即恢复严格模式；正典仍是同一套 Markdown + Git，无数据迁移。
+- **实现说明**：[docs/07](07-light-governance.md)。当前代码与测试已完成，尚未在本仓库内执行生产部署。
+
 ## 4. 交互模型：主频道 agent（降认知触点）
 
 - 配置里给某个连 MCP 的 client（token）标 `channel: primary`。keeper 的 held / 拒收 / 待定夺 / 通知，优先通过它——它在**你已在用的那个对话**里问你，你自然语言回，agent 调 `inbox_resolve`。复用现有 `inbox_list` / `inbox_resolve`，加一个 primary 标记 + 一条房规「主频道 agent 应主动浮出待裁件」。
@@ -130,7 +138,7 @@
 | 字段 | 取值 | 语义 | 默认 / 迁移 |
 |---|---|---|---|
 | `content_id` | 稳定短 id（如 8 位 hash） | 页 / 条目的稳定标识，扛改名；索引与链接引用它 | 现有页一次性 backfill 生成 |
-| `tier` | `canonical` / `candidate` / `rejected` | 分层晋升（§3.1）；默认检索只看 `canonical` | 现有页默认 `canonical` |
+| `tier` | `canonical` / `candidate` / `rejected` / `staging` | 分层晋升（§3.1）；`staging` 专用于 `skills/_incoming/**`，默认检索不含且仅 high 可显式查询 | 现有页默认 `canonical`；`_incoming` 由路径强制视为 `staging` |
 | `source_agent` | client 名（如 cc-mbp） | 谁写的 / 谁提议的 | 现有页留空 |
 | `confidence` | 0.0–1.0 | keeper 判断置信（本就有） | 落盘即写 |
 | `epistemic_type` | `fact`/`preference`/`decision`/`opinion`/`excerpt`/`to-verify` | 记忆条目的认知类型（防污染） | 现有页留空，可后续回填 |
@@ -145,10 +153,11 @@
 
 ### 6.3 MCP 工具面增量
 - **新增 `recall`/`think`（读；服务端综合）**：入参 `query`；返回**带引用的答案对象**（`answer` + `citations[]`(path+content_id) + `gaps[]`（「库里没有 X / 这页 N 周没更新」））。成本/延迟：一次 LLM 调用，走 keeper 同一 provider；可缓存。
-- **`search` 变 tier-aware**：默认只返 `canonical`；可选 `include=candidate|rejected`。审计新增 `result_count` / `hit`（供落空率仪表）。
+- **`search` 变 tier-aware**：默认只返 `canonical`；可选 `include=candidate|rejected|staging`。`staging` 仅 high 可见，`skills/_incoming/**` 即使未写 tier 也由路径强制标为 staging。审计新增 `result_count` / `hit`（供落空率仪表）。
 - **新增 `schema_propose` / `schema_apply`（治理，admin/high）**：提议 / 应用新 zone；apply 走审批 + doctor 校验（§3.4）。
 - **`inbox_*` 复用** + client 的 `channel: primary` 标记（§4）。
-- **`save.hint` 的稳定页寻址**：更新现有页可明确给 `path: <实例相对路径>` 或 `content_id: <8 位 id>`。keeper 代码先在注册 zone 内唯一定位真实路径，再执行模型决定；不存在的显式 path 是合法 `page:create`，直接新建；`content_id` 零命中、撞 id、path/id 冲突仍 owner-held，不按 `<zone>/<slug>.md` 猜。该确定性覆盖只认持久 native proof 命中的亲生件或已认证主人裁定，git pull 伪造件不能借 hint 强制改页；没有 `target:explicit` 能力的软投递会忽略执行性目标并走安全新增/旁置，而非永久卡死。完整 canonical Skill 文档按 `skills/<name>/SKILL.md` 原位替换并保留旧 `content_id`；新 Skill 只允许先写 `skills/_incoming/<name>/SKILL.md`，递归创建父目录，不生成扁平页。
+- **`save.hint` 的稳定页寻址**：更新现有页可明确给 `path: <实例相对路径>` 或 `content_id: <8 位 id>`。keeper 代码先在注册 zone 内唯一定位真实路径，再执行模型决定；不存在的显式 path 是合法 `page:create`，直接新建；`content_id` 零命中、撞 id、path/id 冲突仍 owner-held，不按 `<zone>/<slug>.md` 猜。该确定性覆盖只认持久 native proof 命中的亲生件或已认证主人裁定，git pull 伪造件不能借 hint 强制改页；没有 `target:explicit` 能力的软投递会忽略执行性目标并走安全新增/旁置，而非永久卡死。既有完整 canonical Skill 文档仍按 `skills/<name>/SKILL.md` 原位替换并保留旧 `content_id`。新 Skill 先写 `skills/_incoming/<name>/SKILL.md`，根有效后可继续写同目录 supporting files；supporting file 不解析为 SKILL.md。
+- **新增 `skill_inspect` / `promote_skill`（high；批准仅 primary owner）**：`skill_inspect` 返回完整 staging 树清单、capabilities gate、根 `content_id` 与整树 SHA-256 revision；`promote_skill` 只创建内容绑定的 `kind:skill` 审核 receipt。owner 经 `inbox_resolve` 点选后，keeper 才执行内部 `promote_skill`：复验版本、原子 rename 整目录、doctor、git commit、审计；失败回滚。正式目标默认必须不存在；所有风险等级当前都需 owner 审核。
 
 ### 6.4 检索索引（派生、可抛）
 - SQLite FTS5（词法，默认）+ 可选 sqlite-vec（语义，升级档）。在服务进程内、从文件构建。
@@ -182,6 +191,7 @@
 - **M4.9 常驻宿主小抄抗抖下发（路 B digest 注入）**（2026-07-09 立项并当日落地，源于 Hermes 真机复盘——移动网络/空闲掉线时 MCP instructions 房规随连接一起消失）：MCP instructions 路（连接即下发）是脆的——宿主侧断线重连期间 `session=None` 即出局、重试耗尽 parked 摘工具双重出局、初连失败直接放弃（冷启动断网=死透，宿主侧无自愈）。补齐 `/digest` 拉取路的宿主侧接线：常驻宿主定时拉 `/digest` **原子写入宿主原生常驻上下文文件**（Hermes = `$HOME/.hermes.md`，每个新会话构建系统提示时自动注入），**任何失败一律保留旧文件**（stale-but-present：小抄旧了能用，消失不行）。服务端两笔：① 高信任 instructions 附 `SELF_WIRE`「常驻宿主自装」段（低信任不下发，/digest 对其本就 403）；② `GET /enroll` 协议 §2 Hermes 条目具体化（落地文件 / 30 分钟保鲜 / 失败保旧铁律）——新常驻宿主接入照协议自装，零人工，与 M4.8「一段 prompt 接入」同构。**验收**：✅ 已上真机（两台 Mac 的 Hermes 网关均接好——同款 refresh 脚本〔锚点校验 + 宿主注入扫描器预检 + 同文件系统原子替换 + 0600 + 逐次日志〕+ cron `*/30`；真实会话 dump 验证 `# Project Context → .hermes.md → 主人核心记忆` 完整在场；服务端新增 `instructions.test.js`、全量 385 绿；机制裁定与宿主侧源码事实见 §9「M4.9 裁定」）。覆盖即全量：在用的常驻 Hermes 宿主仅两台 Mac（**Railway 上曾有的 Hermes 实例已废弃**——2026-07-10 主人确认，不作接入目标、文档中不再作为残余项出现）。
 
 - **M4.10 keeper effect policy + 去伪人工 gate**（2026-08-06）：准入能力信封、git 外持久 native/approval proof、终态 consumed tombstone、模型受约束 repair、candidate 安全回退、owner/retryable/security 分型，以及同区两步有界复合归档。实现完全按入口/副作用/可逆性判定，不含 health、体重、日期或文件命名特例。**验收**：普通与 sensitive zone 的新页规则一致；新页不存在自动创建；精确重复幂等；低置信无害件不 owner-held，低置信 forbidden 仍留 rejected 隔离、绝不被翻成 candidate；越权模型输出只 repair/retry，repair 不能绕过低置信破坏性 gate；retry 6 次耗尽后停机告警而非无限烧模型或转嫁主人；本地 commit 后的 rebase/push 故障记持久 `sync_pending`，由后台周期补推提交链而不复活收件/重跑业务；真实 target 冲突/治理结构动作仍问主人；复合第二步失败或目标 hash 改变零部分写入。
+- **M4.11 Skill 完整目录晋升闭环**（2026-08-29）：修复 `_incoming` 只能落根文件、supporting file 被误当 SKILL.md、无批准后晋升动作、staging 冒充 canonical、人工 gate 被当 retryable 六次重试等断链。新增确定性 `stage_skill_file`、`skill_inspect` 与审批式 `promote_skill`；owner 批准绑定根 content_id + 整树 revision，目录 rename + doctor + commit + audit 失败回滚，同版本待审/成功均幂等；普通 save 仍不能新建正式 Skill。详细契约见 [06-skill-promotion.md](06-skill-promotion.md)。
 
 ## 9. 决策记录与开放问题
 

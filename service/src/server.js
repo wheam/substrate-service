@@ -9,7 +9,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createTools } from './tools.js';
 import { createAudit } from './audit.js';
-import { DIGEST_RULES, PRIMARY_RULES, instructionsFor, enrollProtocol } from './instructions.js';
+import { DIRECT_WRITE_RULES, DIGEST_RULES, PRIMARY_RULES, instructionsFor, enrollProtocol } from './instructions.js';
 import { createEnrollment, sanitizeIp } from './enroll.js';
 import { ensureRepo, pullOnce } from './repo.js';
 import { createWriter } from './writer.js';
@@ -26,6 +26,8 @@ import { createRecall } from './recall.js';
 import { normalizeInclude } from './tier.js';
 import { createNativeRegistry } from './native-registry.js';
 import { createNudgeState, nudgeCredentialKey } from './nudge-state.js';
+import { inspectSkillDirectory, requestSkillPromotion, SKILL_NAME_RE } from './skill-promotion.js';
+import { directPageWrite } from './direct-write.js';
 
 const SERVER_INFO = { name: 'substrate-kb', version: '0.2.0' };
 
@@ -36,7 +38,7 @@ const NUDGE_EXEMPT = new Set(['inbox_list', 'inbox_resolve']);
 // D2（M4.6/M4.9.1）：capture 通道无权兑现的件——maintenance/schema/core 都是治理面，
 // 只能由高信任 CC/Hermes 裁定。服务端强制：这类件不进 App 的「待定夺（可裁）」列表、也不经 /capture/resolve 裁定
 // （原则=不给人无权兑现的按钮）。keeper 层的通道限权守卫保留作纵深防御，本层只是把拦截前移到入口。
-const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema', 'core']);
+const CAPTURE_UNRULABLE_KINDS = new Set(['maintenance', 'schema', 'core', 'skill']);
 
 // SEC-1（原型污染免认证）shape 校验：只接受形状合法的 identity——client 是 string 且 trust ∈ {high,low,capture}。
 // 挡什么：`tokens` 是 JSON.parse 出的普通对象，静态查表命中的原型继承键（toString/constructor/hasOwnProperty/
@@ -47,7 +49,7 @@ const validIdentity = (id) =>
   !!id && typeof id === 'object' && typeof id.client === 'string'
   && (id.trust === 'high' || id.trust === 'low' || id.trust === 'capture');
 
-export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 259_200_000, nudgeStatePath = path.resolve(instanceDir, '..', 'nudge-state.json'), nudgeNow = () => Date.now(), nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json'),
+export function createApp({ instanceDir, tokens, audit = createAudit(), eventStore = null, provider = null, indexStore = createIndexStore({ instanceDir }), nudgeTtlMs = 259_200_000, nudgeStatePath = path.resolve(instanceDir, '..', 'nudge-state.json'), nudgeNow = () => Date.now(), nightlyStatePath = path.resolve(instanceDir, '..', 'nightly-state.json'), trustedDirectClients = [],
   // M4.8 enrollment 面：notify = 单向播报函数（接文本；来自 createNotifier().notify，enrollment 通知不依赖 provider）；
   // enrollCodeTtlMs = 铸码有效期（进渲染文本/通知的「N 分钟」）；publicUrl = 对外基址（拼 curl/mcp add，来自 env）；
   // enrollment = 账本实例（默认落 volume、实例 git 之外；reservedClients 传静态表的 client 名，enrollment 铸码不得撞名）。
@@ -56,9 +58,16 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   nativeRegistry = createNativeRegistry({ statePath: path.resolve(instanceDir, '..', 'native-registry-state.json') }) }) {
   // 配置健全性：channel:primary 只在 high 客户端生效（主频道房规/nudge 依赖 inbox 工具，而 inbox 是 high-only）。
   // 标了 primary 却非 high = 无声失效的误配 —— 启动即告警点名，而不是运行期静默丢行为。
+  const directClientSet = new Set((Array.isArray(trustedDirectClients) ? trustedDirectClients : String(trustedDirectClients).split(','))
+    .map((name) => String(name).trim()).filter(Boolean));
+  const directWriteFor = (identity) => identity?.trust === 'high'
+    && (identity?.write_mode === 'direct' || directClientSet.has(identity?.client));
   for (const t of Object.values(tokens)) {
     if (t.channel === 'primary' && t.trust !== 'high') {
       console.warn(`TOKENS_JSON 配置告警：client ${t.client} 标了 channel:primary 但 trust=${t.trust}——主频道需要 high（inbox 工具是 high-only），该标记不会生效`);
+    }
+    if (t.write_mode === 'direct' && t.trust !== 'high') {
+      console.warn(`TOKENS_JSON 配置告警：client ${t.client} 标了 write_mode:direct 但 trust=${t.trust}——可信直写只对 high 生效`);
     }
   }
   // SEC-4：给每个【静态】token 值打来源标记 source='static'。静态 capture = 主人自己的 iOS App（收件审阅心脏，
@@ -286,7 +295,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
 
     const primary = identity.channel === 'primary' && identity.trust === 'high';
     // enrollment 工具（仅主频道注册）需要账本 + notify + 按本请求推导的 publicUrl（拼可粘贴 prompt 里的 <publicUrl>/enroll）。
-    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, audit, nudge: primary ? nudgeFor : null,
+    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, directWrite: directWriteFor(identity), audit, nudge: primary ? nudgeFor : null,
       nativeReg,
       enrollment, notify: fireNotify, tokens, enrollPublicUrl: publicUrlFor(req), enrollCodeTtlMs });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
@@ -305,6 +314,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     try {
       const { content } = await tools.getContext({ trust: identity.trust });
       let out = content + DIGEST_RULES;
+      if (directWriteFor(identity)) out += DIRECT_WRITE_RULES;
       // 夜班「上轮动作」段（M4.6 D1）：digest 已 high-gated，且摘要只含页路径/动作/原因/计数（无正文、无 stem，
       // 且夜班整体排除 sensitive 区 → 页路径均非敏感）。状态文件在 git 外、可能缺失/损坏 → try 包裹，省略即可。
       try { out += formatNightlyDigest(JSON.parse(readFileSync(nightlyStatePath, 'utf8'))); }
@@ -375,7 +385,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
       .filter((e) => e.status !== 'held' || !e.held_class || e.held_class === 'owner')
       .filter((e) => !mineOnly || e.client === identity.client);
     if (identity.trust !== 'high') pending = pending.filter((e) => !CAPTURE_UNRULABLE_KINDS.has(e.kind));
-    if (identity.channel !== 'primary') pending = pending.filter((e) => e.kind !== 'core');
+    if (identity.channel !== 'primary') pending = pending.filter((e) => e.kind !== 'core' && e.kind !== 'skill');
     const events = (eventStore?.list() ?? []).filter((e) => !mineOnly || e.client === identity.client).slice(-100).reverse();
     return res.json({ ok: true, pending, events });
   });
@@ -394,13 +404,17 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
     if (coreHit && identity.channel !== 'primary') {
       return res.status(403).json({ ok: false, error: '核心小抄提案只能在主频道审阅与批准' });
     }
+    const skillHit = inbox.listEntries().entries.find((e) => e.id === id && e.kind === 'skill');
+    if (skillHit && identity.channel !== 'primary') {
+      return res.status(403).json({ ok: false, error: 'Skill 晋升审核只能在主频道由 owner 批准或拒绝' });
+    }
     // D2（M4.6/M4.9.1）入口限权：maintenance/schema/core 件不经手机裁定——在入口就拒（不再走到 keeper 层通道限权才弹回，
     // 那样主人体验 = 「判了→不算→重来」，违反原则 B）。keeper 层通道限权守卫仍在，作纵深防御。高信任仍可裁。
     if (identity.trust !== 'high') {
       const hit = inbox.listEntries().entries.find((e) => e.id === id);
       if (hit && CAPTURE_UNRULABLE_KINDS.has(hit.kind)) {
         audit({ client: identity.client, tool: 'capture_resolve', args: { id }, ok: false, error: '该类件不经手机裁定' });
-        return res.status(403).json({ ok: false, error: '该类件（维护/结构/核心小抄提案）不经手机裁定，请在主频道的 CC / Hermes 处理' });
+        return res.status(403).json({ ok: false, error: '该类件（维护/结构/核心小抄/Skill 晋升提案）不经手机裁定，请在主频道的 CC / Hermes 处理' });
       }
     }
     try {
@@ -416,9 +430,9 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   return app;
 }
 
-function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, audit, nudge = null,
+function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, directWrite = false, audit, nudge = null,
   nativeReg = new Map(), enrollment = null, notify = null, tokens = {}, enrollPublicUrl = null, enrollCodeTtlMs = 900_000 }) {
-  const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity) });
+  const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity, { directWrite }) });
   const { client, trust } = identity;
   const admission = (ingress, kind) => createAdmission({ identity, ingress, kind });
 
@@ -433,7 +447,10 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
     try {
       const result = await fn({ ...args, trust }, args);
       const extra = auditFields ? auditFields(result, args) : null;
-      const cap = captureKind ? { event: 'capture_attempt', id: result?.id, kind: captureKind, source: client } : null;
+      const directAttempt = name === 'save' && (args?.path || args?.mode || args?.expected_content_id);
+      const cap = directAttempt
+        ? { event: 'direct_write', path: result?.path ?? args?.path, mode: result?.mode ?? args?.mode, source: client }
+        : (captureKind ? { event: 'capture_attempt', id: result?.id, kind: captureKind, source: client } : null);
       audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ...(cap ?? {}), ...(extra ?? {}), ms: Date.now() - t0 });
       // 主频道 piggyback：成功响应尾附待裁提示（豁免正在处置的 inbox_* 工具）。发出即单记一条 nudge 审计。
       // nudge 传 identity 非 client 显示名——防重复状态按 token 身份隔离（显示名可重复，同名会互吞）。
@@ -441,7 +458,10 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
       if (n) audit({ client, trust, event: 'nudge', held_count: n.count });
       return { content: [{ type: 'text', text: render(result) + (n?.text ?? '') }] };
     } catch (e) {
-      const cap = captureKind ? { event: 'capture_attempt', kind: captureKind, source: client } : null;
+      const directAttempt = name === 'save' && (args?.path || args?.mode || args?.expected_content_id);
+      const cap = directAttempt
+        ? { event: 'direct_write', path: args?.path, mode: args?.mode, source: client }
+        : (captureKind ? { event: 'capture_attempt', kind: captureKind, source: client } : null);
       audit({ client, trust, tool: name, args: auditArgs(args), ok: false, ...(cap ?? {}), error: e.message, ms: Date.now() - t0 });
       return { content: [{ type: 'text', text: e.message }], isError: true };
     }
@@ -456,7 +476,7 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
     inputSchema: {
       query: z.string().describe('关键词'),
       zone: z.string().optional().describe('限定分区 id（如 todo/knowledge/collections/memory），不传=全库'),
-      include: z.string().optional().describe('可选，附加返回的分层：candidate（低置信旁置）/ rejected（被拒的隔离件，仅高信任）。可逗号组合，如 "candidate,rejected"。默认只返 canonical。'),
+      include: z.string().optional().describe('可选，附加返回的分层：candidate（低置信旁置）/ rejected（被拒隔离件，仅高信任）/ staging（未晋升 Skill，仅高信任）。可逗号组合；默认只返 canonical。'),
     },
     // 检索埋点（spec §6.3）：result_count + hit（hit=有命中）供落空率仪表；
     // query 原文（截断 200）供「部分召回失败」的事后离线分析——hit=true 但漏召时，
@@ -543,20 +563,36 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
     truncated: r?.truncated ?? false,
   })));
 
-  // ==== 写工具（高信任客户端）：全部只落 inbox 隔离区，keeper 审核后才入库 ====
+  // ==== 写工具（高信任客户端）：默认 inbox；显式授权者可对明确普通页走可信直写 ====
   if (trust === 'high') {
-    const receiptText = (r) => `✅ 已受理 → ${r.path}（状态 pending，keeper 审核后归档并通知主人）`;
+    const receiptText = (r) => r.route === 'direct'
+      ? `✅ 已可信直写 → ${r.path}（${r.mode}，doctor 已通过并已提交${r.sync_pending ? '；远端同步待后台重试' : ''}）`
+      : `✅ 已受理 → ${r.path}（状态 pending，keeper 审核后归档并通知主人）`;
 
     server.registerTool('save', {
-      title: '存入知识库（经收件箱）',
-      description: '把一段内容存进主人的知识库。主人明确说「记一下/存一下/收藏这段」时直接用；对话形成重要决定及理由但主人没明确要求保存时，先主动提议，主人同意后再用。内容落 inbox 隔离区，由 keeper 判断归入哪个分区。hint 可携带你或主人对去向的提示（如「决定」「餐厅」）；更新现有页时可明确写 `path: knowledge/xxx.md` 或 `content_id: 1234abcd`。完整 Skill 文档更新支持 `skills/<name>/SKILL.md`，新 Skill 须先写 `skills/_incoming/<name>/SKILL.md`。',
+      title: directWrite ? '存入知识库（可信直写或收件箱）' : '存入知识库（经收件箱）',
+      description: `${directWrite ? '本客户端已启用轻治理可信直写：对普通 Markdown 内容页，能明确安全目标时同时传 path + mode=create|append，可跳过 Keeper，经确定性校验、doctor 与 Git 直接落库；不能明确目标时省略它们，仍进 inbox。可信直写不支持覆盖、删除、Skill、治理/结构页或 typed zone。' : '本客户端未启用可信直写；内容进入 inbox，由 Keeper 归档。'} 主人明确说「记一下/存一下/收藏这段」时直接用；对话形成重要决定及理由但主人没明确要求保存时，先主动提议，主人同意后再用。普通 inbox 更新现有页仍可在 hint 写 path 或 content_id。Skill staging 支持完整目录：先保存 skills/_incoming/<name>/SKILL.md，之后可继续保存同目录 resources；普通 save 永远不能直接新建正式 skills/<name>/。`,
       inputSchema: {
         content: z.string().describe('要保存的内容原文'),
         hint: z.string().optional().describe('去向提示（可选），如：决定/事实/餐厅/想试；现有页可写 path: <相对路径> 或 content_id: <8位id>'),
+        path: z.string().optional().describe('可信直写的明确目标页，如 knowledge/decision-log.md；须与 mode 同传。省略则按原流程进 inbox'),
+        mode: z.enum(['create', 'append']).optional().describe('可信直写动作：create 仅目标不存在时新建；append 仅目标存在时追加。须与 path 同传'),
+        expected_content_id: z.string().regex(/^[0-9a-f]{8}$/).optional().describe('append 可选的对象身份校验；若目标页有 content_id，建议从 read_page 取回后传入'),
       },
-    }, wrap('save', async ({ content, hint }) => inbox.addEntry({
-      kind: 'save', content, hint, client, admission: admission('save', 'save'),
-    }), receiptText, null, 'save'));
+    }, wrap('save', async ({ content, hint, path: directPath, mode, expected_content_id }) => {
+      const requestedDirect = directPath !== undefined || mode !== undefined || expected_content_id !== undefined;
+      if (requestedDirect) {
+        if (!directWrite) throw new Error('[DIRECT_NOT_ENABLED] 本客户端未启用可信直写；请省略 path/mode 走 inbox，或由 owner 在服务配置中授权');
+        if (!directPath || !mode) throw new Error('[DIRECT_ARGUMENTS_INCOMPLETE] 可信直写须同时提供 path 与 mode');
+        return directPageWrite({
+          instanceDir, writer, indexStore, client, page: directPath, content, mode,
+          expectedContentId: expected_content_id,
+        });
+      }
+      return { ...inbox.addEntry({
+        kind: 'save', content, hint, client, admission: admission('save', 'save'),
+      }), route: 'inbox' };
+    }, receiptText, (r) => ({ write_route: r?.route ?? 'inbox', write_target: r?.route === 'direct' ? r.path : undefined }), 'save'));
 
     server.registerTool('todo_add', {
       title: '加待办（经收件箱）',
@@ -607,24 +643,64 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
       inputSchema: {},
     }, wrap('inbox_list', async () => {
       const listed = inbox.listEntries();
-      return identity.channel === 'primary' ? listed : { entries: listed.entries.filter((e) => e.kind !== 'core') };
+      return identity.channel === 'primary' ? listed : { entries: listed.entries.filter((e) => e.kind !== 'core' && e.kind !== 'skill') };
     }, asJson));
 
     server.registerTool('inbox_resolve', {
       title: '主人裁定收件',
-      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。提案件（schema/maintenance/core）批准请传 option 点选候选；core 仅主频道可见、可批。仅在主人明确表态后使用，id 用 inbox_list 查。',
+      description: '把主人对某条收件的裁定传给 keeper（例：「这条进 todo」「扔掉别存」「并入 knowledge 的 xxx 页」）。keeper 会按裁定执行并自动把这次纠正记入判例集。提案件（schema/maintenance/core/skill）批准请传 option 点选候选；core/skill 仅主频道 owner 可审。仅在主人明确表态后使用，id 用 inbox_list 查。',
       inputSchema: {
         id: z.string().describe('收件 id（inbox_list 可查）'),
         ruling: z.string().describe('主人的裁定原话，一句话'),
-        option: z.number().int().min(0).optional().describe('点选候选方案的序号（inbox_list 里 options[].index）——提案件（schema/maintenance/core）批准用它，比转述 ruling 更准'),
+        option: z.number().int().min(0).optional().describe('点选候选方案的序号（inbox_list 里 options[].index）——提案件（schema/maintenance/core/skill）批准用它，比转述 ruling 更准'),
       },
     }, wrap('inbox_resolve', async ({ id, ruling, option }) => {
       const hit = inbox.listEntries().entries.find((e) => e.id === id);
       if (hit?.kind === 'core' && identity.channel !== 'primary') throw new Error('核心小抄提案只能在主频道审阅与批准');
+      if (hit?.kind === 'skill' && identity.channel !== 'primary') throw new Error('Skill 晋升审核只能在主频道由 owner 批准或拒绝');
       return inbox.resolveEntry({ id, ruling, option, via: client, viaTrust: trust, viaChannel: identity.channel });
     },
       (r) => `✅ 裁定已受理（${r.ruling}）→ ${r.path} 复位待 keeper 重判，结果会通知主人并自动立判例`,
       rulingAuditFields));
+
+    // ==== Skill staging → owner review → 原子晋升 ====
+    server.registerTool('skill_inspect', {
+      title: '检查待晋升 Skill 目录',
+      description: '检查 skills/_incoming/<name>/ 的完整目录、manifest、capabilities admission 结果、content_id 与整树 revision。晋升前先调用它；revision 会绑定 supporting files，批准后任何文件变化都会令旧批准失效。未晋升内容状态为 staging，不是 canonical。',
+      inputSchema: { name: z.string().regex(SKILL_NAME_RE).describe('skills/_incoming/ 下的 Skill 目录名') },
+    }, wrap('skill_inspect', async ({ name }) => inspectSkillDirectory(instanceDir, name), asJson,
+      (r) => ({ event: 'skill_inspect', skill_name: r?.name, skill_revision: r?.revision, skill_admission: r?.manifest?.admission })));
+
+    server.registerTool('promote_skill', {
+      title: '提交 Skill 晋升审核',
+      description: '把完整 staged Skill 提交给 owner 审核。本调用不会直接写正式目录：它创建内容绑定、可点选的审核 receipt；owner 在主频道用 inbox_resolve 选择“批准晋升此版本/拒绝”，keeper 才会原子 rename 整个目录、跑 doctor 并提交。所有风险等级当前都要求 owner 审核；正式目标已存在时默认拒绝覆盖。重复提交同一版本返回同一待审 receipt 或已晋升结果。',
+      inputSchema: {
+        name: z.string().regex(SKILL_NAME_RE).describe('staged Skill 目录名'),
+        content_id: z.string().regex(/^[0-9a-f]{8}$/).describe('skill_inspect 返回的根 SKILL.md content_id'),
+        revision: z.string().regex(/^[0-9a-f]{64}$/).describe('skill_inspect 返回的整棵目录 revision'),
+      },
+    }, wrap('promote_skill', async ({ name, content_id, revision }) => {
+      const result = requestSkillPromotion({
+        instanceDir, inbox, name, contentId: content_id, revision, client,
+        admission: admission('promote_skill', 'skill'),
+      });
+      if (result.created && notify) {
+        notify([
+          '🛡️ Skill 待 owner 晋升审核',
+          `${name}（${result.manifest.admission}）`,
+          `content_id=${result.content_id} revision=${result.revision}`,
+          `${result.file_count} files / ${result.total_bytes} bytes`,
+          `审核件：${result.id}；请在主频道选择“批准晋升此版本”或“拒绝晋升”。`,
+        ].join('\n'));
+      }
+      return result;
+    }, (r) => r.already_promoted
+      ? `✅ Skill 已按同一版本晋升（幂等）→ ${r.target}`
+      : `🛡️ Skill 晋升审核${r.created ? '已创建' : '已存在'} → ${r.path}（receipt ${r.id}，owner 须在主频道点选批准/拒绝；尚未写入正式目录）`,
+    (r) => ({
+      event: r?.already_promoted ? 'skill_promotion_idempotent' : 'skill_promotion_requested',
+      skill_name: r?.name, skill_revision: r?.revision, review_id: r?.id, created: r?.created,
+    })));
 
     // ==== schema 演化（M4.4）：提议新 zone → 主频道浮出 → 主人点选批准 → apply（doctor 校验回滚）====
     server.registerTool('schema_propose', {
@@ -885,6 +961,7 @@ if (isMain) {
     PUBLIC_URL,                        // M4.8：对外基址（拼 /enroll 里的 curl / mcp add 示例）
     RAILWAY_PUBLIC_DOMAIN,             // Railway 注入的域名（无 scheme）——PUBLIC_URL 缺省时回落它
     ENROLL_CODE_TTL_MS = 900_000,      // M4.8：enrollment 码有效期（默认 15 分钟）
+    TRUSTED_DIRECT_CLIENTS = '',        // 逗号分隔 client 名；含 enrolled client，high 才生效
   } = process.env;
   if (!REPO_URL || !TOKENS_JSON) {
     console.error('缺少 REPO_URL / TOKENS_JSON 环境变量');
@@ -923,6 +1000,7 @@ if (isMain) {
 
   // recall 复用 keeper 单写口增量刷新的【同一个】 indexStore，读到的是最新归档结果。
   const app = createApp({ instanceDir, tokens, audit, eventStore, provider, indexStore, nudgeTtlMs: Number(NUDGE_TTL_MS),
+    trustedDirectClients: TRUSTED_DIRECT_CLIENTS.split(',').map((name) => name.trim()).filter(Boolean),
     notify: notifier.notify, publicUrl, enrollCodeTtlMs: Number(ENROLL_CODE_TTL_MS) });
   const state = app.locals.state;
 

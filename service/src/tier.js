@@ -6,6 +6,7 @@
 //   canonical —— 高置信、事实性强：进主检索、默认可见（无 tier 的存量页一律视同 canonical，§6.1 迁移铁律）。
 //   candidate —— 价值可疑但不至于拒：落库、低权重、默认检索不含、include=candidate 可查。
 //   rejected  —— keeper 判低价值（disposition=forbidden 但非密钥红线）：隔离可查、带旗标、默认检索排除。
+//   staging   —— skills/_incoming 下尚未 owner 批准晋升的 Skill；仅高信任显式 include=staging 可见。
 //                注意：密钥/凭据红线仍走 inbox.addEntry 真拒、不落盘、不进分层（§7），与本模块无关。
 import { stripScalar } from './acl.js';
 
@@ -13,9 +14,9 @@ export const DEFAULT_TIER = 'canonical';
 // 模型「决定」里可产出的分层（写路径）：rejected 不由模型判，而是 keeper 判 forbidden(非红线) 后由代码落盘。
 export const DECISION_TIERS = new Set(['canonical', 'candidate']);
 // 全部分层（读路径可见性）。
-export const TIERS = new Set(['canonical', 'candidate', 'rejected']);
+export const TIERS = new Set(['canonical', 'candidate', 'rejected', 'staging']);
 // 高→低档位：晋升「不降级」比大小用它（canonical 最高，rejected 最低）。
-export const TIER_RANK = { canonical: 2, candidate: 1, rejected: 0 };
+export const TIER_RANK = { canonical: 2, candidate: 1, rejected: 0, staging: 0 };
 
 // 缺省即 canonical（§6.1：无 tier 视同 canonical）；非法值也归一到 canonical（读侧宽容）。
 // 缺陷4：按 YAML 标量语义归一——先 trim（吃掉 `tier:` 后残留空格），再剥一层引号（复用 acl.stripScalar），
@@ -75,7 +76,7 @@ export function normalizeInclude(include) {
   const out = [];
   for (const x of arr) {
     const t = String(x).trim();
-    if ((t === 'candidate' || t === 'rejected') && !out.includes(t)) out.push(t);
+    if ((t === 'candidate' || t === 'rejected' || t === 'staging') && !out.includes(t)) out.push(t);
   }
   return out;
 }

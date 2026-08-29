@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  BEHAVIOR_RULES, DIGEST_RULES, INSTRUCTIONS, PRIMARY_RULES, SELF_WIRE,
+  BEHAVIOR_RULES, DIRECT_WRITE_RULES, DIGEST_RULES, INSTRUCTIONS, PRIMARY_RULES, SELF_WIRE,
   instructionsFor, enrollProtocol,
 } from '../src/instructions.js';
 
@@ -34,6 +34,14 @@ test('instructionsFor：high 信任附常驻宿主自装指引，low 不附', ()
 test('instructionsFor：primary+high = 基础 + 自装 + 主频道房规，顺序稳定', () => {
   const primary = instructionsFor({ trust: 'high', channel: 'primary' });
   assert.equal(primary, INSTRUCTIONS + SELF_WIRE + PRIMARY_RULES);
+});
+
+test('instructionsFor：可信直写仅在显式授权参数下附加，且不覆盖主频道规则', () => {
+  const direct = instructionsFor({ trust: 'high', channel: 'primary' }, { directWrite: true });
+  assert.equal(direct, INSTRUCTIONS + DIRECT_WRITE_RULES + SELF_WIRE + PRIMARY_RULES);
+  assert.match(direct, /path \+ mode=create\|append/);
+  assert.match(direct, /不做整页覆盖/);
+  assert.doesNotMatch(instructionsFor({ trust: 'high' }), /本连接由 owner 显式授权为 trusted-direct/);
 });
 
 test('enrollProtocol：Hermes 类宿主条目给出具体落地文件与保旧铁律', () => {

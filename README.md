@@ -27,6 +27,10 @@ Your context today is scattered across tools, and every new AI you open starts f
 
 > **你尽可以往里猛倒——它照样好用。** 存一条只要一句话、立刻落地；随后由一个 keeper agent 在后台把每一件分拣归档——哪些进主库、哪些留作低优先、哪些值得单开一个新类别。你添加时尽管随意，记忆照样保持干净。
 
+For a personal instance with only a few trusted agents, an opt-in **light-governance mode** lets those clients create or append an explicitly named ordinary page after deterministic checks and doctor, while ambiguous and high-risk work still goes through the keeper. See [docs/07](docs/07-light-governance.md).
+
+> 如果个人实例只有少数可信 agent，可选择开启**轻治理模式**：明确目标的普通页新建/追加经过确定性校验和 doctor 后直接落库；目标不明和高风险操作仍交给 keeper。详见 [docs/07](docs/07-light-governance.md)。
+
 **It's yours to keep — plain files, offline, forever.** The memory is just markdown in a git repo. One `git clone` and you walk away with all of it: readable, offline, not locked in anyone's service. If this project vanished tomorrow, you'd lose nothing.
 
 > **它永远是你的——纯文件、可离线、拿了就走。** 这份记忆就是 git 仓库里的 markdown。一次 `git clone`，全部带走：可读、可离线、不锁在任何人的服务里。哪怕这项目明天消失，你也一条不丢。
@@ -37,13 +41,13 @@ Your context today is scattered across tools, and every new AI you open starts f
 
 ## How it earns trust · 它怎样建立信任
 
-One design choice holds it all together: **the AI only advises — it never writes your files itself.**
+One design choice holds it all together: **an AI never gets raw filesystem access — bounded, testable code performs every write.**
 
-> 一个设计选择撑起这一切：**AI 只出主意——从不亲手写你的文件。**
+> 一个设计选择撑起这一切：**AI 永远拿不到裸文件系统权限——每次写入都由有界、可测的代码执行。**
 
-The keeper reads what comes in and outputs only a *decision* — file it here, hold it, ask you, refuse it — always with a plain reason; ordinary, testable code carries that decision out. Hidden instructions in captured content cannot directly become file operations: an allow-listed executor validates and applies the decision, backed by adversarial regression tests. Recognized credential patterns are refused before they land, and audits record metadata without copying private write content or credentials. This does not make any hosted system risk-free, but it sharply limits what a poisoned input can do and leaves a visible trail.
+In the default path, the keeper reads what comes in and outputs only a *decision* — file it here, hold it, ask you, refuse it — while ordinary code carries that decision out. In opt-in light mode, a trusted client may request only an explicit ordinary-page create or append; the same allow-listed policy, credential scan, doctor, Git transaction and rollback still apply. Recognized credential patterns are refused before they land, and audits record metadata without copying private write content or credentials. This does not make any hosted system risk-free, but it limits the available effects and leaves a visible trail.
 
-> keeper 读进来的东西，只产出一个「决定」——归这儿、搁置、问你一句、拒收——都附一句人话理由；执行的是一段普通、可测的白名单代码。藏在内容里的指令不能直接变成文件操作，决定还要经过确定性校验和对抗回归测试。已识别的凭据模式会在落盘前被拒收，审计只记元数据、不复制私人写入正文或凭据。这不代表托管系统绝对零风险，但它显著压小了带毒输入的爆炸半径，并留下可查的轨迹。
+> 默认路径里，keeper 读进来的东西只产出一个「决定」——归这儿、搁置、问你一句、拒收；普通白名单代码才执行。轻治理模式里，可信客户端也只能请求明确普通页的 create/append，仍经过同一套 effect policy、凭据扫描、doctor、Git 事务和回滚。审计只记元数据、不复制私人正文或凭据。这不代表托管系统零风险，但它限制了可用副作用，并留下可查轨迹。
 
 This shape has a name: **Governed Agent Memory** — one long-term memory, many agents (and one day, many people), governed so it stays honest, with you keeping the final say. The full pattern: **[docs/05](docs/05-pattern-gam.md)**.
 
@@ -58,13 +62,13 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 | | Built-in AI memory<br>ChatGPT/Claude | Agent-local memory<br>Hermes/OpenClaw | Note-taking apps<br>Obsidian/Notion | **substrate-service** |
 |---|---|---|---|---|
 | Who shares it? | That app only | That agent on that machine | You search it yourself | **All of your agents** |
-| Who curates it? | Platform black box | Each agent writes ad hoc, with no shared rules | You do it manually | **A server-side keeper enforces shared rules** |
+| Who curates it? | Platform black box | Each agent writes ad hoc, with no shared rules | You do it manually | **Server-side policy; keeper for ambiguous/risky work** |
 | Who owns the data? | Locked into the platform | Local, but fragmented across agents | Depends on the app | **Plain markdown + git, fully yours** |
 
 > | | AI 自带记忆<br>ChatGPT/Claude | agent 本地记忆<br>Hermes/OpenClaw | 笔记软件<br>Obsidian/Notion | **substrate-service** |
 > |---|---|---|---|---|
 > | 谁共享？ | 只有那个 app | 只有那台机器上的那个 agent | 靠你自己翻 | **你所有的 agent** |
-> | 谁维护？ | 平台黑箱 | 各 agent 随手记，没有共同房规 | 你手动维护 | **服务端 keeper 按共同房规强制治理** |
+> | 谁维护？ | 平台黑箱 | 各 agent 随手记，没有共同房规 | 你手动维护 | **服务端强制边界；keeper 处理歧义和高风险** |
 > | 数据归谁？ | 锁在平台里 | 虽在本地，却散落在各 agent 中 | 取决于 app | **纯 markdown + git，完全属于你** |
 
 **Why an MCP version?** The substrate engine ([v1](https://github.com/wheam/substrate)) packages governance as skills installed into each agent. It is powerful, but every new agent needs the skills, every machine needs a clone of the instance, and governance depends on each agent following the rules. That per-agent setup tax grows quickly. This project (v2) centralizes the same idea as an MCP service:
@@ -75,7 +79,7 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 |---|---|---|
 | Add a new agent | Install ~10 skills + clone the instance | **One prompt + a one-time code** |
 | Local device state | A clone + git credentials on every machine | **No local state; connect directly** |
-| Governance | Each agent must follow the rules voluntarily | **Enforced server-side; no agent can bypass it** |
+| Governance | Each agent must follow the rules voluntarily | **Effect boundaries enforced server-side; keeper strict by default, light mode opt-in** |
 | Phone access | Awkward with a skills-only model | **Naturally reachable as a service** |
 | Maintenance | Every agent runs doctor/sync itself | **Automated by the keeper and nightly jobs** |
 
@@ -83,7 +87,7 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 > |---|---|---|
 > | 接一个新 agent | 安装约 10 个 skill + clone 实例 | **一段 prompt + 一个一次性码** |
 > | 设备本地状态 | 每台机器都要有 clone + git 凭据 | **零本地状态，直接连接** |
-> | 治理 | 靠各 agent 自觉遵守 | **服务端强制，任何 agent 都绕不过** |
+> | 治理 | 靠各 agent 自觉遵守 | **副作用边界服务端强制；默认 Keeper，轻治理需显式授权** |
 > | 手机可达 | 纯 skills 模型较难 | **服务天然可达** |
 > | 维护 | 各 agent 自己运行 doctor/sync | **keeper + 夜间任务自动完成** |
 
@@ -98,7 +102,8 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
                    ▼  MCP / capture endpoint
       ┌─────────────────────────────────┐
       │  substrate-service              │
-      │  ├─ isolated inbox (fast, no LLM on the write path)
+      │  ├─ deterministic trusted-direct lane (opt-in)
+      │  ├─ isolated inbox (default / ambiguous writes)
       │  ├─ keeper agent (decides, never writes directly)
       │  └─ your instance (markdown + git)
       └────────────────┬────────────────┘
@@ -117,7 +122,8 @@ It's **not** another note-taking app, and not one chatbot with memory bolted on.
 >                   ▼  MCP / capture 端点
 >      ┌─────────────────────────────────┐
 >      │  substrate-service              │
->      │  ├─ inbox 隔离区（写路径无 LLM，快速响应）
+>      │  ├─ 确定性可信直写通道（显式开启）
+>      │  ├─ inbox 隔离区（默认 / 目标不明的写入）
 >      │  ├─ keeper 守门 agent（只作决定，不直接写文件）
 >      │  └─ 你的实例（markdown + git）
 >      └────────────────┬────────────────┘
@@ -145,13 +151,13 @@ This repository keeps its **Dockerfile in the `service/` subdirectory** (`servic
 
 1. **Root Directory = `service`** — otherwise Railway looks for the Dockerfile at the repository root, the `COPY` paths do not line up, and the build fails. The root [`railway.json`](railway.json) declares Dockerfile builds, the `/healthz` check, and the restart policy; Root Directory must still point to `service` in the wizard or dashboard.
 2. **Persistent volume mount path = `/data`** — `DATA_DIR` defaults to `/data`, and the instance is cloned into `/data/instance`.
-3. **Required environment variables** — `REPO_URL` (the git URL of your private instance repository) and `TOKENS_JSON` (the client-token table as JSON). Every other variable has a safe default; see **[INSTALL_FOR_AGENTS.md §4/§5](INSTALL_FOR_AGENTS.md)** for the full list and the `TOKENS_JSON` format. `DEEPSEEK_API_KEY` is optional. Without it, the keeper does not file inbox items and `recall` is not registered, leaving a read-only fallback.
+3. **Required environment variables** — `REPO_URL` (the git URL of your private instance repository) and `TOKENS_JSON` (the client-token table as JSON). Every other variable has a safe default; see **[INSTALL_FOR_AGENTS.md §4/§5](INSTALL_FOR_AGENTS.md)** for the full list and the `TOKENS_JSON` format. `DEEPSEEK_API_KEY` is optional. Without it, the keeper does not file inbox items and `recall` is not registered; explicitly authorized trusted-direct writes still work.
 
 > 本仓库的 **Dockerfile 位于 `service/` 子目录**（`service/Dockerfile`）。所有 `COPY` 路径都相对 `service/`，入口为 `docker-entrypoint.sh → node src/server.js`。无论通过哪种方式部署到 Railway，都要确认下面三项，否则服务无法启动：
 >
 > 1. **Root Directory = `service`**——否则 Railway 会在仓库根目录查找 Dockerfile，`COPY` 路径也会错位，最终导致构建失败。仓库根目录的 [`railway.json`](railway.json) 已声明 Dockerfile 构建、`/healthz` 健康检查和重启策略；但仍需在向导或控制台中把 Root Directory 指向 `service`。
 > 2. **持久卷挂载路径 = `/data`**——`DATA_DIR` 默认为 `/data`，实例会被 clone 到 `/data/instance`。
-> 3. **必填环境变量**——`REPO_URL`（实例私有仓库的 git URL）和 `TOKENS_JSON`（JSON 格式的客户端 token 表）。其他变量都有安全默认值；完整列表和 `TOKENS_JSON` 格式参见 **[INSTALL_FOR_AGENTS.md §4/§5](INSTALL_FOR_AGENTS.md)**。`DEEPSEEK_API_KEY` 为可选项；不提供时 keeper 不执行归档，`recall` 也不会注册，服务退化为只读模式。
+> 3. **必填环境变量**——`REPO_URL`（实例私有仓库的 git URL）和 `TOKENS_JSON`（JSON 格式的客户端 token 表）。其他变量都有安全默认值；完整列表和 `TOKENS_JSON` 格式参见 **[INSTALL_FOR_AGENTS.md §4/§5](INSTALL_FOR_AGENTS.md)**。`DEEPSEEK_API_KEY` 为可选项；不提供时 keeper 不执行 inbox 归档，`recall` 也不会注册；显式授权的可信直写仍可工作。
 
 ### Connect more agents with one prompt · 用一段 prompt 接入更多 agent
 
@@ -177,27 +183,29 @@ Once installed, use natural language and let your agent call the matching tool:
 
 | You say | Tool | What happens |
 |---|---|---|
-| “Save this / put this in my knowledge base” | `save` | Lands in the inbox; the keeper chooses a zone |
+| “Save this / put this in my knowledge base” | `save` | Default: inbox; trusted-direct clients may create/append an explicit ordinary page immediately |
 | “Remember that I… / my preference is…” | `remember` | Lands in the inbox and is filed under memory |
 | “Save this restaurant / add this to my reading list” | `collections_upsert` | Lands in the inbox and is filed as a collection item |
 | “Add a task / what is left this week?” | `todo_add` / `todo_list` | Adds or lists your tasks |
 | “Find what I saved about X / what do I know about Y?” | `search` / `recall` | `recall` answers with citations and gap hints |
 | “What is waiting for my decision?” | `inbox_list` / `inbox_resolve` | Surfaces cases in the primary channel; your ruling becomes precedent |
+| “Review and promote this staged Skill” | `skill_inspect` / `promote_skill` / `inbox_resolve` | Binds approval to the complete staged tree, then atomically promotes it; ordinary `save` cannot write a new canonical Skill |
 
 > 安装完成后，直接使用自然语言，agent 会调用相应的工具：
 >
 > | 你说 | 工具 | 会发生什么 |
 > |---|---|---|
-> |「记一下 / 存进知识库」| `save` | 进入 inbox，由 keeper 判断归入哪个 zone |
+> |「记一下 / 存进知识库」| `save` | 默认进 inbox；可信直写客户端可对明确普通页立即 create/append |
 > |「记住我…… / 我的偏好是……」| `remember` | 进入 inbox，并归入 memory 区 |
 > |「收藏这家餐厅 / 加进书单」| `collections_upsert` | 进入 inbox，并归为收藏条目 |
 > |「加个待办 / 这周还剩什么？」| `todo_add` / `todo_list` | 添加或列出待办 |
 > |「查我存过的 X / 关于 Y 我知道什么？」| `search` / `recall` | `recall` 给出带引用的回答和信息缺口提示 |
 > |「有哪些事情等我裁定？」| `inbox_list` / `inbox_resolve` | 在主频道浮出案例；你的裁定会自动成为判例 |
+> |「审核并晋升这个暂存 Skill」| `skill_inspect` / `promote_skill` / `inbox_resolve` | 批准绑定完整 staging 目录版本，再原子化晋升；普通 `save` 不能新建正式 Skill |
 
-Every write enters the isolated inbox first and is reviewed by the keeper before filing — **accepted does not mean filed**. An agent should only say: “Accepted; the keeper will file it.”
+By default, writes enter the isolated inbox and **accepted does not mean filed**. In light-governance mode, only a response explicitly saying “trusted direct write completed” means the ordinary page is already filed; risky operations keep their governed workflows.
 
-> 所有写入都会先进入隔离的 inbox，再由 keeper 审核归档——**已受理不等于已入库**。agent 只应回复：「已受理，keeper 会归档。」
+> 默认写入先进入隔离 inbox，**已受理不等于已入库**。轻治理模式下，只有响应明确写“已可信直写”才表示普通页已经入库；高风险操作仍走受治理流程。
 
 ## Status · 状态
 
@@ -208,6 +216,7 @@ Personal alpha, used daily by the author as tenant #1. Every milestone is runnin
 ## Docs · 文档
 
 - **[docs/05 — Governed Agent Memory](docs/05-pattern-gam.md)** — a standalone, public explanation of the pattern.
+- **[docs/07 — Light governance](docs/07-light-governance.md)** — opt-in trusted direct writes for a personal instance with a few trusted agents.
 - **[INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md)** — an installation protocol to hand to an agent so it can set up the service for you.
 - **[run-local.md](run-local.md)** — try it on one local machine without the cloud.
 - **[docs/README.md](docs/README.md)** — overview of the design and milestones (02 productization / 03 next-version spec / 05 pattern).

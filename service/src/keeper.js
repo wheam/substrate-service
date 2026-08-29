@@ -11,10 +11,13 @@ import {
 import { admissionFromRaw, parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
 import { findPagesByContentId } from './content-id.js';
+import {
+  finalizeSkillPromotion, rollbackSkillPromotion, validateStagedSkillPath,
+} from './skill-promotion.js';
 
 // SKIP_LLM kinds（M4.4 D2）：提案件（schema/maintenance）直达主人、keeper 绝不 LLM 判它们。
 // 有主人预批决定 → 走现有校验执行流；无 → re-held 提示点选（纯文字裁定永不触发执行/清场，防误伤）。
-const SKIP_LLM_KINDS = new Set(['schema', 'maintenance', 'core']);
+const SKIP_LLM_KINDS = new Set(['schema', 'maintenance', 'core', 'skill']);
 const CANONICAL_SKILL_PATH_RE = /^skills\/[a-z0-9][a-z0-9._-]*\/SKILL\.md$/;
 const INCOMING_SKILL_PATH_RE = /^skills\/_incoming\/[a-z0-9][a-z0-9._-]*\/SKILL\.md$/;
 const MAX_AUTO_RETRIES = 6;
@@ -37,11 +40,26 @@ function explicitPagePath(hint) {
   return labelled ?? null;
 }
 
+function explicitStagedSkillPath(hint) {
+  const s = String(hint ?? '').trim();
+  const candidates = [];
+  const direct = s.match(/^`?(skills\/_incoming\/[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9._\/-]+)`?$/)?.[1];
+  if (direct) candidates.push(direct);
+  const labelled = s.match(/(?:^|\s)(?:target_path|path|目标路径|路径)\s*[:：=]\s*`?(skills\/_incoming\/[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9._\/-]+)`?(?=$|[\s,，。;；)）])/u)?.[1];
+  if (labelled) candidates.push(labelled);
+  const prefixed = s.match(/^`?(skills\/_incoming\/[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9._\/-]+)`?\s*[:：;；]/u)?.[1];
+  if (prefixed) candidates.push(prefixed);
+  for (const candidate of candidates) {
+    try { validateStagedSkillPath(candidate); return candidate; } catch { /* 继续；最终按无显式 staging 目标处理 */ }
+  }
+  return null;
+}
+
 // hint 是路由提示，不是正文；但 inbox 文件会经 git pull，仍可能是伪造件。只有本进程 addEntry 亲生、
 // 或经 resolveEntry 真认证过的件，才允许显式 path/content_id 绕过模型猜路径。其余件保持旧的 LLM→白名单校验流。
 function resolvePageIntent(instanceDir, entry) {
   const requestedId = explicitContentId(entry.hint);
-  const requestedPath = explicitPagePath(entry.hint);
+  const requestedPath = explicitStagedSkillPath(entry.hint) ?? explicitPagePath(entry.hint);
   if (!requestedId && !requestedPath) return null;
   // 主人裁定后的计划以裁定为准，旧 hint 退回纯材料，绝不能在裁定后再改写 action/target。
   if (entry.__ruling_authentic) return null;
@@ -73,6 +91,19 @@ function resolvePageIntent(instanceDir, entry) {
     if (byId && byId !== requestedPath) {
       return { state: 'ambiguous', error: `显式路径 ${requestedPath} 与 content_id ${requestedId} 的真实路径 ${byId} 不一致`, holdClass: 'owner' };
     }
+    if (requestedPath.startsWith('skills/_incoming/')) {
+      let staged;
+      try { staged = validateStagedSkillPath(requestedPath); }
+      catch (e) { return { state: 'invalid', error: e.message, holdClass: 'security' }; }
+      return {
+        state: existsSync(path.join(instanceDir, requestedPath)) ? 'existing' : 'absent',
+        kind: staged.root ? 'skill-root' : 'skill-resource',
+        skillName: staged.name,
+        rel: requestedPath,
+        zoneId: zone.id,
+        trusted: true,
+      };
+    }
     if (existsSync(path.join(instanceDir, requestedPath))) {
       return { state: 'existing', kind: 'existing', rel: requestedPath, zoneId: zone.id, contentId: requestedId, trusted: true };
     }
@@ -95,12 +126,15 @@ function applyPageIntent(decision, entry) {
   if (!intent || decision?.disposition === 'forbidden') return decision;
   const resolved = { ...decision, zone: intent.zoneId, target: intent.rel };
   const actionForIntent = () => {
+    if (intent.kind === 'skill-root' || intent.kind === 'skill-resource') return 'stage_skill_file';
     if (intent.kind === 'new-skill' || intent.state === 'absent') return 'new_page';
     if (CANONICAL_SKILL_PATH_RE.test(intent.rel)) return 'replace_skill';
     return 'merge_into';
   };
   resolved.action = actionForIntent();
-  if (intent.kind === 'new-skill') {
+  if (intent.kind === 'skill-root' || intent.kind === 'skill-resource') {
+    resolved.action = 'stage_skill_file';
+  } else if (intent.kind === 'new-skill') {
     resolved.action = 'new_page';
   } else if (intent.state === 'absent') {
     resolved.action = 'new_page';
@@ -609,9 +643,13 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
 
   async function holdEntry(entry, rel, reason, { holdClass = 'owner' } = {}) {
     let options = [];
+    const deterministicSkillStage = entry.__page_intent?.kind === 'skill-root'
+      || entry.__page_intent?.kind === 'skill-resource';
     // SKIP_LLM kinds（提案件）已自带确定性候选块、且 keeper 绝不 LLM 判它们——即便执行失败也不再调 LLM 生成候选
     // （否则对提案件的对抗正文会触发一次 LLM 调用）。它们只重新 held、保留自带候选。
-    if (holdClass === 'owner' && !SKIP_LLM_KINDS.has(entry.kind)) {
+    // 显式 _incoming staging 同样由代码完整解析；校验失败只保留一条可审计 held 件，不请模型编造
+    // “换个保存位置”等会绕开 staging 边界的候选，更不会形成无意义的重复通知链。
+    if (holdClass === 'owner' && !SKIP_LLM_KINDS.has(entry.kind) && !deterministicSkillStage) {
       try { options = await generateOptions(entry, reason); }
       catch (e) { console.error(`候选方案生成失败：${e.message}`); }
     }
@@ -684,6 +722,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     entry.__ruling_authentic = authentic;
     entry.__ruling_trust = authentic ? (rec.viaTrust ?? null) : null;
     entry.__ruling_channel = authentic ? (rec.viaChannel ?? null) : null;
+    entry.__ruling_via = authentic ? (rec.via ?? entry.ruling_via ?? null) : null;
+    entry.__ruling_at = authentic ? (rec.approvedAt ?? null) : null;
     // SEC-2（审计 B §4 + 二轮加固）：件是否本进程 addEntry 亲生【且未被篡改】——按【内容绑定】token 复算比对，
     // 不再只按公开 id（一轮 Set<id> 被 id 复用打穿）。executor 的 remove_page 分支据此收紧 kind=remove 旁路
     // （认证「主人动过手」≠ 认证「件是服务端亲生的」）。伪造件复用历史 native id 但正文/kind 不符 → token 失配 →
@@ -782,6 +822,14 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     if (entry.approved_decision) {
       // 主人已点选候选方案：预批决定直接进校验与执行，不再消耗判断
       decision = entry.approved_decision;
+    } else if (entry.__page_intent?.kind === 'skill-root' || entry.__page_intent?.kind === 'skill-resource') {
+      // _incoming 文件路径已经由代码按认证 hint 解析；staging 是隔离写，不需要模型再猜 action/target。
+      // 执行器仍会复验 capability、根文件、路径、大小与普通文件类型。
+      decision = {
+        disposition: 'canonical', zone: 'skills', action: 'stage_skill_file', target: entry.__page_intent.rel,
+        summary: `暂存 Skill 文件 ${entry.__page_intent.rel}`, confidence: 1, tier: 'canonical',
+      };
+      model = 'deterministic-skill-stage';
     } else {
       let judged;
       try {
@@ -826,7 +874,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     // 本机亲生普通件上，“模型选了 admission 不允许的 effect”是规划错误，
     // 不是安全事件，更不是主人决策题。给升级档一次带硬边界的 repair；若仍越权，
     // 归类为 retryable model/policy 失配。伪造/篡改件（!__native）不获得 repair 机会，继续 security 隔离。
-    if (!v.ok && v.holdClass !== 'owner' && entry.__native && !entry.approved_decision) {
+    const deterministicSkillStage = entry.__page_intent?.kind === 'skill-root' || entry.__page_intent?.kind === 'skill-resource';
+    if (!v.ok && v.holdClass !== 'owner' && entry.__native && !entry.approved_decision && !deterministicSkillStage) {
       try {
         const repaired = await judgeEntry(entry, { repair: { reason: v.reason, decision } });
         decision = applyPageIntent(repaired.json, entry);
@@ -867,7 +916,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
             rmSync(path.join(instanceDir, rel));
             // core 提案是派生治理件，不是 keeper 语义判例；把整份 always-load 草案写进 _cases 会污染 future few-shot。
             const paths = [rel];
-            if (entry.kind !== 'core') paths.push(appendCase(entry, decision, 'rejected（主人裁定）'));
+            if (!['core', 'skill'].includes(entry.kind)) paths.push(appendCase(entry, decision, 'rejected（主人裁定）'));
             await commitDurably(commit, { paths, message: `keeper: rejected ${entry.id}（主人裁定）` });
           } else {
             // keeper 主动拒收：件不再丢——标 tier: rejected「隔离可查」（spec §3.1 / §6.2），留 inbox 待主人复核。
@@ -939,7 +988,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
           changedPaths = applied.changedPaths;
           rmSync(path.join(instanceDir, rel));
           const paths = [...applied.changedPaths, rel];
-          if (entry.kind !== 'core' && entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
+          if (!['core', 'skill'].includes(entry.kind) && entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
 
           // 普通内容写与 schema/core 一样，doctor 是 commit/push 前的硬闸门：
           // ERROR 或 doctor 自身不可用都不允许把漂移推上主分支。
@@ -970,6 +1019,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
                 instanceDir, rollbackToken: applied.rollbackCoreToken, entryRel: rel, entryRaw: entry.raw,
               });
             }
+            if (applied?.rollbackSkillToken) {
+              rollbackSkillPromotion({ instanceDir, rollbackToken: applied.rollbackSkillToken });
+              applied.rollbackSkillToken = null;
+            }
             await rollbackUncommitted(instanceDir);
           } catch (rollbackError) { recoveryError = rollbackError; }
           try {
@@ -982,6 +1035,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       });
       if (applied?.rollbackToken) finalizeSchemaRollback(applied.rollbackToken); // 成功落地 → 作废 schema rollback token（防成功后残留授权）
       if (applied?.rollbackCoreToken) finalizeCoreRollback(applied.rollbackCoreToken); // core 整页替换提交成功 → 作废回滚快照
+      if (applied?.rollbackSkillToken) finalizeSkillPromotion(applied.rollbackSkillToken); // Skill 目录晋升提交成功 → 作废 rename 回滚授权
     } catch (e) {
       // retryable execution failure 保留 token-bound 原计划：下一轮仍执行主人批准的同一 plan，
       // 不能丢掉 approval 后让 LLM 静默换一个决定。内层若已 consume，会先随文件一起恢复。
@@ -993,6 +1047,9 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       if (applied?.rollbackCoreToken) {
         rollbackCoreCalibration({ instanceDir, rollbackToken: applied.rollbackCoreToken, entryRel: rel, entryRaw: entry.raw });
       }
+      if (applied?.rollbackSkillToken) {
+        rollbackSkillPromotion({ instanceDir, rollbackToken: applied.rollbackSkillToken });
+      }
       if (e.code === 'STALE_CORE_PROPOSAL' && entry.kind === 'core' && coreCalibration?.supersede) {
         await coreCalibration.supersede(entry, e.staleReason ?? e.message);
         emit(entry, 'superseded', rel, e.staleReason ?? e.message);
@@ -1002,8 +1059,12 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         });
         return 'superseded';
       }
-      await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`, { holdClass: 'retryable' });
-      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', held_class: 'retryable', error: e.message, ms: Date.now() - t0 });
+      // owner 已批准的 Skill 晋升若因 doctor/落盘失败，不做六轮自动重试：目录已完整回滚，回到 owner-held，
+      // 待修候选或明确重批。普通引擎瞬时故障仍沿用 retryable 退避。
+      const executionHoldClass = entry.kind === 'skill' ? 'owner' : 'retryable';
+      if (entry.kind === 'skill' && approvalRecord && approvals.get(entry.id) === approvalRecord) approvals.delete(entry.id);
+      await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`, { holdClass: executionHoldClass });
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', held_class: executionHoldClass, error: e.message, ms: Date.now() - t0 });
       return 'held';
     }
     if (approvalRecord && approvals.get(entry.id) === approvalRecord) approvals.delete(entry.id);
@@ -1013,9 +1074,13 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     const actionLabel = Array.isArray(decision.operations) ? 'composite_plan' : decision.action;
     refreshIndex(actionLabel, [...changedPaths, rel]);
 
-    const verb = decision.action === 'remove_page' ? `✅ 已删 → ${detail}（git 历史可找回）` : `✅ 已存 → ${detail}`;
+    const verb = decision.action === 'remove_page'
+      ? `✅ 已删 → ${detail}（git 历史可找回）`
+      : decision.action === 'promote_skill' ? `✅ Skill 已晋升 → ${detail}` : `✅ 已存 → ${detail}`;
     emit(entry, decision.action === 'remove_page' ? 'removed' : 'filed', detail, decision.summary);
-    if (notifyLevel !== 'quiet') {
+    // Skill staging 往往是一个目录的多文件上传；逐文件播报“已存”只会制造噪声。
+    // 真正需要 owner 行动时由 promote_skill 创建且去重的一条审核通知承接；失败告警仍由 holdEntry 发出。
+    if (notifyLevel !== 'quiet' && decision.action !== 'stage_skill_file') {
       await notifier.notify(`${verb}${syncPending ? '；本地已提交，远端同步待重试' : ''}\n${decision.summary}\n（inbox ${entry.id}，${model}）`);
     }
     // filed 的分层去向：canonical → disposition=accepted（进主库）；candidate → disposition=candidate

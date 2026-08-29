@@ -66,6 +66,8 @@
 
 `substrate-service`（本仓库）是 GAM 的 MCP 开源参考实现：MCP server + keeper 守门 agent + 捕获端点，持有并唯一维护一份 markdown+git 的知识库实例。
 
+参考实现另提供一个默认关闭的[个人轻治理档](07-light-governance.md)：少数 owner 明确信任的 high 客户端，可对明确普通页走确定性 create/append；歧义、高风险与结构动作仍保留上述 GAM 门禁。这是个人部署的成本调节器，不改变严格 GAM 模式本身，也不向 capture/低信任入口放权。
+
 - **装法**：[Railway 一键部署](https://railway.com/deploy/AlyM7t)或[本地单机试用](../run-local.md)。
 - **交给你的 agent 自己装**：[INSTALL_FOR_AGENTS.md](../INSTALL_FOR_AGENTS.md)（一段安装协议，agent 读它把服务搭起来）。
 - **完整设计与决策记录**：[docs/03 — 下一版 spec](03-next-version-spec.md)。

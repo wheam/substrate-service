@@ -8,7 +8,7 @@ import { containsCredential } from './secrets.js';
 // 导出供读路径复验：实例仓库经 git pull 同步，inbox 件可以不经 addEntry、被手工伪造后拉进来——
 // 「kind 合法、id 是服务端生成的」只在写路径成立，任何要把 id/kind 拼进响应面的读方必须自己再验。
 // schema/maintenance/core = 服务端提案件：创建即 held、直达主人，keeper 不 LLM 判它们（走点选预批通路）。
-export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture', 'schema', 'maintenance', 'core']);
+export const KINDS = new Set(['save', 'todo', 'collection', 'memory', 'remove', 'todo_done', 'capture', 'schema', 'maintenance', 'core', 'skill']);
 
 // F4（M4.6 Finding4）kind 规范化：inbox 件经 git pull 拉进来时 frontmatter 的 `kind:` 是任意文本——
 // 大小写/首尾空白变体（`Maintenance`、` maintenance `、`SCHEMA`）会让【展示面】（server.js 的 D2 过滤按
@@ -29,7 +29,7 @@ export const ID_FORMAT = /^[a-z0-9]{1,12}-[a-f0-9]{4}$/;
 export const ADMISSION_CAPABILITIES = new Set([
   'page:create', 'page:append', 'target:explicit', 'zone:sensitive-write',
   'todo:add', 'todo:complete', 'collection:insert', 'collection:upsert', 'page:remove',
-  'skill:stage', 'skill:replace', 'schema:propose', 'core:propose',
+  'skill:stage', 'skill:replace', 'skill:propose', 'schema:propose', 'core:propose',
 ]);
 
 function safeAdmissionAtom(value, fallback) {
@@ -73,6 +73,7 @@ export function createAdmission({ identity, ingress, kind = ingress } = {}) {
     else if (ingress === 'collections_upsert') caps.push('collection:upsert');
     else if (ingress === 'remove') caps.push('page:remove');
     else if (ingress === 'schema_propose') caps.push('schema:propose');
+    else if (ingress === 'promote_skill') caps.push('skill:propose');
   } else if (trust === 'system' && ingress === 'core_calibration') {
     caps.push('core:propose');
   }
@@ -403,6 +404,8 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
         token: approvalToken({ id, ruling, decision: approvedDecision, rel: hit.path, kind: hit.kind, client: hit.client, raw }),
         viaTrust: viaTrust ?? null,
         viaChannel: viaChannel ?? null,
+        via: via ? oneline(via) : null,
+        approvedAt: resolvedAt,
       });
     } catch (e) {
       // 批准 proof 与 owner_ruling/decision 文件必须同生：proof 持久化失败时恢复原件，

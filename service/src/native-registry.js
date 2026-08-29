@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 const HASH_RE = /^[0-9a-f]{64}$/;
 const ID_RE = /^[a-z0-9-]{1,80}$/;
 const META_RE = /^[a-zA-Z0-9._:-]{1,80}$/;
+const SAFE_TEXT_RE = /^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,80}$/u;
 
 function validTokenMap(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -19,14 +20,18 @@ function validApproval(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
     && HASH_RE.test(value.token)
     && (value.viaTrust == null || META_RE.test(value.viaTrust))
-    && (value.viaChannel == null || META_RE.test(value.viaChannel));
+    && (value.viaChannel == null || META_RE.test(value.viaChannel))
+    && (value.via == null || SAFE_TEXT_RE.test(value.via))
+    && (value.approvedAt == null || (typeof value.approvedAt === 'string' && Number.isFinite(Date.parse(value.approvedAt))));
 }
 
 function sameApproval(a, b) {
   if (a == null || b == null) return a == null && b == null;
   return a.token === b.token
     && (a.viaTrust ?? null) === (b.viaTrust ?? null)
-    && (a.viaChannel ?? null) === (b.viaChannel ?? null);
+    && (a.viaChannel ?? null) === (b.viaChannel ?? null)
+    && (a.via ?? null) === (b.via ?? null)
+    && (a.approvedAt ?? null) === (b.approvedAt ?? null);
 }
 
 function decodeState(value) {
@@ -88,6 +93,8 @@ export function createNativeRegistry({ statePath } = {}) {
       token: String(record?.token ?? ''),
       viaTrust: record?.viaTrust == null ? null : String(record.viaTrust),
       viaChannel: record?.viaChannel == null ? null : String(record.viaChannel),
+      ...(record?.via == null ? {} : { via: String(record.via) }),
+      ...(record?.approvedAt == null ? {} : { approvedAt: String(record.approvedAt) }),
     };
     if (!validApproval(clean)) throw new Error('approval registry 拒绝非法记录');
     return clean;

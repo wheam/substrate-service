@@ -140,7 +140,8 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
   function rowsForFile(rel, zones) {
     const text = readFileSync(path.join(instanceDir, rel), 'utf8');
     const isMd = rel.endsWith('.md');
-    const tier = isMd ? readTier(text) : 'canonical'; // 无 frontmatter / 非 md（.csv/.txt 收藏）→ canonical
+    // _incoming 是 staging 对象，不因 SKILL.md 没写 tier 就冒充 canonical；路径状态优先于自报 frontmatter。
+    const tier = rel.startsWith('skills/_incoming/') ? 'staging' : (isMd ? readTier(text) : 'canonical');
     const regZone = zoneFor(zones, rel);
     let zone;
     // inbox 即使在真机 zones.md 注册，也仍是隔离区：pending/held 永不入索引；仅 rejected 窄特例可查。
@@ -229,7 +230,8 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
       throw new Error(`没有叫 ${zone} 的分区，可用：${zones.map((z) => z.id).join('、')}`);
     }
     // 分层过滤（§6.3）：canonical 恒含；candidate/rejected 需 include 显式开启。
-    const extraTiers = normalizeInclude(include);
+    // staging Skill 只在高信任显式 include 时可查；低信任即便请求该 tier 也不把它送进 SQL。
+    const extraTiers = normalizeInclude(include).filter((t) => t !== 'staging' || trust === 'high');
     const tiers = ['canonical', ...extraTiers];
 
     // 缺陷8：把「按 trust 可读的 zone 集合」预过滤进 SQL（zone IN (...)），令 ACL 在 LIMIT 之前生效——

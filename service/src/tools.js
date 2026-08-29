@@ -87,7 +87,9 @@ export function createTools({ instanceDir }) {
       // inbox 即使在生产 zones.md 注册，仍只开放 rejected 窄特例；pending/held 任意 trust/include 均不可查。
       if (!registered && !isQuarantineRejected(text)) continue;
       // tier 从 frontmatter 读（无 → canonical）；不在请求档内的页整页跳过（candidate/rejected 默认不现）。
-      const tier = rel.endsWith('.md') ? readTier(text) : 'canonical';
+      const stagedSkill = rel.startsWith('skills/_incoming/');
+      if (stagedSkill && trust !== 'high') continue;
+      const tier = stagedSkill ? 'staging' : (rel.endsWith('.md') ? readTier(text) : 'canonical');
       if (!wantTiers.has(tier)) continue;
       const lines = text.split('\n');
       for (let i = 0; i < lines.length; i++) {
@@ -118,6 +120,9 @@ export function createTools({ instanceDir }) {
     if (!canReadZone(zone, trust)) {
       const why = SERVICE_ZONE_IDS.has(zone.id) ? '属于服务/治理区，不经 read_page 读取' : '属于 sensitive 敏感分区，当前客户端信任级不足';
       throw new Error(`拒绝：${rel} ${why}`);
+    }
+    if (rel.startsWith('skills/_incoming/') && trust !== 'high') {
+      throw new Error(`拒绝：${rel} 是尚未晋升的 staging Skill，仅高信任审核通路可读`);
     }
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`没有这个文件：${rel}`);
     return { path: rel, content: readFileSync(abs, 'utf8') };

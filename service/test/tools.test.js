@@ -1,7 +1,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, cpSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createTools } from '../src/tools.js';
@@ -281,4 +281,23 @@ test('M4.2 search 分层：默认只返 canonical；include=candidate 现候选�
   // 低信任 include=rejected：隔离件不可见（未注册 zone 仅 high）
   const lowR = await tools.search({ query: 'stierprobe', trust: 'low', include: 'rejected' });
   assert.ok(!P(lowR).some((p) => p.startsWith('inbox/')), '低信任仍不得见隔离件');
+});
+
+test('Skill _incoming 明确为 staging：默认不冒充 canonical，仅 high+include=staging 可见', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'substrate-tools-staging-'));
+  cpSync(fixtureDir, dir, { recursive: true });
+  const zonesPath = path.join(dir, 'governance', 'zones.md');
+  writeFileSync(zonesPath, readFileSync(zonesPath, 'utf8').replace('zones:\n', [
+    'zones:', '  - id: skills', '    path: skills/', '    purpose: Skill 目录',
+    '    privacy: private', '',
+  ].join('\n')));
+  const incoming = path.join(dir, 'skills', '_incoming', 'staging-search');
+  mkdirSync(incoming, { recursive: true });
+  writeFileSync(path.join(incoming, 'SKILL.md'), '---\nname: staging-search\n---\n\nstagingprobe 未晋升内容。\n');
+  const scoped = createTools({ instanceDir: dir });
+  assert.equal((await scoped.search({ query: 'stagingprobe', trust: 'high' })).results.length, 0, 'high 默认档也不得当 canonical 返回');
+  const high = await scoped.search({ query: 'stagingprobe', trust: 'high', include: 'staging' });
+  assert.equal(high.results.length, 1);
+  assert.equal(high.results[0].tier, 'staging');
+  assert.equal((await scoped.search({ query: 'stagingprobe', trust: 'low', include: 'staging' })).results.length, 0, '低信任不能请求 staging');
 });
