@@ -10,7 +10,7 @@ import {
 test('在线 instructions 与常驻 digest 复用同一份主动行为契约', () => {
   assert.ok(INSTRUCTIONS.includes(BEHAVIOR_RULES), 'MCP instructions 应包含共享行为契约');
   assert.ok(DIGEST_RULES.includes(BEHAVIOR_RULES), 'digest 应包含同一份共享行为契约');
-  for (const anchor of ['读库再答', '缺口闭环', '捕获信号', '主动提议保存', '敏感边界']) {
+  for (const anchor of ['读库再答', '知识库尾注', '缺口闭环', '捕获信号', '主动提议保存', '敏感边界']) {
     assert.match(BEHAVIOR_RULES, new RegExp(anchor), `共享行为契约缺少「${anchor}」`);
   }
   assert.match(BEHAVIOR_RULES, /recall/, '自然语言问题应路由到 recall');
@@ -19,6 +19,10 @@ test('在线 instructions 与常驻 digest 复用同一份主动行为契约', (
   assert.match(BEHAVIOR_RULES, /没有相应写入工具.*高信任渠道/s, '只读客户端应有可执行的写入兜底');
   assert.match(BEHAVIOR_RULES, /recall 返回 gaps.*最小信息/s, '检索缺口应进入最小信息闭环');
   assert.match(BEHAVIOR_RULES, /当前运行宿主.*不得拿当前宿主状态替代/s, '不得把宿主状态冒充为另一个实体');
+  assert.match(BEHAVIOR_RULES, /实际调用 substrate-kb.*最多一行/s, '只有真实知识库调用才应显示单行尾注');
+  assert.match(BEHAVIOR_RULES, /已读取并写入/, '同轮读写应有简短合并格式');
+  assert.match(BEHAVIOR_RULES, /已提交归档，待 Keeper 处理.*不得写「已写入」/s, '受理不得冒充已落库');
+  assert.match(BEHAVIOR_RULES, /工具失败.*绝不得声称已读取\/已写入/s, '失败调用不得显示成功尾注');
 });
 
 test('instructionsFor：high 信任附常驻宿主自装指引，low 不附', () => {

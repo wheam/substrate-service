@@ -72,6 +72,7 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   assert.match(instructions, /get_context|search|recall/);
   assert.match(instructions, /捕获信号/);
   assert.match(instructions, /主动提议保存/);
+  assert.match(instructions, /知识库尾注/);
   await client.close();
 });
 
@@ -195,6 +196,7 @@ test('GET /digest：高信任返回常驻小抄纯文本；低信任/capture 403
   assert.match(text, /读库再答/, 'digest 应携带主动检索契约');
   assert.match(text, /捕获信号/, 'digest 应携带主动捕获契约');
   assert.match(text, /主动提议保存/, 'digest 应明确要求主动提议保存');
+  assert.match(text, /知识库尾注/, 'digest 应携带知识库读写透明尾注契约');
   assert.match(text, /不要直接修改本地/, '房规应禁止直改本地 clone');
   assert.equal((await fetch(`${baseUrl}/digest`, { headers: { Authorization: 'Bearer test-token-low' } })).status, 403);
   assert.equal((await fetch(`${baseUrl}/digest`)).status, 401);
