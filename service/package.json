@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "eval:recall": "node --test test/recall-eval.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

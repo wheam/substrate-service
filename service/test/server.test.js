@@ -67,7 +67,10 @@ test('initialize 下发 server instructions（行为契约）', async () => {
   const client = await mcpClient('test-token-high');
   const instructions = client.getInstructions();
   assert.ok(instructions, '应有 instructions');
-  assert.match(instructions, /查无不编|没存过/);
+  // 未命中措辞契约：只说「未检索到足够依据」，不得教 agent 断言主人从未保存过（详见 knowledge-entry.test.js）
+  assert.match(instructions, /未检索到足够依据/);
+  assert.doesNotMatch(instructions, /库里没存过/);
+  assert.match(instructions, /我的知识库/, '入口应认领主人口中的「我的知识库」');
   assert.match(instructions, /读库再答/);
   assert.match(instructions, /get_context|search|recall/);
   assert.match(instructions, /捕获信号/);

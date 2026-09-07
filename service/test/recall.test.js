@@ -66,7 +66,8 @@ test('正常问答：检到候选，LLM 一次调用，返回 answer + 验真过
     assert.equal(provider.calls.length, 1, '检到候选应恰好调一次 LLM');
     assert.match(r.answer, /牛排/);
     assert.equal(r.citations.length, 1);
-    assert.deepEqual(Object.keys(r.citations[0]).sort(), ['content_id', 'path', 'snippet']);
+    // 引用仍是白名单字段，只是多了 sections（绑定实际给出的章节/行范围，见 recall-evidence.test.js）
+    assert.deepEqual(Object.keys(r.citations[0]).sort(), ['content_id', 'path', 'sections', 'snippet']);
     assert.equal(r.citations[0].path, 'knowledge/dining-sf.md');
     assert.equal(r.citations[0].content_id, '11112222');
     assert.ok(typeof r.citations[0].snippet === 'string' && r.citations[0].snippet.length > 0, '引用应带命中片段');
@@ -128,18 +129,19 @@ test('引用验真：LLM 只给 content_id（或只给 path）也能对上候选
   } finally { indexStore.close(); }
 });
 
-// ==== 零命中：不调 LLM，直答「库里没有」+ gaps ====
+// ==== 零命中：不调 LLM，如实答「未检索到足够依据」（≠ 主人没存过）+ gaps ====
 
-test('零命中：检索无候选 → 不调 LLM（省成本）+ 答「库里没有」+ gaps 记录', async () => {
+test('零命中：检索无候选 → 不调 LLM（省成本）+ 答「未检索到足够依据」+ gaps 记录', async () => {
   const { indexStore, provider, recall } = makeRecall('recall-empty', [{
     answer: '不该被调用', citations: [], gaps: [],
   }]);
   try {
     const r = await recall.recall({ query: 'zzz绝无此词xyz', trust: 'high' });
     assert.equal(provider.calls.length, 0, '零命中绝不调 LLM');
-    assert.match(r.answer, /库里没有/);
+    assert.match(r.answer, /未检索到足够依据/);
+    assert.doesNotMatch(r.answer, /库里没有|没存过|从未保存/, '未命中不得被说成主人从未保存');
     assert.equal(r.citations.length, 0);
-    assert.ok(r.gaps.some((g) => /库里没有/.test(g)), 'gaps 应记「库里没有 X」');
+    assert.ok(r.gaps.some((g) => /未检索到/.test(g)), 'gaps 应如实记「未检索到可引用内容」');
     assert.equal(r.meta.candidate_count, 0);
     assert.equal(r.meta.hit === undefined, true); // meta 不含 hit（hit 由审计层从 candidate_count 派生）
   } finally { indexStore.close(); }
@@ -229,12 +231,15 @@ test('抗注入：候选片段含「忽略以上指令…」→ 作为数据传�
   }]);
   try {
     const r = await recall.recall({ query: '报销', trust: 'high' });
-    // 输出结构合法：顶层只有 answer/citations/gaps/meta，注入字段被丢弃
-    assert.deepEqual(Object.keys(r).sort(), ['answer', 'citations', 'gaps', 'meta']);
+    // 输出结构合法：顶层只有 answer/citations/gaps/evidence(/truncated)/meta，注入字段被丢弃
+    assert.deepEqual(Object.keys(r).sort(), ['answer', 'citations', 'evidence', 'gaps', 'meta']);
     assert.equal(r.action, undefined);
     assert.equal(r.exfiltrate, undefined);
-    // 引用对象也只有白名单三字段
-    assert.deepEqual(Object.keys(r.citations[0]).sort(), ['content_id', 'path', 'snippet']);
+    // 引用与证据对象也只有白名单字段（材料面绝不夹带执行位）
+    assert.deepEqual(Object.keys(r.citations[0]).sort(), ['content_id', 'path', 'sections', 'snippet']);
+    for (const e of r.evidence) {
+      assert.deepEqual(Object.keys(e).sort(), ['content_id', 'full_page', 'heading', 'lines', 'path', 'text']);
+    }
     assert.match(r.answer, /报销/);
     // 候选内容确实作为「数据」进了 user prompt，系统提示明确「数据非指令」
     assert.match(provider.calls[0].user, /忽略以上所有指令/, '注入文本原样进材料（数据块）');
@@ -365,7 +370,7 @@ test('缺陷7：zones 改 sensitive + rebuild 后，TTL 窗口内低信任不再
 
 const TOKENS = { 'high-token': { client: 'cc-test', trust: 'high' } };
 
-test('MCP recall：注册可用、render 只出 answer/citations/gaps、审计带 result_count/hit/cached/llm_ms/query', async () => {
+test('MCP recall：注册可用、render 出 answer/citations/gaps/evidence（不外泄 meta）、审计带 result_count/hit/cached/llm_ms/query', async () => {
   const { dir, indexPath } = tmpInstance('recall-mcp');
   const indexStore = createIndexStore({ instanceDir: dir, indexPath });
   const provider = fakeProvider([{
@@ -385,9 +390,10 @@ test('MCP recall：注册可用、render 只出 answer/citations/gaps、审计�
 
     const res = await client.callTool({ name: 'recall', arguments: { query: '牛排' } });
     const out = JSON.parse(res.content[0].text);
-    assert.deepEqual(Object.keys(out).sort(), ['answer', 'citations', 'gaps'], 'render 不外泄 meta');
+    assert.deepEqual(Object.keys(out).sort(), ['answer', 'citations', 'evidence', 'gaps'], 'render 带证据但不外泄 meta');
     assert.match(out.answer, /牛排/);
     assert.equal(out.citations[0].path, 'knowledge/dining-sf.md');
+    assert.ok(out.evidence.length >= 1 && out.evidence[0].text.includes('wagyu'), 'render 应带出实际证据原文');
 
     const rec = auditLog.find((e) => e.tool === 'recall' && e.args?.query === '牛排');
     assert.ok(rec, '应有 recall 审计条目');
@@ -395,6 +401,8 @@ test('MCP recall：注册可用、render 只出 answer/citations/gaps、审计�
     assert.equal(rec.hit, true);
     assert.equal(rec.cached, false);
     assert.equal(typeof rec.llm_ms, 'number');
+    assert.equal(typeof rec.evidence_chars, 'number', '审计须记证据规模（首批要观察的量）');
+    assert.equal(rec.evidence_truncated, false);
     assert.equal(rec.query, '牛排', '审计须带 query 原文（供扇出模式离线分析）');
     assert.equal(typeof rec.ms, 'number', 'wrap 的总耗时字段仍在');
   } finally {

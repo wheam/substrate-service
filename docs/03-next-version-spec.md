@@ -152,7 +152,7 @@
 - **红线不变**：命中凭据 / 密钥 = `forbidden` **真拒、不落盘**（不进 lossless 分层），见 §7。
 
 ### 6.3 MCP 工具面增量
-- **新增 `recall`/`think`（读；服务端综合）**：入参 `query`；返回**带引用的答案对象**（`answer` + `citations[]`(path+content_id) + `gaps[]`（「库里没有 X / 这页 N 周没更新」））。成本/延迟：一次 LLM 调用，走 keeper 同一 provider；可缓存。
+- **新增 `recall`/`think`（读；服务端综合）**：入参 `query`；返回**带引用的答案对象**（`answer` + `citations[]`(path+content_id) + `gaps[]`（「未检索到足够依据 / 这页 N 周没更新」））。成本/延迟：一次 LLM 调用，走 keeper 同一 provider；可缓存。**易用性首批已在其上兼容新增 `evidence[]`（实际读到的章节原文）与 `truncated`（证据被预算/页数裁剪时才有），并把「未命中」措辞统一为「未检索到足够依据」——落点、预算与尚未跑的真模型验收见 [08 知识库易用性](08-knowledge-usability.md)。**
 - **`search` 变 tier-aware**：默认只返 `canonical`；可选 `include=candidate|rejected|staging`。`staging` 仅 high 可见，`skills/_incoming/**` 即使未写 tier 也由路径强制标为 staging。审计新增 `result_count` / `hit`（供落空率仪表）。
 - **新增 `schema_propose` / `schema_apply`（治理，admin/high）**：提议 / 应用新 zone；apply 走审批 + doctor 校验（§3.4）。
 - **`inbox_*` 复用** + client 的 `channel: primary` 标记（§4）。

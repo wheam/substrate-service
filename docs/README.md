@@ -2,6 +2,7 @@
 
 > 状态：IMPLEMENTED / 个人 alpha（严格治理主线已日用；轻治理可信直写已实现、待部署试用）
 > 演化路线：**01 个人版**（M0–M3；含私人细节，未公开）→ **[03 MCP 版](03-next-version-spec.md)**（M4.x，已实现）→ **[02 长期产品化](02-productization.md)**（未来）
+> 读侧易用性的首批改造（入口自称、未命中措辞、recall 证据扩展、离线评测）见 **[08 知识库易用性](08-knowledge-usability.md)**。
 > 本仓库包含 `substrate-service` 的实现与公开设计文档；个人知识库实例始终放在独立私有仓库。
 
 ## 一句话

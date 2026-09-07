@@ -318,7 +318,8 @@ test('malformed 洪泛也返 429：连发 malformed body → 第 6 次起 429（
 test('静态优先/零回归：静态 high token handshake instructions 正常 + search 读通', async () => {
   const { baseUrl } = await startApp();
   const client = await mcpClient(baseUrl, 'test-token-high');
-  assert.match(client.getInstructions() ?? '', /查无不编|没存过/);
+  assert.match(client.getInstructions() ?? '', /未检索到足够依据/);
+  assert.doesNotMatch(client.getInstructions() ?? '', /库里没存过/);
   const s = await client.callTool({ name: 'search', arguments: { query: '耶加雪菲' } });
   assert.match(s.content[0].text, /coffee-brewing/);
   await client.close();
