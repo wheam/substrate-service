@@ -7,6 +7,7 @@ const INGRESS_BY_KIND = {
   memory: 'remember',
   remove: 'remove',
   todo_done: 'todo_done',
+  todo_note: 'todo_note',
   capture: 'capture',
   schema: 'schema_propose',
   skill: 'promote_skill',
@@ -29,7 +30,7 @@ export function testAdmissionForKind({ kind }) {
 
 export const ALL_TEST_CAPABILITIES = [
   'page:create', 'page:append', 'target:explicit', 'zone:sensitive-write',
-  'todo:add', 'todo:complete', 'collection:insert', 'collection:upsert', 'page:remove',
+  'todo:add', 'todo:complete', 'todo:annotate', 'collection:insert', 'collection:upsert', 'page:remove',
   'skill:stage', 'skill:replace', 'skill:propose', 'schema:propose', 'core:propose',
 ];
 

@@ -103,6 +103,14 @@
 - 执行器逐 effect 校验 `page:create` / `page:append` / sensitive write / todo / collection / remove / Skill 等能力。新页不存在只是 `page:create` 的正常前置条件，不是主人审批条件。
 - 复合归档只开放一个有界形状：同 zone 的 `new_page|merge_into(entry_body)` + `append_reference` 两步。第二步只能由执行器生成 wikilink，禁止任意 body/patch、跨区、结构页、skills/raw/服务区；事务内重做 preflight，目标 hash 改变或 doctor 失败则整体回滚。
 
+#### 待办完成与补充备注
+
+- `todo_done({item, note?})` 完成指定待办，可同时附上完成备注；旧客户端只传 `item` 仍可用。优先匹配进行中/待办，未命中才查已完成，避免同名历史任务抢占本次完成；对已完成的同一条重试不会重复移动条目或改写完成日期。
+- `todo_note({item, note})` 只向唯一匹配的待办追加备注，适用于进行中、待办、已完成三个小节；不改变状态、标题或其他条目。仅 high 身份的专用入口签发 `todo:annotate`，普通 `save` / capture 不获得此权限。
+- 备注请求由服务端编码为带版本的 JSON 正文，和 item 一起纳入 native proof；备注只取原请求，模型不能生成、替换备注或改变显式目标。明确的结构化请求走确定性匹配，不依赖模型推测；目标不存在或有多个匹配时保留收件并提示提供条目原文，同时提供可认证点选的放弃方案，不把目标重写交给模型。
+- 匹配只看任务首行，优先全文相等，再接受唯一片段；已完成项可带原文中的 `✅ YYYY-MM-DD` 区分同名历史任务。备注、说明段落和子列表不参与匹配，小标题不打断所属状态区。完成操作整体移动任务及其缩进内容，追加备注以缩进引用呈现，并中和 Markdown/HTML 结构字符及 Unicode 换行。相同备注重复提交不重复追加；模型的待办材料省略备注，避免长备注挤掉任务标题。
+- 凭据扫描覆盖 item / note 原文；写入仍在原 writer 事务内执行 preflight、doctor、Git 提交与回滚。新增/完成/备注是不同操作，不开放 todo 整页写入。
+
 ### 3.11 个人轻治理档：Keeper 从普通知识必经门退为歧义/风险门
 
 - **适用前提**：一个 owner，实际只有少数明确可信的主力 agent；严格 keeper 成本已经高于它拦住的真实错误。

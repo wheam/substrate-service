@@ -409,7 +409,7 @@ test('generic new_page/merge_into 不能绕过 todo/collections typed-zone effec
     const result = validateDecisionPlan({ instanceDir, entry, decision: attempted });
     assert.equal(result.ok, false, `${attempted.action} 不得写 ${attempted.zone}`);
     assert.equal(result.holdClass, 'security');
-    assert.match(result.reason, /typed zone/);
+    assert.match(result.reason, attempted.zone === 'todo' ? /todo_note.*本次未修改清单/ : /typed zone/);
   }
 });
 

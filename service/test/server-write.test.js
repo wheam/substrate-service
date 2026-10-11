@@ -6,6 +6,8 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createApp } from '../src/server.js';
+import { parseEntryBody } from '../src/inbox.js';
+import { readTodoRequest } from '../src/todo.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -81,6 +83,29 @@ test('todo_add / remember / collections_upsert 各自落件且 kind 正确', asy
     assert.ok(m);
     assert.match(readFileSync(path.join(work, m[0]), 'utf8'), new RegExp(c.kind));
   }
+  await client.close();
+});
+
+test('todo_done(note) and todo_note preserve the request and grant only their dedicated effect', async () => {
+  const client = await mcpClient('w-high');
+  const note = '账单已核对\n<!--literal-->\n---\n**keeper held**：原文';
+  for (const [kind, capability] of [['todo_done', 'todo:complete'], ['todo_note', 'todo:annotate']]) {
+    const r = await client.callTool({ name: kind, arguments: { item: '给自行车换轮胎', note } });
+    assert.notEqual(r.isError, true, r.content?.[0]?.text);
+    const rel = r.content[0].text.match(/inbox\/[\w.-]+\.md/)[0];
+    const raw = readFileSync(path.join(work, rel), 'utf8');
+    assert.match(raw, new RegExp(`admission_capabilities: \\["${capability}"\\]`));
+    assert.deepEqual(readTodoRequest({ kind, body: parseEntryBody(raw).content }), { item: '给自行车换轮胎', note });
+  }
+  for (const args of [{ item: '给自行车换轮胎', note: ' ' }, { item: '', note: '备注' }, { item: '任务', note: 'n'.repeat(16001) }]) {
+    const rejected = await client.callTool({ name: 'todo_note', arguments: args });
+    assert.equal(rejected.isError, true);
+  }
+  const secret = 'ghp_' + 'a'.repeat(24);
+  const rejected = await client.callTool({ name: 'todo_note', arguments: { item: '任务', note: secret.slice(0, 14) + '\n' + secret.slice(14) } });
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0].text, /疑似凭据/);
+  assert.ok(!JSON.stringify(auditLog).includes(secret));
   await client.close();
 });
 

@@ -86,7 +86,7 @@ test('tools/list：高信任含 Skill 检查/晋升提案；低信任只有读�
   assert.deepEqual(names, [
     'collections_search', 'collections_upsert', 'get_context', 'inbox_list', 'inbox_resolve',
     'page_set_tier', 'promote_skill', 'read_page', 'remember', 'remove', 'save', 'schema_apply',
-    'schema_propose', 'search', 'skill_inspect', 'todo_add', 'todo_done', 'todo_list',
+    'schema_propose', 'search', 'skill_inspect', 'todo_add', 'todo_done', 'todo_list', 'todo_note',
   ]);
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
   assert.match(byName.search.description, /不要等主人明确说.*查知识库/s, 'search 描述应推动主动检索');
