@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # fixture stub：与引擎 collections.py 同 CLI（upsert --csv --field k=v --apply）。
 # 最小行为：按 id 幂等 追加/更新 一行。真实逻辑归引擎测试管。
+import sys, os
+# Match the real CLI: this filename must not shadow stdlib collections.
+_here = os.path.dirname(os.path.realpath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.realpath(p or ".") != _here]
 import argparse, csv
 
 p = argparse.ArgumentParser()
@@ -9,7 +13,15 @@ u = sub.add_parser("upsert")
 u.add_argument("--csv", required=True)
 u.add_argument("--field", action="append", default=[])
 u.add_argument("--apply", action="store_true")
+c = sub.add_parser("count")
+c.add_argument("--csv", required=True)
 a = p.parse_args()
+
+if a.cmd == "count":
+    with open(a.csv, newline="", encoding="utf-8-sig") as fh:
+        rows = [r for r in csv.reader(fh) if any(c.strip() for c in r)]
+    print(max(len(rows) - 1, 0))
+    raise SystemExit(0)
 
 fields = dict(f.split("=", 1) for f in a.field)
 assert "id" in fields, "id required"

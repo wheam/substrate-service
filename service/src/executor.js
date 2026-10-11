@@ -983,8 +983,28 @@ async function upsertRow(instanceDir, decision) {
   const csvRel = `collections/${decision.target}/data.csv`;
   const args = ['upsert', '--csv', csvRel, '--apply'];
   for (const [k, v] of Object.entries(fields)) args.push('--field', `${k}=${String(v).replace(/\n/g, ' ')}`);
-  await py(instanceDir, path.join(instanceDir, 'skills', 'substrate-collections', 'collections.py'), args);
-  return { changedPaths: [csvRel], detail: `${decision.target} 行 ${fields.id}` };
+  const script = path.join(instanceDir, 'skills', 'substrate-collections', 'collections.py');
+  await py(instanceDir, script, args);
+  // The CLI writes only the CSV. Its count command uses the same CSV parser and
+  // non-empty-row rule as doctor (including quoted multiline cells).
+  const count = (await py(instanceDir, script, ['count', '--csv', csvRel])).trim();
+  if (!/^\d+$/.test(count)) throw new Error('collections count 未返回有效行数');
+  const changedPaths = [csvRel];
+  const dirRel = path.posix.dirname(csvRel);
+  // Doctor checks total-count claims in immediate sibling Markdown pages only.
+  // Subdirectory shards have their own subset counts; never rewrite those.
+  for (const file of readdirSync(path.join(instanceDir, dirRel), { withFileTypes: true })) {
+    if (!file.isFile() || !file.name.endsWith('.md')) continue;
+    const rel = `${dirRel}/${file.name}`;
+    const abs = path.join(instanceDir, rel);
+    const before = readFileSync(abs, 'utf8');
+    const after = before.replace(/(\*\*\s*)\d+(\s*\*\*\s*(?:条|rows|entries))/g, (_, a, b) => `${a}${count}${b}`);
+    if (after === before) continue;
+    writeFileSync(abs, after);
+    changedPaths.push(rel);
+  }
+  // Include derived pages in the same transaction, rollback and index refresh.
+  return { changedPaths, detail: `${decision.target} 行 ${fields.id}` };
 }
 
 async function newPage(instanceDir, entry, decision, zone) {

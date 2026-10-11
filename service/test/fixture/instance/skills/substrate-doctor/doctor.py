@@ -2,7 +2,7 @@
 # fixture stub：最小 doctor——只校验 governance/zones.md 的 yaml 块可解析 + 每个注册 zone 的目录存在。
 # 真实 doctor 归引擎测试管（在真实例私库）；这里只求「schema_apply 落地 doctor 0 error」端到端可真验。
 # 末行固定输出 `→ N error(s)`（keeper/executor 的 runDoctor 用正则 `→ (\d+) error` 抽 N）。
-import sys, re, pathlib
+import sys, re, pathlib, csv
 
 inst = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 errors = []
@@ -50,6 +50,16 @@ for z in zones:
         continue
     if not (inst / p).is_dir():
         errors.append(f"zone {z.get('id', '?')} 的目录不存在：{p}")
+
+# Same count gate as the instance doctor: sibling totals, not nested shards.
+for csvf in (inst / "collections").glob("**/data.csv"):
+    with csvf.open(newline="", encoding="utf-8-sig") as fh:
+        rows = [r for r in csv.reader(fh) if any(c.strip() for c in r)]
+    count = max(len(rows) - 1, 0)
+    for page in csvf.parent.glob("*.md"):
+        for claimed in re.findall(r"\*\*\s*(\d+)\s*\*\*\s*(?:条|rows|entries)", page.read_text()):
+            if int(claimed) != count:
+                errors.append(f"计数漂移 {page.name}: {claimed} != {count}")
 
 for e in errors:
     print(e)

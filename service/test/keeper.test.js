@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createWriter } from '../src/writer.js';
 import { createInbox } from '../src/inbox.js';
 import { createKeeper, caseLogSafe } from '../src/keeper.js';
-import { rollbackUncommitted, validateDecision } from '../src/executor.js';
+import { rollbackUncommitted, validateDecision, runDoctor } from '../src/executor.js';
 import { readTier } from '../src/tier.js';
 import { testAdmissionForKind } from './helpers/admission.js';
 
@@ -297,6 +297,64 @@ test('collection kind → collections.py upsert 真写主表', async () => {
   await receipt.synced;
   await keeper.processPending();
   assert.match(readFileSync(path.join(work, 'collections', 'restaurants', 'data.csv'), 'utf8'), /new-place,新地方,样例城/);
+});
+
+test('collection insert/update keeps both total claims in the doctor-checked transaction; shards stay unchanged', async () => {
+  const { work, origin, inbox, keeper } = setup({
+    doctor: true,
+    providerScript: [{
+      disposition: 'canonical', zone: 'collections', action: 'upsert_row',
+      target: 'restaurants', fields: { id: 'new-place', name: '新地方', city: '样例城' },
+      summary: '收录 新地方', confidence: 0.9,
+    }],
+  });
+  const dir = path.join(work, 'collections/restaurants');
+  // Quoted multiline cells must count as one record, not two physical lines.
+  writeFileSync(path.join(dir, 'data.csv'), 'id,name,city\na,"A\nCafe",City\nb,B,City\n');
+  const page = path.join(dir, 'restaurants.md');
+  writeFileSync(page, '当前 **2** 条\n共 ** 2 ** entries\n价格 **88** 元\n');
+  mkdirSync(path.join(dir, 'by-city'));
+  const shard = path.join(dir, 'by-city/city.md');
+  writeFileSync(shard, '该城市 **1** 条\n');
+  git(work, 'add', '.');
+  git(work, 'commit', '-m', 'seed count claims');
+  git(work, 'push');
+  assert.equal(await runDoctor(work), 0);
+  for (let i = 0; i < 2; i++) {
+    const receipt = inbox.addEntry({ kind: 'collection', payload: { name: 'restaurants', row: { id: 'new-place', name: '新地方' } }, client: 'cc-test' });
+    await receipt.synced;
+    await keeper.processPending();
+    assert.equal(existsSync(path.join(work, receipt.path)), false, 'successful receipt must be removed');
+    assert.equal(readFileSync(page, 'utf8'), '当前 **3** 条\n共 ** 3 ** entries\n价格 **88** 元\n');
+    assert.equal(readFileSync(shard, 'utf8'), '该城市 **1** 条\n');
+    assert.equal(await runDoctor(work), 0);
+    assert.equal(git(work, 'status', '--porcelain').trim(), '', 'derived page must be committed too');
+    assert.equal(git(origin, 'show', 'main:collections/restaurants/restaurants.md'), readFileSync(page, 'utf8'));
+  }
+});
+
+test('collection count changes roll back together with CSV when doctor rejects another error', async () => {
+  const { work, inbox, keeper } = setup({ doctor: true, providerScript: [{
+    disposition: 'canonical', zone: 'collections', action: 'upsert_row',
+    target: 'restaurants', fields: { id: 'new-place', name: '新地方' },
+    summary: '收录 新地方', confidence: 0.9,
+  }] });
+  const page = path.join(work, 'collections/restaurants/restaurants.md');
+  writeFileSync(page, '当前 **2** 条\n');
+  writeFileSync(path.join(work, 'skills/substrate-doctor/doctor.py'), 'print("→ 1 error(s)")\n');
+  git(work, 'add', '.');
+  git(work, 'commit', '-m', 'seed rejecting doctor');
+  git(work, 'push');
+  const csv = path.join(work, 'collections/restaurants/data.csv');
+  const before = readFileSync(csv, 'utf8');
+  const receipt = inbox.addEntry({ kind: 'collection', payload: { name: 'restaurants', row: { name: '新地方' } }, client: 'cc-test' });
+  await receipt.synced;
+  await keeper.processPending();
+  assert.equal(readFileSync(csv, 'utf8'), before);
+  assert.equal(readFileSync(page, 'utf8'), '当前 **2** 条\n');
+  assert.match(readFileSync(path.join(work, receipt.path), 'utf8'), /held_class: retryable/);
+  assert.match(readFileSync(path.join(work, receipt.path), 'utf8'), /doctor 报 1 error/);
+  assert.equal(git(work, 'status', '--porcelain').trim(), '');
 });
 
 test('两轮低置信且模型想改既有页 → 自动旁置独立 candidate，不问主人', async () => {
