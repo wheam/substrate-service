@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
 import { parseZones } from './acl.js';
+import { applyTodoDecision, validateTodoDecision } from './todo.js';
 import { newContentId, readContentId } from './content-id.js';
 import { parseEntryBody, scanSegments, INBOX_PREVIEW_CHARS } from './inbox.js';
 import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
@@ -19,7 +20,7 @@ const DISPOSITIONS = new Set(['canonical', 'reference', 'local-only', 'forbidden
 // schema_apply（M4.4 D2b）：落地一个 zone 提案。内容只认提案件正文的 json 块，decision 只能「指向」件（白名单原则）。
 // merge_pages（M4.4 D3）：夜班去重/薄页合并的确定性落点——现有 merge_into 并入的是 entry.body（收件正文），
 // 对夜班提案件那是「提案文案」，执行它语义全错；真语义 = 源页正文并入目标页 + 删源页清反链，须一个原子动作表达。
-const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page', 'todo_done', 'schema_apply', 'merge_pages']);
+const ACTIONS = new Set(['new_page', 'merge_into', 'upsert_row', 'todo_add', 'remove_page', 'todo_done', 'todo_note', 'schema_apply', 'merge_pages']);
 // set_tier（M4.6 D1）刻意【不】进 ACTIONS：它是可逆降级/晋升，绝不能从 keeper 的 LLM decision 触达
 // （否则注入内容可诱导 keeper 把任意页降级=软删除，绕过 remove_page 的裁定保护）。它只有两个确定性入口——
 // ① 夜班进程内扫描后直执行降级；② 高信任 page_set_tier 工具 re-promote——均直调 setPageTier、不经 validateDecision。
@@ -260,23 +261,6 @@ function collectionIdExists(instanceDir, collection, id) {
   return lines.slice(1).some((line) => parseCsvLine(line)[idCol] === id);
 }
 
-function findTodoMatches(instanceDir, needleRaw) {
-  const rel = 'todo/owner.md';
-  const text = readFileSync(path.join(instanceDir, rel), 'utf8');
-  const needle = String(needleRaw ?? '').trim();
-  const lines = text.split('\n');
-  const matches = [];
-  let inSection = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^## (进行中|待办)/.test(lines[i])) { inSection = true; continue; }
-    if (/^## /.test(lines[i])) { inSection = false; continue; }
-    if (!inSection) continue;
-    const itemText = lines[i].replace(/^(\d+\.|-)\s+/, '').trim();
-    if (itemText && (itemText === needle || itemText.includes(needle))) matches.push({ i, itemText });
-  }
-  return { rel, text, lines, needle, matches };
-}
-
 function validConfidence(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 }
@@ -461,18 +445,15 @@ export function validateDecision({ instanceDir, decision, entry }) {
     const cap = capabilityError(entry, 'todo:add', 'todo add');
     if (cap) return cap;
     if (d.zone !== 'todo') return { ok: false, reason: 'todo_add 只能进 todo 区' };
-  } else if (d.action === 'todo_done') {
-    const cap = capabilityError(entry, 'todo:complete', 'todo complete');
+  } else if (d.action === 'todo_done' || d.action === 'todo_note') {
+    const cap = capabilityError(entry, d.action === 'todo_note' ? 'todo:annotate' : 'todo:complete', d.action);
     if (cap) return cap;
-    if (entry?.kind !== 'todo_done' && !entry?.__ruling_authentic) {
-      return policyDenied(`todo_done 只接受专用 todo_done ingress 或已认证主人裁定；本件 kind=${entry.kind}`);
+    if (entry?.kind !== d.action && !entry?.__ruling_authentic) {
+      return policyDenied(`${d.action} 只接受对应专用 ingress 或已认证主人裁定；本件 kind=${entry.kind}`);
     }
-    if (d.zone !== 'todo') return { ok: false, reason: 'todo_done 只能作用于 todo 区' };
-    if (!d.target?.trim()) return { ok: false, reason: 'todo_done 缺 target（待办条目原文）' };
-    const todo = findTodoMatches(instanceDir, d.target);
-    if (todo.matches.length !== 1) {
-      return { ok: false, holdClass: 'owner', reason: `todo_done 目标须唯一匹配，「${todo.needle}」命中 ${todo.matches.length} 条——请主人指明是哪条` };
-    }
+    if (d.zone !== 'todo') return { ok: false, reason: `${d.action} 只能作用于 todo 区` };
+    const todo = validateTodoDecision(instanceDir, d, entry);
+    if (!todo.ok) return todo;
   } else if (d.action === 'remove_page') {
     // 先给真实 capture 裁定返回通道限权理由，不被泛化 capability 报错掩盖。
     if (entry?.__ruling_authentic && entry?.__ruling_trust === 'capture') {
@@ -562,7 +543,7 @@ export function validateDecision({ instanceDir, decision, entry }) {
       return policyDenied(`服务区 ${d.zone} 不接受普通 keeper 内容写入`);
     }
     if (d.zone === 'todo') {
-      return policyDenied('todo 是 typed zone：只能经 todo_add/todo_done effect 修改，不接受普通 Markdown 建页或合并');
+      return policyDenied('待办清单不能通过普通 save 修改：新增请用 todo_add，完成请用 todo_done，补充备注请用 todo_note；本次未修改清单');
     }
     if (d.zone === 'collections') {
       return policyDenied('collections 是 typed zone：只能经 collection insert/upsert effect 修改，不接受普通 Markdown 建页或合并');
@@ -706,7 +687,8 @@ export function validateDecisionPlan({ instanceDir, decision, entry }) {
 export async function applyDecision({ instanceDir, entry, decision, zone }) {
   switch (decision.action) {
     case 'todo_add': return todoAdd(instanceDir, entry);
-    case 'todo_done': return todoDone(instanceDir, decision);
+    case 'todo_done':
+    case 'todo_note': return applyTodoDecision(instanceDir, entry, decision);
     case 'upsert_row': return upsertRow(instanceDir, decision);
     case 'new_page': return newPage(instanceDir, entry, decision, zone);
     case 'merge_into': return mergeInto(instanceDir, entry, decision, zone);
@@ -956,23 +938,6 @@ function todoAdd(instanceDir, entry) {
   const glue = m[0].endsWith('\n\n') ? '' : '\n';
   writeFileSync(abs, text.slice(0, insertAt) + (m[0].endsWith('\n') ? '' : '\n') + line + glue + text.slice(insertAt));
   return { changedPaths: [rel], detail: `todo/owner.md 第 ${next} 条` };
-}
-
-// 有界改动：把「进行中/待办」里唯一匹配的一条挪进「已完成」（- 原文 ✅ 日期，实例既有格式）
-function todoDone(instanceDir, decision) {
-  const { rel, lines, needle, matches } = findTodoMatches(instanceDir, decision.target);
-  const abs = path.join(instanceDir, rel);
-  if (matches.length !== 1) {
-    throw new Error(`todo_done 目标须唯一匹配，「${needle}」命中 ${matches.length} 条——请主人指明是哪条`);
-  }
-  const { i, itemText } = matches[0];
-  lines.splice(i, 1);
-  let out = lines.join('\n');
-  if (!/^## 已完成/m.test(out)) out = out.replace(/\n*$/, '\n\n## 已完成\n');
-  out = out.replace(/^## 已完成\n/m, `## 已完成\n\n- ${itemText} ✅ ${today()}\n`)
-    .replace(/\n{4,}/g, '\n\n\n');
-  writeFileSync(abs, out.replace(/^updated: .*$/m, `updated: ${today()}`));
-  return { changedPaths: [rel], detail: `todo 完成：${itemText.slice(0, 40)}` };
 }
 
 async function upsertRow(instanceDir, decision) {

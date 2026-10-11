@@ -1,3 +1,4 @@
+import { encodeTodoRequest, TODO_ITEM_LIMIT, TODO_NOTE_LIMIT } from './todo.js';
 // MCP server（streamable HTTP，无状态模式）+ bearer 认证 + 审计。
 // 每客户端一把 token（TOKENS_JSON），trust 决定 sensitive 区可见性。
 import express from 'express';
@@ -643,11 +644,27 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
 
     server.registerTool('todo_done', {
       title: '标待办完成（经收件箱）',
-      description: '把主人的某条待办标为已完成（挪进「已完成」小节）。主人说「X 做完了/完成了/搞定了」时用。item 写主人指的那条（原话即可，keeper 会对着清单精确匹配）。',
-      inputSchema: { item: z.string().describe('主人说的哪条待办，原话') },
-    }, wrap('todo_done', async ({ item }) => inbox.addEntry({
-      kind: 'todo_done', content: item, client, admission: admission('todo_done', 'todo_done'),
+      description: '把指定待办标为已完成，可同时传 note 保存完成备注、结论或凭证。先用 todo_list 查条目；带 note 时 item 必须为条目原文或唯一片段。已完成条目可补备注，重复调用不会重复完成。只补备注也可用 todo_note，不要用 save 改待办清单。',
+      inputSchema: {
+        item: z.string().trim().min(1).max(TODO_ITEM_LIMIT).describe('待办条目原文或唯一片段'),
+        note: z.string().trim().min(1).max(TODO_NOTE_LIMIT).optional().describe('可选的完成备注；原文保存，不由模型改写'),
+      },
+    }, wrap('todo_done', async ({ item, note }) => inbox.addEntry({
+      kind: 'todo_done', content: note === undefined ? item : encodeTodoRequest({ item, note }, 'todo_done'),
+      client, admission: admission('todo_done', 'todo_done'),
     }), receiptText, null, 'todo_done'));
+
+    server.registerTool('todo_note', {
+      title: '补充待办备注（经收件箱）',
+      description: '给主人指定的现有待办追加备注、结果或凭证，不改变完成状态。支持进行中、待办、已完成；先用 todo_list 查条目，item 用原文或唯一片段，同名已完成项可带原文的 ✅ 日期区分，匹配不唯一则不修改。相同备注重复提交不会重复追加。仅在主人授权记录该备注时使用。',
+      inputSchema: {
+        item: z.string().trim().min(1).max(TODO_ITEM_LIMIT).describe('待办条目原文或唯一片段'),
+        note: z.string().trim().min(1).max(TODO_NOTE_LIMIT).describe('要追加的备注原文'),
+      },
+    }, wrap('todo_note', async ({ item, note }) => inbox.addEntry({
+      kind: 'todo_note', content: encodeTodoRequest({ item, note }, 'todo_note'),
+      client, admission: admission('todo_note', 'todo_note'),
+    }), receiptText, null, 'todo_note'));
 
     server.registerTool('remove', {
       title: '删除库中内容（经收件箱）',

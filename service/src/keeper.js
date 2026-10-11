@@ -11,6 +11,7 @@ import {
 import { admissionFromRaw, parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
 import { findPagesByContentId } from './content-id.js';
+import { readTodoRequest } from './todo.js';
 import {
   finalizeSkillPromotion, rollbackSkillPromotion, validateStagedSkillPath,
 } from './skill-promotion.js';
@@ -194,7 +195,8 @@ function settleLowConfidence(instanceDir, decision, entry) {
   // 专用写入工具已承载用户意图：“加待办”和“写收藏行”不再由 confidence 二次授权。
   if ((entry.kind === 'todo' && decision.action === 'todo_add')
       || (entry.kind === 'collection' && decision.action === 'upsert_row')
-      || (entry.kind === 'todo_done' && decision.action === 'todo_done')) return decision;
+      || (entry.kind === 'todo_done' && decision.action === 'todo_done')
+      || (entry.kind === 'todo_note' && decision.action === 'todo_note')) return decision;
   // 普通语义归类拿不准时，安全退化为原 zone 的独立 candidate：不覆盖、
   // 不污染既有页、不打扰主人。真正无法旁置的删除/完成目标歧义才保留 owner-held。
   return candidateFallback(instanceDir, decision, entry);
@@ -215,6 +217,7 @@ function admissionMaterials(entry, zones) {
   if (caps.has('page:append')) effects.push('merge_into');
   if (caps.has('todo:add')) effects.push('todo_add');
   if (caps.has('todo:complete')) effects.push('todo_done');
+  if (caps.has('todo:annotate')) effects.push('todo_note');
   if (caps.has('collection:insert') || caps.has('collection:upsert')) effects.push('upsert_row');
   if (caps.has('page:remove')) effects.push('remove_page');
   if (caps.has('skill:replace')) effects.push('replace_skill');
@@ -460,7 +463,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       ? readdirSync(memDir).filter((f) => f.endsWith('.md') && f !== 'README.md' && !f.startsWith('_')).map((f) => f.replace(/\.md$/, '')).join('、')
       : '';
     const todoPath = path.join(instanceDir, 'todo', 'owner.md');
-    const todoList = existsSync(todoPath) ? readFileSync(todoPath, 'utf8').slice(0, 6000) : '';
+    const todoList = existsSync(todoPath) ? readFileSync(todoPath, 'utf8').split('\n')
+      .filter(line => !/^  >/.test(line)).join('\n').replace(/\n{3,}/g, '\n\n').slice(0, 6000) : '';
     let targetContext = null;
     if (entry.__page_intent?.state === 'existing') {
       const abs = path.join(instanceDir, entry.__page_intent.rel);
@@ -643,13 +647,18 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
 
   async function holdEntry(entry, rel, reason, { holdClass = 'owner' } = {}) {
     let options = [];
+    if (holdClass === 'owner' && entry.__todo_request) {
+      options = [{ label: '放弃本次待办请求', decision: {
+        disposition: 'forbidden', summary: '放弃本次待办请求', confidence: 1, reject_reason: '主人放弃本次待办请求',
+      } }];
+    }
     const deterministicSkillStage = entry.__page_intent?.kind === 'skill-root'
       || entry.__page_intent?.kind === 'skill-resource';
     // SKIP_LLM kinds（提案件）已自带确定性候选块、且 keeper 绝不 LLM 判它们——即便执行失败也不再调 LLM 生成候选
     // （否则对提案件的对抗正文会触发一次 LLM 调用）。它们只重新 held、保留自带候选。
     // 显式 _incoming staging 同样由代码完整解析；校验失败只保留一条可审计 held 件，不请模型编造
     // “换个保存位置”等会绕开 staging 边界的候选，更不会形成无意义的重复通知链。
-    if (holdClass === 'owner' && !SKIP_LLM_KINDS.has(entry.kind) && !deterministicSkillStage) {
+    if (holdClass === 'owner' && !SKIP_LLM_KINDS.has(entry.kind) && !deterministicSkillStage && !entry.__todo_request) {
       try { options = await generateOptions(entry, reason); }
       catch (e) { console.error(`候选方案生成失败：${e.message}`); }
     }
@@ -677,6 +686,16 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       await commitDurably(commit, { paths: [rel], message: `keeper: held ${entry.id}（${holdClass}）` });
     });
     if (holdClass === 'owner') {
+      if (entry.__todo_request) {
+        await notifier.notify([
+          '⚠️ 本次未修改待办',
+          `条目：${entry.__todo_request.item.slice(0, 120)}`,
+          `原因：${reason}`,
+          '请先核对待办清单，再用条目原文重新提交完成或备注请求。',
+          `也可用 inbox_resolve(id: ${entry.id}, option: 0) 放弃本次请求。`,
+        ].join('\n'));
+        return;
+      }
       await notifier.notify([
         '🤔 待你定夺',
         `内容：「${entry.body.slice(0, 80)}${entry.body.length > 80 ? '…' : ''}」`,
@@ -818,10 +837,29 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       return 'held';
     }
 
+    let todoRequest;
+    try { todoRequest = readTodoRequest(entry); }
+    catch (e) {
+      await holdEntry(entry, rel, e.message, { holdClass: 'security' });
+      audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, verdict: 'held', held_class: 'security', reason: e.message });
+      return 'held';
+    }
+    entry.__todo_request = todoRequest;
     let decision, model = 'owner-approved', usage = null;
     if (entry.approved_decision) {
       // 主人已点选候选方案：预批决定直接进校验与执行，不再消耗判断
       decision = entry.approved_decision;
+    } else if (todoRequest && entry.__ruling_authentic && entry.__ruling_trust === 'high'
+        && ['放弃本次待办请求', '取消', '取消本次请求', '放弃', '扔掉', '不要了', '扔掉，不要了', '不保存', 'discard', 'cancel']
+          .includes(String(entry.owner_ruling).trim().replace(/[。.!！]+$/, '').toLowerCase())) {
+      decision = { disposition: 'forbidden', summary: '放弃本次待办请求', confidence: 1, reject_reason: '主人放弃本次待办请求' };
+    } else if (todoRequest) {
+      decision = {
+        disposition: 'canonical', zone: 'todo', action: entry.kind, target: todoRequest.item,
+        summary: entry.kind === 'todo_note' ? '已补充这条待办的备注，完成状态不变' : '已记录完成状态及备注',
+        confidence: 1, tier: 'canonical',
+      };
+      model = 'deterministic-todo';
     } else if (entry.__page_intent?.kind === 'skill-root' || entry.__page_intent?.kind === 'skill-resource') {
       // _incoming 文件路径已经由代码按认证 hint 解析；staging 是隔离写，不需要模型再猜 action/target。
       // 执行器仍会复验 capability、根文件、路径、大小与普通文件类型。
@@ -875,7 +913,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     // 不是安全事件，更不是主人决策题。给升级档一次带硬边界的 repair；若仍越权，
     // 归类为 retryable model/policy 失配。伪造/篡改件（!__native）不获得 repair 机会，继续 security 隔离。
     const deterministicSkillStage = entry.__page_intent?.kind === 'skill-root' || entry.__page_intent?.kind === 'skill-resource';
-    if (!v.ok && v.holdClass !== 'owner' && entry.__native && !entry.approved_decision && !deterministicSkillStage) {
+    if (!v.ok && v.holdClass !== 'owner' && entry.__native && !entry.approved_decision && !deterministicSkillStage && !todoRequest) {
       try {
         const repaired = await judgeEntry(entry, { repair: { reason: v.reason, decision } });
         decision = applyPageIntent(repaired.json, entry);
