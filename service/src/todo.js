@@ -24,9 +24,17 @@ function checkedRequest(value, kind) {
 
 export function encodeTodoRequest({ item, note }, kind) {
   const request = checkedRequest({ todo_request: 1, item, note }, kind);
+  if (kind === 'todo_done') assertCompletionNote(request.note);
   // JSON escapes newlines, and escaping '<' keeps HTML/machine markers literal
   // through the inbox parser without losing any user text after JSON decoding.
   return '```json\n' + JSON.stringify({ todo_request: 1, ...request }).replace(/</g, '\\u003c') + '\n```';
+}
+
+function assertCompletionNote(note) {
+  // Reject an explicit leading negation; do not attempt general semantic inference.
+  if (/^(?:(?:不是|并非|不算)(?:已经?)?完成|(?:并|尚|还)?未完成|还?没有?完成|(?:不要|别|请勿|勿)(?:标(?:记)?(?:为|成)?|设(?:为|成)?)(?:已经?)?完成|not\s+(?:yet\s+)?(?:done|complete(?:d)?)|do\s+not\s+mark\s+(?:it\s+)?(?:as\s+)?(?:done|complete(?:d)?))(?=$|[\s\p{P}])/iu.test(note.trim())) {
+    throw new Error('备注明确表示未完成，不能调用 todo_done；迁移/移除请用 todo_remove，只补说明请用 todo_note');
+  }
 }
 
 export function readTodoRequest(entry) {
@@ -47,7 +55,7 @@ function title(text) {
     .replace(/^\[[ xX]\]\s+/, '').replace(/\s+✅\s+\d{4}-\d{2}-\d{2}\s*$/, '').trim();
 }
 
-export function findTodoMatches(instanceDir, target, { action } = {}) {
+export function findTodoMatches(instanceDir, target, { action, exactOnly = false, literal = false } = {}) {
   // Never follow a task file/directory symlink outside this instance.
   if (!lstatSync(path.join(instanceDir, 'todo')).isDirectory()
       || !lstatSync(path.join(instanceDir, REL)).isFile()) throw new Error('待办清单须为实例内的普通文件');
@@ -71,14 +79,15 @@ export function findTodoMatches(instanceDir, target, { action } = {}) {
     let end = i + 1;
     while (end < lines.length && (!lines[end].trim() || /^[ \t]/.test(lines[end]))) end++;
     while (end > i + 1 && !lines[end - 1].trim()) end--;
-    entries.push({ i, end, section, itemText: title(lines[i]), completedDate: lines[i].match(/\s+✅\s+(\d{4}-\d{2}-\d{2})\s*$/)?.[1] });
+    entries.push({ i, end, section, line: lines[i], itemText: title(lines[i]), completedDate: lines[i].match(/\s+✅\s+(\d{4}-\d{2}-\d{2})\s*$/)?.[1] });
   }
   const match = (items) => {
     const exact = needle ? items.filter((item) => item.itemText === needle) : [];
-    return exact.length ? exact : needle ? items.filter((item) => item.itemText.includes(needle)) : [];
+    return exact.length || exactOnly ? exact : needle ? items.filter((item) => item.itemText.includes(needle)) : [];
   };
   let matches;
-  if (completedDate) matches = match(entries.filter(item => item.section === '已完成' && item.completedDate === completedDate));
+  if (literal) matches = entries.filter(item => item.line === String(target).trim());
+  else if (completedDate) matches = match(entries.filter(item => item.section === '已完成' && item.completedDate === completedDate));
   else if (action === 'todo_done') {
     matches = match(entries.filter(item => item.section !== '已完成'));
     if (!matches.length) matches = match(entries.filter(item => item.section === '已完成'));
@@ -93,6 +102,10 @@ export function validateTodoDecision(instanceDir, decision, entry) {
   catch (e) { return { ok: false, holdClass: 'security', reason: e.message }; }
   if (request && (decision.action !== entry.kind || decision.target !== request.item)) {
     return { ok: false, holdClass: 'security', reason: '待办操作必须使用原请求指定的动作和条目，不能由模型改写' };
+  }
+  if (request && decision.action === 'todo_done') {
+    try { assertCompletionNote(request.note); }
+    catch (e) { return { ok: false, holdClass: 'owner', reason: e.message }; }
   }
   if (decision.action === 'todo_note' && (!request || entry?.kind !== 'todo_note' || !entry.__native)) {
     return { ok: false, holdClass: 'security', reason: '追加待办备注只接受已认证的 todo_note 专用请求' };

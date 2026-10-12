@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createApp } from '../src/server.js';
 import { parseEntryBody } from '../src/inbox.js';
 import { readTodoRequest } from '../src/todo.js';
+import { readRemovalRequest } from '../src/removal.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -119,5 +120,29 @@ test('save：密钥红线在写路径生效', async () => {
   assert.ok(audit);
   assert.ok(!JSON.stringify(audit).includes(secret), '被拒的密钥原文不得进入审计');
   assert.deepEqual(audit.args.content, { redacted: true, length: `token: ${secret}`.length });
+  await client.close();
+});
+
+test('explicit removal MCP ingress binds targets and only grants its own capability', async () => {
+  const client = await mcpClient('w-high');
+  for (const [tool, args, kind, capability, target] of [
+    ['remove', { path: 'knowledge/coffee-brewing.md', what: '已迁移' }, 'remove', 'page:remove', { path: 'knowledge/coffee-brewing.md', reason: '已迁移' }],
+    ['remove', { what: 'knowledge/coffee-brewing.md（已迁移）' }, 'remove', 'page:remove', { path: 'knowledge/coffee-brewing.md', reason: '已迁移' }],
+    ['todo_remove', { item: '给自行车换轮胎' }, 'todo_remove', 'todo:remove', { item: '给自行车换轮胎' }],
+    ['collections_remove', { name: 'restaurants', ids: ['demo-ramen'] }, 'collection_remove', 'collection:remove', { collection: 'restaurants', ids: ['demo-ramen'] }],
+  ]) {
+    const result = await client.callTool({ name: tool, arguments: args });
+    assert.notEqual(result.isError, true, result.content[0].text);
+    const rel = result.content[0].text.match(/inbox\/[\w.-]+\.md/)[0];
+    const raw = readFileSync(path.join(work, rel), 'utf8');
+    assert.match(raw, new RegExp(`admission_capabilities: \\["${capability}"\\]`));
+    assert.deepEqual(readRemovalRequest({ kind, body: parseEntryBody(raw).content }), { removal_request: 1, ...target });
+  }
+  for (const [name, args] of [
+    ['remove', {}], ['remove', { path: '../escape.md' }],
+    ['collections_remove', { name: 'restaurants', ids: [] }],
+    ['collections_remove', { name: 'restaurants', ids: ['x', 'x'] }],
+    ['todo_done', { item: '给自行车换轮胎', note: '不是已完成：只迁到共享清单' }],
+  ]) assert.equal((await client.callTool({ name, arguments: args })).isError, true);
   await client.close();
 });
