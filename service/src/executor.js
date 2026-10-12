@@ -5,6 +5,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { applyTodoDecision, validateTodoDecision } from './todo.js';
+import { readRemovalRequest, validateRemovalDecision, inspectPageRemoval, applyTypedRemoval } from './removal.js';
 import { newContentId, readContentId } from './content-id.js';
 import { parseEntryBody, scanSegments, INBOX_PREVIEW_CHARS } from './inbox.js';
 import { normTier, readTier, hasExplicitTier, setTierLine, TIER_RANK, DECISION_TIERS } from './tier.js';
@@ -285,6 +286,11 @@ export function validateDecision({ instanceDir, decision, entry }) {
     }
   }
   if (d.disposition === 'forbidden') return { ok: true, verdict: 'reject', reason: d.reject_reason || '按宪法禁止入库' };
+  let removal;
+  try { removal = readRemovalRequest(entry); }
+  catch (e) { return { ok: false, holdClass: 'security', reason: e.message }; }
+  if (removal) return validateRemovalDecision(instanceDir, entry, d, removal);
+  if (['todo_remove', 'remove_rows'].includes(d.action)) return policyDenied('移除条目只接受专用工具的绑定请求');
   if (d.disposition === 'local-only') return { ok: false, reason: 'local-only 在服务端无落点，需在 AdmissionContext 内重新规划' };
   // stage_skill_file 是 keeper 按认证 save hint 解析出的内部动作，模型不能直接产出。它只整文件写 _incoming，
   // supporting file 不要求 SKILL.md frontmatter；但根文件必须合法，资源文件则要求同目录根已存在且合法。
@@ -462,6 +468,7 @@ export function validateDecision({ instanceDir, decision, entry }) {
     const cap = capabilityError(entry, 'page:remove', 'page remove');
     if (cap) return cap;
     if (NO_DELETE_ZONES.has(d.zone)) return { ok: false, reason: `禁删区：${d.zone}（骨架/流水区不允许经服务删除）` };
+    if (['todo', 'collections'].includes(d.zone)) return policyDenied('待办/收藏不可整页删除；请使用 todo_remove 或 collections_remove');
     // 硬校验爆炸半径（spec §7）：remove_page 只允许「删除件（kind=remove）」或「主人裁定过的件」。
     // F1：裁定的真实性只认持久批准登记表（keeper 查表命中才置 entry.__ruling_authentic），不再信文件里
     // 裸的 owner_ruling / ruling_via_trust（git pull 可伪造这些 frontmatter 字段绕过本门）。普通 capture/save
@@ -488,6 +495,8 @@ export function validateDecision({ instanceDir, decision, entry }) {
       return { ok: false, reason: `不允许删结构页：${rel}` };
     }
     if (!existsSync(path.join(instanceDir, rel))) return { ok: false, reason: `目标页不存在：${rel}（不误删，需主人确认）` };
+    try { inspectPageRemoval(instanceDir, rel); }
+    catch (e) { return { ok: false, holdClass: 'owner', reason: e.message }; }
   } else if (d.action === 'merge_pages') {
     // 夜班维护合并（M4.4 D3）会删源页——与 remove_page 同级硬校验：只认主人裁定过的件（点选提案候选
     // 即写 owner_ruling），数据/模型输出永不触发；且不设 kind 旁路（它还会改写目标页，比纯删更宽的改动面）。
@@ -686,6 +695,8 @@ export function validateDecisionPlan({ instanceDir, decision, entry }) {
 
 export async function applyDecision({ instanceDir, entry, decision, zone }) {
   switch (decision.action) {
+    case 'todo_remove':
+    case 'remove_rows': return applyTypedRemoval(instanceDir, entry, decision);
     case 'todo_add': return todoAdd(instanceDir, entry);
     case 'todo_done':
     case 'todo_note': return applyTodoDecision(instanceDir, entry, decision);
@@ -695,7 +706,15 @@ export async function applyDecision({ instanceDir, entry, decision, zone }) {
     case 'replace_skill': return replaceSkill(instanceDir, entry, decision);
     case 'stage_skill_file': return stageSkillFile(instanceDir, entry, decision);
     case 'promote_skill': return applySkillPromotion({ instanceDir, entry, decision });
-    case 'remove_page': return removePage(instanceDir, decision, zone);
+    case 'remove_page': {
+      const request = readRemovalRequest(entry);
+      if (request) {
+        const check = validateRemovalDecision(instanceDir, entry, decision, request);
+        if (!check.ok) throw new Error(check.reason);
+        if (!inspectPageRemoval(instanceDir, request.path).exists) return { changedPaths: [], detail: `${request.path} 已不存在，未作修改` };
+      }
+      return removePage(instanceDir, decision, zone);
+    }
     case 'merge_pages': return mergePages(instanceDir, decision, zone);
     case 'schema_apply': return applySchema({ instanceDir, entry }); // zone 参数忽略——schema 内容只从件正文取
     case 'calibrate_core': return applyCoreCalibration({ instanceDir, entry }); // 特权整页替换；正文只取主人可见 core 草案

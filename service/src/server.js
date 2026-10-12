@@ -1,4 +1,5 @@
 import { encodeTodoRequest, TODO_ITEM_LIMIT, TODO_NOTE_LIMIT } from './todo.js';
+import { encodeRemovalRequest, readRemovalRequest } from './removal.js';
 // MCP server（streamable HTTP，无状态模式）+ bearer 认证 + 审计。
 // 每客户端一把 token（TOKENS_JSON），trust 决定 sensitive 区可见性。
 import express from 'express';
@@ -644,7 +645,7 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
 
     server.registerTool('todo_done', {
       title: '标待办完成（经收件箱）',
-      description: '把指定待办标为已完成，可同时传 note 保存完成备注、结论或凭证。先用 todo_list 查条目；带 note 时 item 必须为条目原文或唯一片段。已完成条目可补备注，重复调用不会重复完成。只补备注也可用 todo_note，不要用 save 改待办清单。',
+      description: '仅在事项实际完成时标为已完成，可同时传 note 保存完成备注。迁移、取消或从个人库移除必须用 todo_remove，不能用完成代替删除。先用 todo_list 查条目；带 note 时 item 必须为条目原文或唯一片段。只补备注用 todo_note，不要用 save 改待办清单。',
       inputSchema: {
         item: z.string().trim().min(1).max(TODO_ITEM_LIMIT).describe('待办条目原文或唯一片段'),
         note: z.string().trim().min(1).max(TODO_NOTE_LIMIT).optional().describe('可选的完成备注；原文保存，不由模型改写'),
@@ -666,13 +667,32 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
       client, admission: admission('todo_note', 'todo_note'),
     }), receiptText, null, 'todo_note'));
 
+    server.registerTool('todo_remove', {
+      title: '移除指定待办（经收件箱）',
+      description: '仅在主人要求删除、取消或迁移出本库时，移除一条待办及备注，不标完成。先 todo_list，item 传完整条目首行；同名已完成项保留 ✅ 日期。不存在时不作修改，歧义时拒绝猜测；Git 历史可恢复。',
+      inputSchema: { item: z.string().trim().min(1).max(4000), reason: z.string().max(4000).optional() },
+    }, wrap('todo_remove', async ({ item, reason }) => inbox.addEntry({
+      kind: 'todo_remove', content: encodeRemovalRequest('todo_remove', { item, ...(reason === undefined ? {} : { reason }) }), client, admission: admission('todo_remove', 'todo_remove'),
+    }), receiptText, null, 'todo_remove'));
+
+    server.registerTool('collections_remove', {
+      title: '删除指定收藏行（经收件箱）',
+      description: '仅在主人授权删除指定收藏时使用。先 collections_search 查询并核对精确行 ID，再传 name 和 ids（1–200 个），只删除这些行，保留其他收藏。支持迁移后移除本库副本；不接受模糊条件或整表删除。缺失 ID 安全跳过，Git 历史可恢复。',
+      inputSchema: { name: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,99}$/i), ids: z.array(z.string().min(1).max(200)).min(1).max(200), reason: z.string().max(4000).optional() },
+    }, wrap('collections_remove', async ({ name, ids, reason }) => inbox.addEntry({
+      kind: 'collection_remove', content: encodeRemovalRequest('collection_remove', { collection: name, ids, ...(reason === undefined ? {} : { reason }) }), client,
+      admission: admission('collections_remove', 'collection_remove'),
+    }), receiptText, null, 'collections_remove'));
+
     server.registerTool('remove', {
       title: '删除库中内容（经收件箱）',
-      description: '删除知识库中的某一页。仅当主人明确要求删除时使用（例：「把 X 那页删了」）——不要因为内容过时/你认为没用就主动删。keeper 会校验目标并执行；git 历史永远可找回；骨架区（governance/skills）禁删。',
-      inputSchema: { what: z.string().describe('主人要删什么，原话或页路径（如 knowledge/xxx）') },
-    }, wrap('remove', async ({ what }) => inbox.addEntry({
-      kind: 'remove', content: what, client, admission: admission('remove', 'remove'),
-    }), receiptText, null, 'remove'));
+      description: '仅在主人明确要求时删除一页。优先传 path 为查到的完整 .md 路径，what 可说明原因；明确路径由代码校验执行。旧 what 原话仍可用。缺失页面视为无操作；结构页禁删。删除待办用 todo_remove，删除收藏行用 collections_remove；Git 历史可找回。',
+      inputSchema: { path: z.string().max(1000).optional(), what: z.string().trim().min(1).max(4000).optional() },
+    }, wrap('remove', async ({ what, path: targetPath }) => {
+      if (targetPath === undefined && !what) throw new Error('请提供 path 或 what');
+      const request = targetPath === undefined ? readRemovalRequest({ kind: 'remove', body: what }) : { path: targetPath, ...(what ? { reason: what } : {}) };
+      return inbox.addEntry({ kind: 'remove', content: request ? encodeRemovalRequest('remove', request) : what, client, admission: admission('remove', 'remove') });
+    }, receiptText, null, 'remove'));
 
     server.registerTool('inbox_list', {
       title: '查收件箱',
