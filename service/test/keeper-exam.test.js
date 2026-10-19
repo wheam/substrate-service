@@ -259,7 +259,8 @@ test('判别力自证：坏大脑 → 通过率掉到阈值下、代表判例被
   const exam = await runExam({ goldens, judge: makeKeeperExamJudge(brokenProvider()), zoneIds });
   assert.equal(exam.meetsThreshold, false, `坏大脑不该达标，实测 ${(exam.passRate * 100).toFixed(1)}%`);
   const failed = new Set(exam.results.filter((r) => !r.pass).map((r) => r.id));
-  assert.ok(failed.has('todo-report'), 'todo 判例应被判败');
+  // 新增待办已改为确定性执行（不调模型），坏大脑也影响不到它——与红线件一样恒过。
+  assert.ok(!failed.has('todo-report') && !failed.has('todo-catfood'), '新增待办不依赖模型');
   assert.ok(failed.has('reject-chitchat'), '该拒的判例应被判败');
   assert.ok(failed.has('collection-restaurant'), '收藏判例应被判败');
   // 红线件与模型无关（inbox 层拦），坏大脑下仍应恒过 —— 证明 §7 第一道防线不依赖模型。

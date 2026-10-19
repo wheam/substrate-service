@@ -14,7 +14,7 @@ import { createDoctorGate, describeDoctorFailure, parseBrokenLink } from './doct
 import { admissionFromRaw, parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
 import { findPagesByContentId } from './content-id.js';
-import { readTodoRequest } from './todo.js';
+import { readTodoRequest, findTodoMatches } from './todo.js';
 import { readRemovalRequest, removalDecision } from './removal.js';
 import {
   finalizeSkillPromotion, rollbackSkillPromotion, validateStagedSkillPath,
@@ -550,6 +550,11 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
   }
 
   async function judgeEntry(entry, { repair = null } = {}) {
+    if (!provider) {
+      const error = new Error('未配置模型（DEEPSEEK_API_KEY），这件需要模型判断去向，先留在收件箱');
+      error.code = 'NO_PROVIDER';
+      throw error;
+    }
     const materials = buildMaterials(entry);
     const user = [
       `材料：${JSON.stringify({ zones: materials.zones, collections: materials.collections }, null, 1)}`,
@@ -702,6 +707,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
 
   // held 收敛点：写状态 + 让升级档生成候选方案 + 通知（带预览与候选）
   async function generateOptions(entry, reason) {
+    if (!provider) return [];
     const materials = buildMaterials(entry);
     const user = [
       `材料：${JSON.stringify({ zones: materials.zones, collections: materials.collections }, null, 1)}`,
@@ -952,6 +958,19 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         confidence: 1, tier: 'canonical',
       };
       model = 'deterministic-todo';
+    } else if (entry.kind === 'todo' && !entry.__ruling_authentic) {
+      // 新增待办不需要模型：执行器只取收件原文写进清单。完全相同的未完成条目按重复拒收，其余直接加。
+      // 带主人裁定的件仍交给模型按裁定解释。
+      const item = entry.body.trim().replace(/\s*\n\s*/g, ' ');
+      let duplicate = false;
+      try { duplicate = !!item && findTodoMatches(instanceDir, item, { exactOnly: true }).matches.some((m) => m.section !== '已完成'); }
+      catch { duplicate = false; }
+      decision = !item || duplicate
+        ? { disposition: 'forbidden', summary: '未新增待办', confidence: 1,
+          reject_reason: item ? `待办清单里已有相同的未完成条目：${item.slice(0, 80)}` : '待办内容为空' }
+        : { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner',
+          summary: `已加待办：${item.slice(0, 80)}`, confidence: 1, tier: 'canonical' };
+      model = 'deterministic-todo-add';
     } else if (entry.__page_intent?.kind === 'skill-root' || entry.__page_intent?.kind === 'skill-resource') {
       // _incoming 文件路径已经由代码按认证 hint 解析；staging 是隔离写，不需要模型再猜 action/target。
       // 执行器仍会复验 capability、根文件、路径、大小与普通文件类型。
@@ -969,6 +988,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       try {
         judged = await judgeEntry(entry);
       } catch (e) {
+        // 没有模型不是故障：件原样留在收件箱，模型恢复后正常处理；不写状态、不计重试、不告警。
+        if (e.code === 'NO_PROVIDER') return 'waiting';
         await holdEntry(entry, rel, `两档判断都没成（${e.message.slice(0, 120)}）`, { holdClass: 'retryable' });
         audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, ok: false, error: e.message, verdict: 'held', disposition: 'held', held_class: 'retryable', ms: Date.now() - t0 });
         return 'held';
@@ -1034,6 +1055,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
           v = { ...v, holdClass: 'retryable', reason: `受约束重规划仍不可执行：${v.reason}` };
         }
       } catch (e) {
+        if (e.code === 'NO_PROVIDER') return 'waiting';
         await holdEntry(entry, rel, `effect policy 重规划失败：${e.message.slice(0, 120)}`, { holdClass: 'retryable' });
         audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', held_class: 'retryable', error: e.message, reason: 'policy-repair-failed', ms: Date.now() - t0 });
         return 'held';
@@ -1470,7 +1492,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
   async function processPending() {
     if (running) return { skipped: true };
     running = true;
-    const result = { processed: 0, filed: 0, rejected: 0, held: 0, superseded: 0, errors: 0, grouped: 0 };
+    const result = { processed: 0, filed: 0, rejected: 0, held: 0, superseded: 0, errors: 0, grouped: 0, waiting: 0 };
     try {
       for (const rel of listPending(await headNow())) {
         try {

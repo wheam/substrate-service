@@ -84,64 +84,94 @@ export function validateDirectPageTarget({ instanceDir, page, mode, expectedCont
   return { rel, abs, zone };
 }
 
-export async function directPageWrite({
-  instanceDir, writer, indexStore = null, client, page, content, mode,
-  expectedContentId = null, doctor = true, doctorGate = null,
+// 一批页面一次事务：全部校验、依次写入、跑一次 doctor、一次提交；任何一步失败整批回滚。
+// 一组互相链接的新页逐页直写时，前面的页会链到还不存在的后面的页，单页永远过不了 doctor
+// （2026-10-18 的 18 页航旅记录即此），整批写入后链接全部可解析。单页直写是 pages.length === 1 的特例。
+export const MAX_BATCH_PAGES = 50;
+export const MAX_BATCH_BYTES = 4 * 1024 * 1024;
+
+function checkedBody(content, label) {
+  const body = String(content ?? '');
+  if (!body.trim()) throw directError('DIRECT_CONTENT_EMPTY', `直写内容不能为空${label}`);
+  if (Buffer.byteLength(body, 'utf8') > MAX_CONTENT_BYTES) {
+    throw directError('DIRECT_CONTENT_TOO_LARGE', `直写内容超过 ${MAX_CONTENT_BYTES} bytes${label}`);
+  }
+  if (body.includes('\0')) throw directError('DIRECT_CONTENT_INVALID', `直写内容含 NUL${label}`);
+  if (containsCredential(body)) {
+    throw directError('DIRECT_CREDENTIAL', `拒收：内容含疑似密钥/凭据（红线：密钥原文绝不进库）。请脱敏后重试。${label}`);
+  }
+  return body;
+}
+
+export async function directPagesWrite({
+  instanceDir, writer, indexStore = null, client, pages, doctor = true, doctorGate = null,
 }) {
   const sourceClient = String(client ?? '');
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(sourceClient)) {
     throw directError('DIRECT_IDENTITY_INVALID', '可信直写 client 标识不合法，须为 1-64 位 A-Za-z0-9._-');
   }
-  const body = String(content ?? '');
-  if (!body.trim()) throw directError('DIRECT_CONTENT_EMPTY', '直写内容不能为空');
-  if (Buffer.byteLength(body, 'utf8') > MAX_CONTENT_BYTES) {
-    throw directError('DIRECT_CONTENT_TOO_LARGE', `直写内容超过 ${MAX_CONTENT_BYTES} bytes`);
+  if (!Array.isArray(pages) || !pages.length) throw directError('DIRECT_BATCH_EMPTY', '批量直写至少要有一页');
+  if (pages.length > MAX_BATCH_PAGES) {
+    throw directError('DIRECT_BATCH_TOO_LARGE', `批量直写一次最多 ${MAX_BATCH_PAGES} 页（本次 ${pages.length} 页）`);
   }
-  if (body.includes('\0')) throw directError('DIRECT_CONTENT_INVALID', '直写内容含 NUL');
-  if (containsCredential(body)) {
-    throw directError('DIRECT_CREDENTIAL', '拒收：内容含疑似密钥/凭据（红线：密钥原文绝不进库）。请脱敏后重试。');
+  const batch = pages.length > 1;
+  const items = pages.map((p, i) => ({
+    page: p?.path, mode: p?.mode, expectedContentId: p?.expected_content_id ?? null,
+    body: checkedBody(p?.content, batch ? `（第 ${i + 1} 页 ${String(p?.path ?? '')}）` : ''),
+  }));
+  const totalBytes = items.reduce((n, it) => n + Buffer.byteLength(it.body, 'utf8'), 0);
+  if (totalBytes > MAX_BATCH_BYTES) {
+    throw directError('DIRECT_BATCH_TOO_LARGE', `批量直写总内容超过 ${MAX_BATCH_BYTES} bytes`);
   }
 
   const gate = doctorGate ?? createDoctorGate({ instanceDir, enabled: doctor });
   let result;
   await writer.transact(async (commit) => {
     await assertCleanWorktree(instanceDir);
-    const target = validateDirectPageTarget({ instanceDir, page, mode, expectedContentId });
     const requestId = `${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`;
-    const entry = {
-      id: requestId,
-      body,
-      client: sourceClient,
-      kind: 'save',
-      __direct: true,
-      __native: true,
-      __admission_enforced: true,
-      __capabilities: ['page:create', 'page:append', 'target:explicit', 'zone:sensitive-write'],
-    };
-    const decision = {
-      disposition: 'canonical',
-      tier: 'canonical',
-      action: mode === 'create' ? 'new_page' : 'merge_into',
-      zone: target.zone.id,
-      target: target.rel,
-      title: path.posix.basename(target.rel, '.md'),
-      page_type: target.zone.id,
-      summary: `可信客户端明确${mode === 'create' ? '新建' : '追加'} ${target.rel}`,
-      confidence: 1,
-      links: [],
-    };
-    const validation = validateDecisionPlan({ instanceDir, decision, entry });
-    if (!validation.ok || validation.verdict !== 'file') {
-      throw directError('DIRECT_POLICY_DENIED', validation.reason || '可信直写未通过 effect policy');
-    }
-
-    // 基线在任何写入之前取：库里既有的内容质量问题不挡这次无关写入，只拦本次新增的错误。
+    // 基线在任何写入之前取。批量的后续页要看到前面页写入后的状态（如同批先 create 再 append），
+    // 所以路径/策略校验只能边写边做，失败即整批回滚。
     const doctorBase = await gate.baseline();
-    let applied = null;
     let writeStarted = false;
     try {
-      writeStarted = true;
-      applied = await applyDecisionPlan({ instanceDir, entry, decision, validation });
+      const changed = [];
+      const written = [];
+      for (const [i, it] of items.entries()) {
+        const label = batch ? `（第 ${i + 1} 页）` : '';
+        let target;
+        try { target = validateDirectPageTarget({ instanceDir, page: it.page, mode: it.mode, expectedContentId: it.expectedContentId }); }
+        catch (error) { if (batch) error.message += label; throw error; }
+        const entry = {
+          id: batch ? `${requestId}-${i + 1}` : requestId,
+          body: it.body,
+          client: sourceClient,
+          kind: 'save',
+          __direct: true,
+          __native: true,
+          __admission_enforced: true,
+          __capabilities: ['page:create', 'page:append', 'target:explicit', 'zone:sensitive-write'],
+        };
+        const decision = {
+          disposition: 'canonical',
+          tier: 'canonical',
+          action: it.mode === 'create' ? 'new_page' : 'merge_into',
+          zone: target.zone.id,
+          target: target.rel,
+          title: path.posix.basename(target.rel, '.md'),
+          page_type: target.zone.id,
+          summary: `可信客户端明确${it.mode === 'create' ? '新建' : '追加'} ${target.rel}`,
+          confidence: 1,
+          links: [],
+        };
+        const validation = validateDecisionPlan({ instanceDir, decision, entry });
+        if (!validation.ok || validation.verdict !== 'file') {
+          throw directError('DIRECT_POLICY_DENIED', `${validation.reason || '可信直写未通过 effect policy'}${label}`);
+        }
+        writeStarted = true;
+        const applied = await applyDecisionPlan({ instanceDir, entry, decision, validation });
+        changed.push(...(applied.changedPaths ?? []));
+        written.push({ path: target.rel, mode: it.mode, changed: (applied.changedPaths ?? []).length > 0 });
+      }
       const gateResult = await gate.check(doctorBase);
       if (gateResult.unavailable) throw directError('DIRECT_DOCTOR_UNAVAILABLE', 'doctor 未返回可解析结果');
       if (!gateResult.ok) {
@@ -149,13 +179,15 @@ export async function directPageWrite({
         error.doctor = { new_errors: gateResult.newErrors, blocking_existing: gateResult.blockingExisting };
         throw error;
       }
-      const changedPaths = [...new Set(applied.changedPaths ?? [])];
+      const changedPaths = [...new Set(changed)];
       const sync = await commit({
-        paths: changedPaths.length ? changedPaths : [target.rel],
-        message: `direct: ${mode} ${target.rel} via ${sourceClient}`,
+        paths: changedPaths.length ? changedPaths : written.map((w) => w.path),
+        message: batch
+          ? `direct: batch ${written.length} pages via ${sourceClient}`
+          : `direct: ${written[0].mode} ${written[0].path} via ${sourceClient}`,
       });
       result = {
-        route: 'direct', mode, path: target.rel, request_id: requestId,
+        route: 'direct', request_id: requestId, pages: written,
         changed: changedPaths.length > 0, changed_paths: changedPaths,
         ...(sync?.sync_pending ? { sync_pending: true } : {}),
       };
@@ -176,4 +208,16 @@ export async function directPageWrite({
     } catch { /* 派生索引可重建；不回滚已经 durable 的正典写入 */ }
   }
   return result;
+}
+
+export async function directPageWrite({
+  instanceDir, writer, indexStore = null, client, page, content, mode,
+  expectedContentId = null, doctor = true, doctorGate = null,
+}) {
+  const r = await directPagesWrite({
+    instanceDir, writer, indexStore, client, doctor, doctorGate,
+    pages: [{ path: page, content, mode, expected_content_id: expectedContentId }],
+  });
+  const { pages: [only], ...rest } = r;
+  return { ...rest, mode: only.mode, path: only.path };
 }

@@ -195,3 +195,59 @@ test('路径校验不跟随 zone 内父目录符号链接', () => {
     /DIRECT_PATH_SYMLINK/,
   );
 });
+
+test('save_batch 只对可信直写客户端开放', async () => {
+  const direct = await mcpClient('direct-token');
+  const normal = await mcpClient('normal-token');
+  const names = async (c) => (await c.listTools()).tools.map((t) => t.name);
+  assert.ok((await names(direct)).includes('save_batch'));
+  assert.ok(!(await names(normal)).includes('save_batch'));
+  await direct.close();
+  await normal.close();
+});
+
+test('save_batch 一次事务写一组页面：同批先建后追加，一次提交，审计不记正文', async () => {
+  const client = await mcpClient('direct-token');
+  const before = git(origin, 'rev-list', '--count', 'main').trim();
+  const result = await client.callTool({
+    name: 'save_batch',
+    arguments: {
+      pages: [
+        { path: 'knowledge/batch-index.md', content: '批量索引：[[batch-part]]', mode: 'create' },
+        { path: 'knowledge/batch-part.md', content: '批量分页：[[batch-index]]', mode: 'create' },
+        { path: 'knowledge/batch-index.md', content: '同批追加的补充。', mode: 'append' },
+      ],
+    },
+  });
+  assert.notEqual(result.isError, true, result.content?.[0]?.text);
+  assert.match(result.content[0].text, /已可信直写 3 页/);
+  assert.match(readFileSync(path.join(work, 'knowledge/batch-index.md'), 'utf8'), /同批追加的补充/);
+  assert.ok(existsSync(path.join(work, 'knowledge/batch-part.md')));
+  assert.equal(Number(git(origin, 'rev-list', '--count', 'main').trim()), Number(before) + 1, '整批只有一次提交');
+  assert.match(git(origin, 'log', '--oneline', '-1'), /direct: batch 3 pages via codex-main/);
+  const audit = auditLog.filter((e) => e.tool === 'save_batch').at(-1);
+  assert.equal(audit.event, 'direct_write');
+  assert.ok(audit.args.pages.every((p) => p.content.redacted === true && !('text' in p)));
+  assert.ok(!JSON.stringify(audit).includes('批量分页'));
+  await client.close();
+});
+
+test('save_batch 任一页不合规则整批不写', async () => {
+  const client = await mcpClient('direct-token');
+  const before = git(origin, 'rev-parse', 'main').trim();
+  const result = await client.callTool({
+    name: 'save_batch',
+    arguments: {
+      pages: [
+        { path: 'knowledge/batch-ok.md', content: '这一页本身没问题。', mode: 'create' },
+        { path: 'knowledge/README.md', content: '结构页不允许直写。', mode: 'append' },
+      ],
+    },
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /DIRECT_STRUCTURE_DENIED.*第 2 页/);
+  assert.equal(existsSync(path.join(work, 'knowledge/batch-ok.md')), false, '前面已写的页随整批回滚');
+  assert.equal(git(origin, 'rev-parse', 'main').trim(), before);
+  assert.equal(git(work, 'status', '--porcelain').trim(), '');
+  await client.close();
+});

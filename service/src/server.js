@@ -30,7 +30,7 @@ import { normalizeInclude } from './tier.js';
 import { createNativeRegistry } from './native-registry.js';
 import { createNudgeState, nudgeCredentialKey } from './nudge-state.js';
 import { inspectSkillDirectory, requestSkillPromotion, SKILL_NAME_RE } from './skill-promotion.js';
-import { directPageWrite } from './direct-write.js';
+import { directPageWrite, directPagesWrite, MAX_BATCH_PAGES } from './direct-write.js';
 
 // 本批保留现有 name/version；title 是供宿主选择展示的名称——
 // 让工具面板上出现「个人知识库」这四个字，而不是只有一个 substrate-kb 代号。
@@ -458,9 +458,9 @@ function buildMcpServer({ instanceDir, writer, doctorGate = null, tools, inbox, 
     try {
       const result = await fn({ ...args, trust }, args);
       const extra = auditFields ? auditFields(result, args) : null;
-      const directAttempt = name === 'save' && (args?.path || args?.mode || args?.expected_content_id);
+      const directAttempt = name === 'save_batch' || (name === 'save' && (args?.path || args?.mode || args?.expected_content_id));
       const cap = directAttempt
-        ? { event: 'direct_write', path: result?.path ?? args?.path, mode: result?.mode ?? args?.mode, source: client }
+        ? { event: 'direct_write', path: result?.path ?? args?.path ?? result?.pages?.map((p) => p.path).join(','), mode: result?.mode ?? args?.mode ?? 'batch', source: client }
         : (captureKind ? { event: 'capture_attempt', id: result?.id, kind: captureKind, source: client } : null);
       audit({ client, trust, tool: name, args: auditArgs(args), ok: true, ...(cap ?? {}), ...(extra ?? {}), ms: Date.now() - t0 });
       // 主频道 piggyback：成功响应尾附待裁提示（豁免正在处置的 inbox_* 工具）。发出即单记一条 nudge 审计。
@@ -469,9 +469,9 @@ function buildMcpServer({ instanceDir, writer, doctorGate = null, tools, inbox, 
       if (n) audit({ client, trust, event: 'nudge', held_count: n.count });
       return { content: [{ type: 'text', text: render(result) + (n?.text ?? '') }] };
     } catch (e) {
-      const directAttempt = name === 'save' && (args?.path || args?.mode || args?.expected_content_id);
+      const directAttempt = name === 'save_batch' || (name === 'save' && (args?.path || args?.mode || args?.expected_content_id));
       const cap = directAttempt
-        ? { event: 'direct_write', path: args?.path, mode: args?.mode, source: client }
+        ? { event: 'direct_write', path: args?.path ?? (Array.isArray(args?.pages) ? args.pages.map((p) => p?.path).join(',').slice(0, 2000) : undefined), mode: args?.mode ?? (name === 'save_batch' ? 'batch' : undefined), source: client }
         : (captureKind ? { event: 'capture_attempt', kind: captureKind, source: client } : null);
       audit({ client, trust, tool: name, args: auditArgs(args), ok: false, ...(cap ?? {}), error: e.message, ms: Date.now() - t0 });
       return { content: [{ type: 'text', text: e.message }], isError: true };
@@ -619,6 +619,24 @@ function buildMcpServer({ instanceDir, writer, doctorGate = null, tools, inbox, 
         kind: 'save', content, hint, client, admission: admission('save', 'save'),
       }), route: 'inbox' };
     }, receiptText, (r) => ({ write_route: r?.route ?? 'inbox', write_target: r?.route === 'direct' ? r.path : undefined }), 'save'));
+
+    if (directWrite) {
+      server.registerTool('save_batch', {
+        title: '可信直写一组页面（原子）',
+        description: `本客户端已启用可信直写。一组需要一起出现的普通 Markdown 页面（尤其是互相 [[链接]] 的一批新页，如总索引 + 分年页）用它一次提交：全部校验、整批写入、doctor 只跑一次、一次 Git 提交，任一页失败则整批不写。逐页 save 时前面的页会链到还不存在的后面的页，单页过不了 doctor。每页规则同 save 的可信直写（path + mode=create|append，不能覆盖、删除或碰 Skill/治理/结构页/typed zone）。一次最多 ${MAX_BATCH_PAGES} 页。`,
+        inputSchema: {
+          pages: z.array(z.object({
+            path: z.string().describe('目标页，如 knowledge/flight-history-2025.md'),
+            content: z.string().describe('页面内容原文'),
+            mode: z.enum(['create', 'append']).describe('create 仅目标不存在时新建；append 仅目标存在时追加'),
+            expected_content_id: z.string().regex(/^[0-9a-f]{8}$/).optional().describe('append 可选的对象身份校验'),
+          })).min(1).max(MAX_BATCH_PAGES).describe('按写入顺序排列；同批先 create 再 append 同一页也可以'),
+        },
+      }, wrap('save_batch', async ({ pages }) => directPagesWrite({
+        instanceDir, writer, indexStore, client, pages, doctorGate,
+      }), (r) => `✅ 已可信直写 ${r.pages.length} 页（doctor 已通过，一次提交${r.sync_pending ? '；远端同步待后台重试' : ''}）：\n${r.pages.map((p) => `- ${p.path}（${p.mode}）`).join('\n')}`,
+      (r) => ({ write_route: 'direct', write_target: r?.pages?.map((p) => p.path).join(',') }), 'save'));
+    }
 
     server.registerTool('todo_add', {
       title: '加待办（经收件箱）',
@@ -984,6 +1002,14 @@ const PRIVATE_AUDIT_ARGS = new Set(['content', 'item', 'fact', 'ruling', 'note',
 function auditArgs(args) {
   const out = {};
   for (const [k, v] of Object.entries(args ?? {})) {
+    if (k === 'pages' && Array.isArray(v)) {
+      // save_batch：只记路径、动作和长度，正文与其它私密参数同样不进审计。
+      out.pages = v.slice(0, 60).map((p) => ({
+        path: typeof p?.path === 'string' ? p.path.slice(0, 200) : undefined,
+        mode: p?.mode, content: { redacted: true, length: String(p?.content ?? '').length },
+      }));
+      continue;
+    }
     if (PRIVATE_AUDIT_ARGS.has(k)) {
       out[k] = typeof v === 'string'
         ? { redacted: true, length: v.length }
@@ -1083,48 +1109,46 @@ if (isMain) {
     }).catch((e) => console.error(`pull 队列异常：${e.message}`));
   }, Number(PULL_INTERVAL_MS)).unref?.();
 
-  if (provider) {
-    // notifier 已在 createApp 之前建好（enrollment 通知复用同一实例）；keeper/夜班共用它。
-    // 夜班（M4.4 D3）只在 provider 在场时挂：它的提案执行依赖 keeper 循环（tick 里勾 maybeRun），
-    // 降级模式（无 key）下 keeper、夜班和 core calibration 都不跑——文档口径不变。
-    // 三者复用 createApp 建立的 inbox/writer，确保同一份持久批准账本与单写者队列严格一致。
-    const serviceInbox = app.locals.inbox;
-    const nightly = createNightly({
-      instanceDir,
-      inbox: serviceInbox,
-      notifier, audit,
-      writer: app.locals.writer, // M4.6：降级/维护日志/迁移的写入走单写者队列（与归档写串行不打架）
-      indexStore,                // 降级翻 tier 后刷新同一派生索引（candidate 默认检索不含）
-      intervalMs: Number(NIGHTLY_INTERVAL_MS),
-      autoDemote: ['1', 'true', 'yes'].includes(String(NIGHTLY_AUTO_DEMOTE).trim().toLowerCase()),
-    });
-    const coreCalibration = createCoreCalibration({
-      instanceDir, inbox: serviceInbox, provider, writer: app.locals.writer, notifier, audit,
-      approvals: app.locals.approvals, nativeReg: app.locals.nativeReg,
-      retryMs: Number(CORE_CALIBRATION_RETRY_MS),
-      quietMs: Number(CORE_CALIBRATION_QUIET_MS),
-      maxDirtyMs: Number(CORE_CALIBRATION_MAX_DIRTY_MS),
-      cooldownMs: Number(CORE_CALIBRATION_COOLDOWN_MS),
-    });
-    const keeper = createKeeper({
-      instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly, coreCalibration,
-      approvals: app.locals.approvals, // F1：与 createApp 内 inbox 共享同一个批准登记表
-      nativeReg: app.locals.nativeReg, // SEC-2/SEC-5：与 createApp 内 inbox 共享同一个亲生件登记表
-      onEvent: (e) => eventStore.push(e),
-      minConfidence: Number(KEEPER_MIN_CONFIDENCE),
-      notifyLevel: KEEPER_NOTIFY_LEVEL,
-    });
-    state.keeper = { enabled: true, model: DEEPSEEK_MODEL, lastRun: null, lastResult: null };
-    const tick = () => keeper.processPending()
-      .then((r) => { state.keeper.lastRun = new Date().toISOString(); if (!r.skipped) state.keeper.lastResult = r; })
-      .catch((e) => console.error(`keeper 循环异常：${e.message}`));
-    setTimeout(tick, 5_000); // 启动后先扫一轮
-    setInterval(tick, Number(KEEPER_INTERVAL_MS)).unref?.();
-    console.log(`keeper enabled（${DEEPSEEK_MODEL} → ${DEEPSEEK_ESCALATION_MODEL}，每 ${KEEPER_INTERVAL_MS}ms；夜班每 ${NIGHTLY_INTERVAL_MS}ms，0=禁用）`);
-  } else {
-    state.keeper = { enabled: false };
-    console.log('keeper disabled（缺 DEEPSEEK_API_KEY）');
-  }
+  // keeper 与模型解耦：没有 DEEPSEEK_API_KEY 时 keeper 照样跑——新增/完成待办、删除、整组落库、
+  // 主人已批准的计划这些确定性任务不需要模型；需要模型判断去向的收件原样留在 inbox，等模型恢复。
+  // 夜班是纯确定性扫描，同样不依赖模型；core calibration 要模型蒸馏，只在 provider 在场时挂。
+  // 三者复用 createApp 建立的 inbox/writer，确保同一份持久批准账本与单写者队列严格一致。
+  const serviceInbox = app.locals.inbox;
+  const nightly = createNightly({
+    instanceDir,
+    inbox: serviceInbox,
+    notifier, audit,
+    writer: app.locals.writer, // M4.6：降级/维护日志/迁移的写入走单写者队列（与归档写串行不打架）
+    indexStore,                // 降级翻 tier 后刷新同一派生索引（candidate 默认检索不含）
+    intervalMs: Number(NIGHTLY_INTERVAL_MS),
+    autoDemote: ['1', 'true', 'yes'].includes(String(NIGHTLY_AUTO_DEMOTE).trim().toLowerCase()),
+  });
+  const coreCalibration = provider ? createCoreCalibration({
+    instanceDir, inbox: serviceInbox, provider, writer: app.locals.writer, notifier, audit,
+    approvals: app.locals.approvals, nativeReg: app.locals.nativeReg,
+    retryMs: Number(CORE_CALIBRATION_RETRY_MS),
+    quietMs: Number(CORE_CALIBRATION_QUIET_MS),
+    maxDirtyMs: Number(CORE_CALIBRATION_MAX_DIRTY_MS),
+    cooldownMs: Number(CORE_CALIBRATION_COOLDOWN_MS),
+  }) : null;
+  const keeper = createKeeper({
+    instanceDir, writer: app.locals.writer, provider, notifier, audit, indexStore, nightly, coreCalibration,
+    approvals: app.locals.approvals, // F1：与 createApp 内 inbox 共享同一个批准登记表
+    nativeReg: app.locals.nativeReg, // SEC-2/SEC-5：与 createApp 内 inbox 共享同一个亲生件登记表
+    doctorGate: app.locals.doctorGate, // 与可信直写共用 doctor 基线缓存
+    onEvent: (e) => eventStore.push(e),
+    minConfidence: Number(KEEPER_MIN_CONFIDENCE),
+    notifyLevel: KEEPER_NOTIFY_LEVEL,
+  });
+  state.keeper = { enabled: true, model: provider ? DEEPSEEK_MODEL : null, lastRun: null, lastResult: null };
+  const tick = () => keeper.processPending()
+    .then((r) => { state.keeper.lastRun = new Date().toISOString(); if (!r.skipped) state.keeper.lastResult = r; })
+    .catch((e) => console.error(`keeper 循环异常：${e.message}`));
+  setTimeout(tick, 5_000); // 启动后先扫一轮
+  setInterval(tick, Number(KEEPER_INTERVAL_MS)).unref?.();
+  console.log(provider
+    ? `keeper enabled（${DEEPSEEK_MODEL} → ${DEEPSEEK_ESCALATION_MODEL}，每 ${KEEPER_INTERVAL_MS}ms；夜班每 ${NIGHTLY_INTERVAL_MS}ms，0=禁用）`
+    : `keeper enabled（无模型：只执行确定性任务，需要模型判断的收件留在 inbox；每 ${KEEPER_INTERVAL_MS}ms）`);
 
   app.listen(Number(PORT), () => console.log(`substrate-kb listening on :${PORT}`));
 }

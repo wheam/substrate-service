@@ -104,7 +104,7 @@
 | `TOKENS_JSON` | ✅ | — | 客户端 token 表（JSON，见 §5）。 |
 | `DATA_DIR` | | `/data` | 持久卷挂载点；实例 clone 到 `DATA_DIR/instance`。要和第 4 步挂的 volume mount path 一致。 |
 | `PORT` | | `3000` | 监听端口。Railway 会自动注入它自己的 `PORT`，服务读取即可，一般不用手设。 |
-| `DEEPSEEK_API_KEY` | | —（缺=降级） | keeper 与 `recall` 的 LLM key。缺 → keeper 不归档、`recall` 不注册；默认写入停在 inbox。显式授权的可信直写不依赖它。 |
+| `DEEPSEEK_API_KEY` | | —（缺=降级） | keeper 与 `recall` 的 LLM key。缺 → `recall` 不注册，需要模型判断去向的收件停在 inbox 等待；新增/完成待办、删除、互链批次整组落库、已批准计划和可信直写照常执行（keeper 不依赖 key 运行）。 |
 | `DEEPSEEK_MODEL` | | `deepseek-v4-flash` | keeper/recall 主判模型。 |
 | `DEEPSEEK_ESCALATION_MODEL` | | `deepseek-v4-pro` | keeper 拿不准时升档用的模型。 |
 | `DEEPSEEK_TIMEOUT_MS` | | `120000`（2 分钟） | 主判模型单次请求的总时限；超时按可重试故障处理，不拖住 keeper 整轮。 |
