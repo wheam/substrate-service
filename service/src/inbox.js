@@ -318,6 +318,7 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
           id, path: rel, kind, status: get('status'),
           held_class: get('held_class') || undefined,
           retry_exhausted: get('retry_exhausted') === 'true' || undefined,
+          blocked_category: get('blocked_category') || undefined,
           received_at: get('received_at'), hint: get('hint') || undefined,
           client, excerpt: parsed.content.slice(0, 120),
           content: parsed.content.slice(0, nativeCore ? CORE_PROPOSAL_PREVIEW_CHARS : INBOX_PREVIEW_CHARS),
@@ -386,7 +387,9 @@ export function createInbox({ instanceDir, writer, indexStore = null, approvals 
       .replace(/^held_class: .*\n/m, '')
       .replace(/^retry_count: .*\n/m, '')
       .replace(/^retry_after: .*\n/m, '')
-      .replace(/^retry_exhausted: .*\n/m, '');
+      .replace(/^retry_exhausted: .*\n/m, '')
+      // keeper 的 blocked 状态字段只在 frontmatter 里清，正文同名行是数据、不能碰。
+      .replace(/^---\n[\s\S]*?\n---\n/, (fm) => fm.replace(/^blocked_\w+: .*\n/gm, ''));
     const rulingLines = [
       `owner_ruling: ${oneline(ruling)}`,
       ...(via ? [`ruling_via: ${oneline(via)}`, `ruling_via_trust: ${oneline(viaTrust ?? '')}`] : []),

@@ -5,6 +5,10 @@ export function createDeepSeekProvider({
   escalationModel = 'deepseek-v4-pro',
   baseUrl = 'https://api.deepseek.com',
   fetchImpl = fetch,
+  // 应用级总时限（含读完响应体）。keeper 一轮串行处理，一次挂起的请求会拖住整轮归档；
+  // 升级档开 thinking、预算 16k token，给得更宽。超时/429/5xx 抛出的错误带 retryable 标记。
+  timeoutMs = 120_000,
+  escalationTimeoutMs = 300_000,
 }) {
   async function judge({ system, user, escalate = false }) {
     const useModel = escalate ? escalationModel : model;
@@ -27,15 +31,35 @@ export function createDeepSeekProvider({
       body.temperature = 0;
       body.max_tokens = 6000;
     }
-    const res = await fetchImpl(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      throw new Error(`DeepSeek API ${res.status}：${(await res.text()).slice(0, 300)}`);
+    const limitMs = escalate ? escalationTimeoutMs : timeoutMs;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limitMs);
+    let data;
+    try {
+      const res = await fetchImpl(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const error = new Error(`DeepSeek API ${res.status}：${(await res.text()).slice(0, 300)}`);
+        error.status = res.status;
+        error.retryable = res.status === 429 || res.status >= 500;
+        throw error;
+      }
+      data = await res.json();
+    } catch (e) {
+      if (controller.signal.aborted) {
+        const error = new Error(`DeepSeek 请求超时（${Math.round(limitMs / 1000)}s，${useModel}）`);
+        error.code = 'PROVIDER_TIMEOUT';
+        error.retryable = true;
+        throw error;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
-    const data = await res.json();
     const choice = data.choices?.[0];
     const text = choice?.message?.content ?? '';
     if (!text.trim()) {

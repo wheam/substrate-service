@@ -11,7 +11,8 @@
 //   诱饵页操纵的正文长度），有入链的页不自动降级（被依赖）——堵「更长的诱饵页反向挤降正典页」。
 // 抗注入（M4.6 Finding3）：一切进 digest/维护日志的页路径过 displaySafePath 单行化+实体化（路径=git 文件名，可含
 //   换行/Markdown/控制字符）。明确不做（v0 裁剪，理由入 docs §9）：孤儿检测、矛盾旗标、keeper 聚簇自动提 zone。
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, lstatSync, rmSync } from 'node:fs';
+import { viaSymlink } from './safe-fs.js';
 import path from 'node:path';
 import { parseZones } from './acl.js';
 import { setPageTier } from './executor.js';
@@ -88,6 +89,10 @@ export function createNightly({
   writer = null,        // M4.6：降级/维护日志/迁移的写入都走 writer.transact（沿夜班现有落盘方式，写与 commit 同队列串行）
   indexStore = null,    // 降级翻 tier 后刷新派生索引（candidate 默认检索不含）；缺省 null → 无副作用（老调用方/测试不变）
   intervalMs = 604_800_000, // 默认 7 天；0=禁用
+  // 薄页/近似重复默认只进 digest 建议、不自动降级。长度和相似度不是知识价值的判断：一条刚明确保存的
+  // 简短决定没有别的正文入链，就会被降成 candidate、从默认 search/recall 里消失（2026-10-18 审查复现）。
+  // 显式 autoDemote:true（env NIGHTLY_AUTO_DEMOTE=1）才恢复旧的自动降级。
+  autoDemote = false,
   // 状态文件在实例 git 之外（与 recall-index 同级惯例）：lastRun/lastActions 是运维状态，不是知识，不进库
   statePath = path.resolve(instanceDir, '..', 'nightly-state.json'),
 } = {}) {
@@ -102,13 +107,16 @@ export function createNightly({
     const pages = [];
     for (const z of zones) {
       const root = path.join(instanceDir, z.path);
-      if (!existsSync(root)) continue;
+      if (!existsSync(root) || viaSymlink(instanceDir, z.path)) continue;
       const stack = [root];
       while (stack.length) {
         const d = stack.pop();
         for (const name of readdirSync(d)) {
           const p = path.join(d, name);
-          if (statSync(p).isDirectory()) { stack.push(p); continue; }
+          // 符号链接不扫（见 safe-fs.js）：夜班会改 tier，跟随别名可能改到实例外或敏感区的真实文件。
+          const st = lstatSync(p);
+          if (st.isSymbolicLink()) continue;
+          if (st.isDirectory()) { stack.push(p); continue; }
           if (!name.endsWith('.md') || name === 'README.md' || name.startsWith('_')) continue;
           const raw = readFileSync(p, 'utf8');
           const fm = raw.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
@@ -136,7 +144,9 @@ export function createNightly({
       for (const name of readdirSync(d)) {
         if (name === '.git') continue;
         const p = path.join(d, name);
-        if (statSync(p).isDirectory()) stack.push(p);
+        const st = lstatSync(p);
+        if (st.isSymbolicLink()) continue;
+        if (st.isDirectory()) stack.push(p);
         else if (name.endsWith('.md')) stems.add(name.replace(/\.md$/, ''));
       }
     }
@@ -308,9 +318,16 @@ export function createNightly({
       out.thin = found.thin.length;
       out.broken = found.brokenLinks.length;
       const demoted = [];
+      const advisory = [];
       // D1：薄页/重复页 → 进程内确定性 set_tier 降级，不写 inbox 提案、不需裁定。每轮 ≤MAX_DEMOTE；
       // 同页已 candidate 则跳过（幂等，不占额度、不误报审计）；sensitive 区 listPages 已整体排除。
+      // autoDemote 关闭（默认）时同一批目标只转成建议，页面 tier 不动。
+      const peerOf = new Map(found.duplicates.map((d) => [d.b, d.a]));
       for (const tgt of collectDemoteTargets(found)) {
+        if (!autoDemote) {
+          advisory.push({ page: tgt.page, reason: tgt.reason, ...(peerOf.has(tgt.page) && tgt.reason === 'duplicate' ? { peer: peerOf.get(tgt.page) } : {}) });
+          continue;
+        }
         if (out.demoted >= MAX_DEMOTE) break;
         const abs = path.join(instanceDir, tgt.page);
         if (!existsSync(abs)) continue;
@@ -327,7 +344,7 @@ export function createNightly({
       actions = {
         demoted,
         broken: [...new Set(found.brokenLinks.map((b) => b.page))], // 仅页路径
-        suggestions: found.suggestions.map((s) => ({ page: s.page, reason: s.reason, ...(s.peer ? { peer: s.peer } : {}) })),
+        suggestions: [...advisory, ...found.suggestions.map((s) => ({ page: s.page, reason: s.reason, ...(s.peer ? { peer: s.peer } : {}) }))],
         counts: { demoted: out.demoted, broken: out.brokenReported },
       };
       // 零动作不打扰主人——audit 的 nightly_run 已是心跳，通知只在真有事时发
@@ -411,11 +428,13 @@ export function formatNightlyDigest(state) {
   // 建议（Finding2）：疑似重复/薄页但因 created 无法判定保留侧、或有入链被依赖 → 未自动降级，仅供人工确认。
   if (a.suggestions?.length) {
     if (a.demoted?.length || a.broken?.length) lines.push('');
-    lines.push(`另有 ${a.suggestions.length} 处疑似冗余/薄页未自动降级（需人工确认，可用 page_set_tier 处理）：`);
+    lines.push(`另有 ${a.suggestions.length} 处疑似冗余/薄页未自动降级（仅供参考；确需降级可用 page_set_tier）：`);
     for (const s of a.suggestions) {
       const why = s.reason === 'duplicate-tie' ? '疑似重复但创建时间无法判定保留侧'
         : s.reason === 'duplicate-inlink' ? '疑似冗余但有其它页链入（被依赖）'
-        : s.reason === 'thin-inlink' ? '薄页但有其它页链入（被依赖）' : String(s.reason ?? '');
+        : s.reason === 'thin-inlink' ? '薄页但有其它页链入（被依赖）'
+        : s.reason === 'thin' ? '正文偏短（仅提示，未降级）'
+        : s.reason === 'duplicate' ? '疑似近似重复（仅提示，未降级）' : String(s.reason ?? '');
       lines.push(`- ${displaySafePath(s.page)}${s.peer ? `（疑似与 ${displaySafePath(s.peer)} 重复）` : ''}（${why}）`);
     }
   }

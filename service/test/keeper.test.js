@@ -207,7 +207,10 @@ test('doctor 提交前闸门：ERROR 时回滚新页与索引，收件转 held�
   );
   const held = readFileSync(path.join(work, receipt.path), 'utf8');
   assert.match(held, /^status: held$/m, '原收件应恢复并转 held');
-  assert.match(held, /doctor 报 1 error，已回滚/, 'held 原因应说明 doctor 门禁');
+  assert.match(held, /doctor 报 1 error/, 'held 原因应说明 doctor 门禁');
+  // doctor 拦下是确定性失败：转 blocked（库有新提交才重试、不重判），不再按时间退避六次。
+  assert.match(held, /^held_class: blocked$/m);
+  assert.doesNotMatch(held, /^retry_count:/m);
   assert.equal(git(work, 'status', '--short'), '', '回滚与 held 提交后工作树应 clean');
   assert.doesNotMatch(
     git(work, 'ls-tree', '-r', '--name-only', 'origin/main'),
@@ -352,7 +355,7 @@ test('collection count changes roll back together with CSV when doctor rejects a
   await keeper.processPending();
   assert.equal(readFileSync(csv, 'utf8'), before);
   assert.equal(readFileSync(page, 'utf8'), '当前 **2** 条\n');
-  assert.match(readFileSync(path.join(work, receipt.path), 'utf8'), /held_class: retryable/);
+  assert.match(readFileSync(path.join(work, receipt.path), 'utf8'), /held_class: blocked/);
   assert.match(readFileSync(path.join(work, receipt.path), 'utf8'), /doctor 报 1 error/);
   assert.equal(git(work, 'status', '--porcelain').trim(), '');
 });

@@ -79,7 +79,7 @@ function nightlyOn(work, { statePath, indexStore } = {}) {
   const nightly = createNightly({
     instanceDir: work, inbox, writer, ...(indexStore ? { indexStore } : {}),
     notifier: { notify: async () => ({ ok: true }) }, audit: (e) => audits.push(e),
-    intervalMs: 604_800_000, statePath: statePath ?? path.join(work, '..', 'ns-demote.json'),
+    autoDemote: true, intervalMs: 604_800_000, statePath: statePath ?? path.join(work, '..', 'ns-demote.json'),
   });
   return { writer, inbox, nightly, audits };
 }
@@ -448,4 +448,24 @@ test('G3（Finding3 维护日志复现）断链页文件名含反引号/井号 �
   assert.match(logRaw, /&#96;code&#96;/, '文件名里的反引号被实体化为 &#96;');
   assert.match(logRaw, /&#35;h/, '文件名里的井号被实体化为 &#35;');
   assert.ok(!/\[\[ghost/.test(logRaw), '维护日志里没有裸 [[（对 doctor 任何 strip 免疫）');
+});
+
+test('默认配置：薄页只进 digest 建议、不自动降级（明确保存的简短决定仍在默认检索里）', async () => {
+  const { work } = makeGitInstance();
+  seedCommit(work, (w) => {
+    writePage(w, 'knowledge/decision-short.md', { title: '每周备份决定', body: '决定：项目采用每周备份，保留四周。' });
+  });
+  const writer = createWriter({ instanceDir: work });
+  const nightly = createNightly({
+    instanceDir: work, inbox: createInbox({ instanceDir: work, writer }), writer,
+    notifier: { notify: async () => ({ ok: true }) }, audit: () => {},
+    intervalMs: 604_800_000, statePath: path.join(work, '..', 'ns-default-advisory.json'),
+  });
+  assert.ok(nightly.scan().thin.some((t) => t.page === 'knowledge/decision-short.md'), '扫描仍识别出薄页');
+  const r = await nightly.maybeRun();
+  assert.equal(r.demoted, 0);
+  assert.equal(tierOf(work, 'knowledge/decision-short.md'), 'canonical');
+  const state = nightly.readState();
+  assert.ok(state.lastActions.suggestions.some((s) => s.page === 'knowledge/decision-short.md' && s.reason === 'thin'));
+  assert.match(formatNightlyDigest(state), /正文偏短（仅提示，未降级）/);
 });

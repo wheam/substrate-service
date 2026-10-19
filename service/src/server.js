@@ -22,6 +22,7 @@ import { createCoreCalibration } from './core-calibration.js';
 import { applySchema, validateSchemaProposal, setPageTier, rollbackSchemaWrites, finalizeSchemaRollback } from './executor.js';
 import { createNotifier } from './notify.js';
 import { createDeepSeekProvider } from './provider.js';
+import { createDoctorGate } from './doctor-gate.js';
 import { createEventStore } from './events.js';
 import { createIndexStore } from './index-store.js';
 import { createRecall } from './recall.js';
@@ -84,6 +85,8 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   for (const v of Object.values(tokens)) if (v && typeof v === 'object') v.source = 'static';
   const tools = createTools({ instanceDir });
   const writer = createWriter({ instanceDir });
+  // doctor 增量门禁：可信直写与 keeper 共用一份（基线按 HEAD 缓存）。
+  const doctorGate = createDoctorGate({ instanceDir });
   // SEC-2/SEC-5 接线：「服务端亲生件登记表」<id,nativeToken>。只存内容绑定 hash、
   // 落在实例 git 之外的 volume；同一账本的 approvals 子表保存内容绑定主人批准，避免重启或
   // retryable 执行故障后把主人裁定丢掉、让 LLM 静默改判。生产用持久子表；注入普通 Map 的测试回退 Map。
@@ -96,6 +99,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   const identityCredentialKeys = new WeakMap();
   const app = express();
   app.locals.writer = writer; // keeper 与写工具共用同一个单写者
+  app.locals.doctorGate = doctorGate;
   app.locals.inbox = inbox; // 夜班/core calibration 复用同一门面（尤其共享 native/approval 账本）
   app.locals.approvals = approvals; // F1：keeper（isMain）经此拿到与 inbox 同一个批准登记表
   app.locals.nativeReg = nativeReg; // SEC-2/SEC-5：keeper/nightly（isMain）经此拿到与 inbox 同一个亲生件登记表
@@ -302,7 +306,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
 
     const primary = identity.channel === 'primary' && identity.trust === 'high';
     // enrollment 工具（仅主频道注册）需要账本 + notify + 按本请求推导的 publicUrl（拼可粘贴 prompt 里的 <publicUrl>/enroll）。
-    const server = buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore, identity, directWrite: directWriteFor(identity), audit, nudge: primary ? nudgeFor : null,
+    const server = buildMcpServer({ instanceDir, writer, doctorGate, tools, inbox, recall, indexStore, identity, directWrite: directWriteFor(identity), audit, nudge: primary ? nudgeFor : null,
       nativeReg,
       enrollment, notify: fireNotify, tokens, enrollPublicUrl: publicUrlFor(req), enrollCodeTtlMs });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
@@ -437,7 +441,7 @@ export function createApp({ instanceDir, tokens, audit = createAudit(), eventSto
   return app;
 }
 
-function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore = null, identity, directWrite = false, audit, nudge = null,
+function buildMcpServer({ instanceDir, writer, doctorGate = null, tools, inbox, recall, indexStore = null, identity, directWrite = false, audit, nudge = null,
   nativeReg = new Map(), enrollment = null, notify = null, tokens = {}, enrollPublicUrl = null, enrollCodeTtlMs = 900_000 }) {
   const server = new McpServer(SERVER_INFO, { instructions: instructionsFor(identity, { directWrite }) });
   const { client, trust } = identity;
@@ -608,7 +612,7 @@ function buildMcpServer({ instanceDir, writer, tools, inbox, recall, indexStore 
         if (!directPath || !mode) throw new Error('[DIRECT_ARGUMENTS_INCOMPLETE] 可信直写须同时提供 path 与 mode');
         return directPageWrite({
           instanceDir, writer, indexStore, client, page: directPath, content, mode,
-          expectedContentId: expected_content_id,
+          expectedContentId: expected_content_id, doctorGate,
         });
       }
       return { ...inbox.addEntry({
@@ -1004,6 +1008,8 @@ if (isMain) {
     DEEPSEEK_API_KEY,
     DEEPSEEK_MODEL = 'deepseek-v4-flash',
     DEEPSEEK_ESCALATION_MODEL = 'deepseek-v4-pro',
+    DEEPSEEK_TIMEOUT_MS = '120000',
+    DEEPSEEK_ESCALATION_TIMEOUT_MS = '300000',
     FEISHU_WEBHOOK_URL,
     FEISHU_WEBHOOK_SECRET,
     KEEPER_INTERVAL_MS = 60_000,
@@ -1011,6 +1017,7 @@ if (isMain) {
     KEEPER_NOTIFY_LEVEL = 'all',
     NUDGE_TTL_MS = 259_200_000, // 同一批待裁件默认 72 小时最多主动浮出一次（状态跨部署持久化）
     NIGHTLY_INTERVAL_MS = 604_800_000, // 夜班默认 7 天一轮；0=禁用
+    NIGHTLY_AUTO_DEMOTE = '0',         // 1=薄页/近似重复自动降为 candidate；默认只在 digest 里提示
     CORE_CALIBRATION_RETRY_MS = 3_600_000, // 核心蒸馏失败后同一来源至少等 1 小时再试
     CORE_CALIBRATION_QUIET_MS = 1_800_000, // 来源停止变化 30 分钟后再合批判断
     CORE_CALIBRATION_MAX_DIRTY_MS = 86_400_000, // 持续变化最多等待 24 小时
@@ -1041,7 +1048,10 @@ if (isMain) {
 
   // provider（keeper 与 recall 同一把）：无 key 则读侧 recall 与写侧 keeper 一并降级（不注册/不启用）。
   const provider = DEEPSEEK_API_KEY
-    ? createDeepSeekProvider({ apiKey: DEEPSEEK_API_KEY, model: DEEPSEEK_MODEL, escalationModel: DEEPSEEK_ESCALATION_MODEL })
+    ? createDeepSeekProvider({
+      apiKey: DEEPSEEK_API_KEY, model: DEEPSEEK_MODEL, escalationModel: DEEPSEEK_ESCALATION_MODEL,
+      timeoutMs: Number(DEEPSEEK_TIMEOUT_MS), escalationTimeoutMs: Number(DEEPSEEK_ESCALATION_TIMEOUT_MS),
+    })
     : null;
 
   // notifier 提前到 createApp 之前（M4.8 要点 7）：enrollment 通知（铸码/兑换/吊销）不依赖 provider——
@@ -1086,6 +1096,7 @@ if (isMain) {
       writer: app.locals.writer, // M4.6：降级/维护日志/迁移的写入走单写者队列（与归档写串行不打架）
       indexStore,                // 降级翻 tier 后刷新同一派生索引（candidate 默认检索不含）
       intervalMs: Number(NIGHTLY_INTERVAL_MS),
+      autoDemote: ['1', 'true', 'yes'].includes(String(NIGHTLY_AUTO_DEMOTE).trim().toLowerCase()),
     });
     const coreCalibration = createCoreCalibration({
       instanceDir, inbox: serviceInbox, provider, writer: app.locals.writer, notifier, audit,

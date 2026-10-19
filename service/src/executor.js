@@ -70,14 +70,29 @@ function nulPaths(raw) {
 // keeper 的复合写在专用 clone + 单写者队列里执行。正式落盘前要求工作树 clean，避免把人工/并发改动
 // 混进本次归档；失败时只恢复本次产生的 tracked diff，并逐个删除本次新建的 untracked 文件。
 // 不用 reset --hard / git clean，回滚面保持可枚举、可审计。
+// inbox/ 与回滚口径一致地排除：addEntry/resolveEntry 为秒回先在队列外落盘、再排队 commit，
+// 它们可能恰好落在本事务开始之前。事务只 add 自己的 paths，回滚也不碰 inbox/，所以并发收件
+// 不会混进本次提交；把它们算作 dirty 只会让排队中的无关写入被误拒（2026-10-18 审查复现）。
 export async function assertCleanWorktree(instanceDir) {
   const status = await git(instanceDir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
-  const dirty = nulPaths(status);
+  const dirty = porcelainPaths(status).filter(outsideInbox);
   if (dirty.length) throw new Error(`实例工作树有 ${dirty.length} 处未提交改动，拒绝混入 keeper 归档`);
 }
 
+// porcelain v1 -z：每条 "XY path"，重命名/复制条目后面多跟一个原路径字段。
+function porcelainPaths(raw) {
+  const fields = nulPaths(raw);
+  const out = [];
+  for (let i = 0; i < fields.length; i++) {
+    const code = fields[i].slice(0, 2);
+    out.push(fields[i].slice(3));
+    if (code.includes('R') || code.includes('C')) out.push(fields[++i]);
+  }
+  return out;
+}
+
 function outsideInbox(rel) {
-  return rel !== 'inbox' && !rel.startsWith('inbox/');
+  return rel !== 'inbox' && rel !== 'inbox/' && !rel.startsWith('inbox/');
 }
 
 export async function rollbackUncommitted(instanceDir) {

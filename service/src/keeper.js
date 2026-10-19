@@ -2,12 +2,15 @@
 // → 确定性执行 → git commit+push → 通知主人。只有真正缺人的语义取舍才 owner-held；
 // 可安全旁置的不确定性用 candidate 吸收，引擎/权限问题分别进 retryable/security。
 import { readFileSync, writeFileSync, readdirSync, existsSync, rmSync, mkdirSync, statSync, lstatSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { parseZones, zoneFor, SERVICE_ZONE_IDS } from './acl.js';
 import {
-  validateDecisionPlan, applyDecisionPlan, runDoctor, rollbackSchemaWrites, finalizeSchemaRollback,
+  validateDecisionPlan, applyDecisionPlan, rollbackSchemaWrites, finalizeSchemaRollback,
   assertCleanWorktree, rollbackUncommitted,
 } from './executor.js';
+import { createDoctorGate, describeDoctorFailure, parseBrokenLink } from './doctor-gate.js';
 import { admissionFromRaw, parseEntryBody, approvalToken, nativeToken, normKind } from './inbox.js';
 import { finalizeCoreRollback, rollbackCoreCalibration } from './core-calibration.js';
 import { findPagesByContentId } from './content-id.js';
@@ -23,6 +26,27 @@ const SKIP_LLM_KINDS = new Set(['schema', 'maintenance', 'core', 'skill']);
 const CANONICAL_SKILL_PATH_RE = /^skills\/[a-z0-9][a-z0-9._-]*\/SKILL\.md$/;
 const INCOMING_SKILL_PATH_RE = /^skills\/_incoming\/[a-z0-9][a-z0-9._-]*\/SKILL\.md$/;
 const MAX_AUTO_RETRIES = 6;
+// 整组落库的规模上限：一次 tick 里互相链接、单件过不了 doctor 的普通页面。
+const MAX_GROUP_SIZE = 60;
+const GROUP_ACTIONS = new Set(['new_page', 'merge_into']);
+
+// 只改首个 frontmatter 块里的机器字段；正文里同名的行是数据，不能被状态迁移误改。
+function editFrontmatter(raw, fn) {
+  return raw.replace(/^---\n([\s\S]*?)\n---\n/, (_all, fm) => `---\n${fn(fm)}\n---\n`);
+}
+function fmSet(fm, key, value) {
+  const line = `${key}: ${value}`;
+  const re = new RegExp(`^${key}: .*$`, 'm');
+  return re.test(fm) ? fm.replace(re, line) : fm.replace(/^status: (.*)$/m, `${line}\nstatus: $1`);
+}
+function fmGet(raw, key) {
+  const fm = String(raw).match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
+  return fm.match(new RegExp(`^${key}: (.*)$`, 'm'))?.[1]?.trim() ?? null;
+}
+function fmDropBlocked(fm) {
+  return fm.replace(/^blocked_\w+: .*(?:\n|$)/gm, '').replace(/\n+$/, '');
+}
+const stemOf = (target) => path.posix.basename(String(target).trim()).replace(/\.md$/, '');
 
 function explicitContentId(hint) {
   return String(hint ?? '').match(/\bcontent_id\s*[:：=]?\s*([0-9a-f]{8})\b/i)?.[1]?.toLowerCase() ?? null;
@@ -381,8 +405,22 @@ export function displaySafePath(p) {
     .slice(0, 200);                                    // 长度上限
 }
 
-export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, coreCalibration = null, approvals = new Map(), nativeReg = new Map() }) {
+export function createKeeper({ instanceDir, writer, provider, notifier, audit = () => {}, onEvent = () => {}, minConfidence = 0.75, doctor = true, notifyLevel = 'all', indexStore = null, nightly = null, coreCalibration = null, approvals = new Map(), nativeReg = new Map(), doctorGate = null, blockedAlertMs = 30 * 60_000 }) {
   let running = false;
+  // doctor 增量门禁（见 doctor-gate.js）：只拦本次写入新增的错误；既有内容质量问题不再挡无关写入。
+  const gate = doctorGate ?? createDoctorGate({ instanceDir, enabled: doctor });
+  // 已过 effect policy 的计划缓存（进程内）。执行失败后重试复用同一计划：同一份 doctor/Git 故障
+  // 让模型再判一次只会得到同样的失败（2026-10-18：19 件 × 6 次重判）。键绑正文/kind/client/hint/裁定，
+  // 任何一项变化都回到模型；进程重启后丢失，最多多判一次。
+  const planCache = new Map();
+  // blocked 件（确定性 doctor 失败）上次尝试时的 HEAD：实例没变化就不重试，结果必然相同。
+  const blockedTriedAt = new Map();
+  // blocked 件的失败明细（断链目标等），供整组落库判断“缺的页是否由同组其他件提供”。
+  const blockedInfo = new Map();
+  let lastGroupSignature = null;
+  const systemAlerted = new Set();
+  // 本轮待合并发送的运维告警：一次 tick 最多一条，不再一件一条。
+  const pendingAlerts = [];
   // F4：夜班独立 in-flight 旗，与归档锁 running 解耦——长扫描/慢 push 不再阻塞下一次 pending 受理。
   let nightlyRunning = false;
   let coreRunning = false;
@@ -407,7 +445,27 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     } catch (e) { console.error(`onEvent 异常：${e.message}`); }
   };
 
-  function listPending() {
+  function headNow() {
+    return new Promise((resolve) => {
+      execFile('git', ['rev-parse', 'HEAD'], { cwd: instanceDir, timeout: 30_000, encoding: 'utf8' },
+        (err, stdout) => resolve(err ? null : stdout.trim()));
+    });
+  }
+
+  function planKey(entry) {
+    return createHash('sha256').update(JSON.stringify([
+      entry.kind, entry.client ?? '', entry.hint ?? '', entry.body ?? '', entry.owner_ruling ?? '',
+    ])).digest('hex');
+  }
+
+  function forgetEntry(id) {
+    planCache.delete(id);
+    blockedTriedAt.delete(id);
+    blockedInfo.delete(id);
+  }
+
+  // head：当前实例 HEAD。blocked 件只在 HEAD 与上次尝试时不同才重试（未提供 head 时不重试 blocked 件）。
+  function listPending(head = null) {
     const dir = path.join(instanceDir, 'inbox');
     if (!existsSync(dir)) return [];
     return readdirSync(dir)
@@ -416,6 +474,9 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       .filter((rel) => {
         const raw = readFileSync(path.join(instanceDir, rel), 'utf8');
         if (/^status: pending$/m.test(raw)) return true;
+        if (/^status: held$/m.test(raw) && fmGet(raw, 'held_class') === 'blocked') {
+          return !!head && blockedTriedAt.get(fmGet(raw, 'id')) !== head;
+        }
         if (!/^status: held$/m.test(raw) || !/^held_class: retryable$/m.test(raw)) return false;
         if (/^retry_exhausted: true$/m.test(raw)) return false;
         const retryAt = raw.match(/^retry_after: (.*)$/m)?.[1];
@@ -538,7 +599,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     return requireResult(result, '升级档判断');
   }
 
-  function rewriteEntry(entry, status, extra, { tier, holdClass = 'owner' } = {}) {
+  function rewriteEntry(entry, status, extra, { tier, holdClass = 'owner', blocked = null } = {}) {
     const now = new Date().toISOString();
     let updated = entry.raw
       // retryable 件下轮重试时入参仍是 status:held；状态迁移不能只匹配 pending。
@@ -588,7 +649,23 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       } else {
         updated = updated.replace(/^retry_count: .*\n/m, '').replace(/^retry_after: .*\n/m, '').replace(/^retry_exhausted: .*\n/m, '');
       }
+      if (holdClass === 'blocked' && blocked) {
+        const prevFp = fmGet(updated, 'blocked_fp');
+        const since = fmGet(updated, 'blocked_since') ?? now;
+        updated = editFrontmatter(updated, (fm) => {
+          let next = fmDropBlocked(fm);
+          next = fmSet(next, 'blocked_since', since);
+          next = fmSet(next, 'blocked_category', blocked.category);
+          next = fmSet(next, 'blocked_fp', blocked.fp);
+          // 计时从第一次 blocked 起算；同一失败原因只提醒一次，原因变了会按新原因再提醒一次。
+          if (prevFp === blocked.fp && fmGet(entry.raw, 'blocked_alerted') === 'true') next = fmSet(next, 'blocked_alerted', 'true');
+          return next;
+        });
+      } else {
+        updated = editFrontmatter(updated, fmDropBlocked);
+      }
     } else {
+      updated = editFrontmatter(updated, fmDropBlocked);
       updated = updated
         .replace(/^keeper_held_at: .*\n/m, '')
         .replace(/^held_class: .*\n/m, '')
@@ -654,6 +731,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
   }
 
   async function holdEntry(entry, rel, reason, { holdClass = 'owner' } = {}) {
+    if (holdClass === 'owner' || holdClass === 'security') forgetEntry(entry.id);
     let options = [];
     if (holdClass === 'owner' && (entry.__todo_request || entry.__removal_request)) {
       const label = entry.__removal_request ? '放弃本次移除请求' : '放弃本次待办请求';
@@ -718,14 +796,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       ].join('\n'));
     } else if (holdClass === 'retryable'
         && /^retry_exhausted: true$/m.test(readFileSync(path.join(instanceDir, rel), 'utf8'))) {
-      // 自动重试耗尽是运维告警，不是归档选择题：不生成候选、不写 keeper_held_at，
-      // 只明确告知已停止烧模型/反复写 git。主人若愿意可在高信任 inbox_list 中查看或复位。
-      await notifier.notify([
-        '⚠️ keeper 自动重试已停止',
-        `收件：${entry.id}`,
-        `原因：${reason}`,
-        `已连续失败 ${MAX_AUTO_RETRIES} 次；这不是归档决策题，未生成主人候选。`,
-      ].join('\n'));
+      // 自动重试耗尽是运维告警，不是归档选择题：不生成候选、不写 keeper_held_at。
+      // 同一轮的多件合并成一条（flushAlerts），不再一件一条刷屏。
+      forgetEntry(entry.id);
+      pendingAlerts.push({ type: 'exhausted', id: entry.id, reason });
     }
     emit(entry, 'held', rel, `${holdClass}:${reason}`);
   }
@@ -886,6 +960,10 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         summary: `暂存 Skill 文件 ${entry.__page_intent.rel}`, confidence: 1, tier: 'canonical',
       };
       model = 'deterministic-skill-stage';
+    } else if (planCache.get(entry.id)?.key === planKey(entry)) {
+      // 上次已通过 effect policy、只是执行失败（doctor/Git）的同一份计划：直接复用，下方仍完整重校验。
+      ({ decision, model } = planCache.get(entry.id));
+      decision = structuredClone(decision);
     } else {
       let judged;
       try {
@@ -927,6 +1005,8 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       }
     }
     let v = validateDecisionPlan({ instanceDir, decision, entry });
+    // 缓存的计划已不再合法（库变化了）：丢掉，下一轮回到模型按新状态判断。
+    if (!v.ok) planCache.delete(entry.id);
     // 本机亲生普通件上，“模型选了 admission 不允许的 effect”是规划错误，
     // 不是安全事件，更不是主人决策题。给升级档一次带硬边界的 repair；若仍越权，
     // 归类为 retryable model/policy 失配。伪造/篡改件（!__native）不获得 repair 机会，继续 security 隔离。
@@ -995,6 +1075,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       emit(entry, 'rejected', rel, v.reason);
       // 隔离-rejected 件并进派生索引（默认检索仍排除它，include=rejected 可查）。主人裁定的拒收已清场、不入索引。
       if (!ownerRuled) refreshIndex('reject', [rel]);
+      forgetEntry(entry.id);
       await notifier.notify(`❌ 拒收：${v.reason}\n（inbox ${entry.id}${ownerRuled ? '，按你的裁定已清场' : '，件留在收件箱、隔离可查（默认检索不含）'}）`);
       audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'rejected', disposition: 'rejected', tier: 'rejected', ms: Date.now() - t0 });
       return 'rejected';
@@ -1019,17 +1100,26 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       return 'held';
     }
 
+    if (!entry.approved_decision) {
+      planCache.set(entry.id, { key: planKey(entry), decision: structuredClone(decision), model });
+    }
+
     let detail, changedPaths = [], applied = null, syncPending = false, syncError = null;
     try {
       await writer.transact(async (commit) => {
         await assertCleanWorktree(instanceDir);
         assertEntryCurrent(entry, rel);
+        // doctor 基线必须在任何写入之前、工作树干净时取（按 HEAD 缓存）。记下本次尝试所基于的 HEAD：
+        // 若失败转 blocked，HEAD 不再变化就不必重试；取得晚了会漏掉期间别的提交带来的修复。
+        entry.__attempt_head = await headNow();
+        const doctorBase = await gate.baseline();
         try {
           // 判断到执行之间可能已有别的服务端写者落盘。在同一 writer 事务内重做完整
           // preflight，且必须在任何页面写入之前全部通过；复合计划的 target hash 也在这里重取。
           const freshValidation = validateDecisionPlan({ instanceDir, decision, entry });
           if (!freshValidation.ok || freshValidation.verdict !== 'file') {
             const error = new Error(`执行前 preflight 失败：${freshValidation.reason ?? freshValidation.verdict}`);
+            error.code = 'PREFLIGHT_FAILED';
             if (freshValidation.staleCore) {
               error.code = 'STALE_CORE_PROPOSAL';
               error.staleReason = freshValidation.reason;
@@ -1046,12 +1136,14 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
           const paths = [...applied.changedPaths, rel];
           if (!['core', 'skill'].includes(entry.kind) && entry.__ruling_authentic && entry.owner_ruling) paths.push(appendCase(entry, decision, applied.detail));
 
-          // 普通内容写与 schema/core 一样，doctor 是 commit/push 前的硬闸门：
-          // ERROR 或 doctor 自身不可用都不允许把漂移推上主分支。
-          if (doctor) {
-            const errors = await runDoctor(instanceDir, { enabled: true });
-            if (errors === null) throw new Error('doctor 未返回可解析结果，已回滚');
-            if (errors > 0) throw new Error(`doctor 报 ${errors} error，已回滚`);
+          // doctor 仍是 commit/push 前的硬闸门，但只拦本次新增的错误（以及凭据/契约等全局不变式）；
+          // doctor 自身不可用时 fail closed。
+          const gateResult = await gate.check(doctorBase);
+          if (!gateResult.ok) {
+            const error = new Error(`${describeDoctorFailure(gateResult)}，已回滚`);
+            error.code = gateResult.unavailable ? 'DOCTOR_UNAVAILABLE' : 'DOCTOR_BLOCKED';
+            error.doctor = gateResult;
+            throw error;
           }
           const actionLabel = Array.isArray(decision.operations) ? 'composite_plan' : decision.action;
           const committed = await commitDurably(commit, { paths, message: `keeper: ${actionLabel} → ${detail}（${entry.id}）` });
@@ -1115,8 +1207,17 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
         });
         return 'superseded';
       }
+      // 执行前 preflight 失败说明库已变化、旧计划失效：丢掉缓存，下一轮按新状态重新判断。
+      if (e.code === 'PREFLIGHT_FAILED') planCache.delete(entry.id);
+      // doctor 判定本次写入会引入错误（或库里有必须人工处理的错误）是确定性失败：不按时间退避重试、
+      // 不重判，转 blocked——库有新提交才重试；互相链接的一组由 tryLinkGroup 合并落库。
+      if (e.code === 'DOCTOR_BLOCKED' && entry.kind !== 'skill') {
+        const { changed } = await blockEntry(entry, rel, e.doctor);
+        if (changed) audit({ tool: 'keeper', entry: entry.id, kind: entry.kind, decision, verdict: 'held', disposition: 'held', held_class: 'blocked', error: e.message, ms: Date.now() - t0 });
+        return 'held';
+      }
       // owner 已批准的 Skill 晋升若因 doctor/落盘失败，不做六轮自动重试：目录已完整回滚，回到 owner-held，
-      // 待修候选或明确重批。普通引擎瞬时故障仍沿用 retryable 退避。
+      // 待修候选或明确重批。普通引擎瞬时故障仍沿用 retryable 退避（复用同一计划，不再重判）。
       const executionHoldClass = entry.kind === 'skill' ? 'owner' : 'retryable';
       if (entry.kind === 'skill' && approvalRecord && approvals.get(entry.id) === approvalRecord) approvals.delete(entry.id);
       await holdEntry(entry, rel, `执行失败：${e.message.slice(0, 120)}`, { holdClass: executionHoldClass });
@@ -1124,6 +1225,7 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
       return 'held';
     }
     if (approvalRecord && approvals.get(entry.id) === approvalRecord) approvals.delete(entry.id);
+    forgetEntry(entry.id);
     // 归档已落定 → 刷新派生索引（受影响页；删页则全量重建）。仅到此处代表 filed 成功。
     // 一并带上被移除的收件 rel：清掉它可能残留的「隔离-rejected」索引行（如先前被拒、经主人裁定又 filed 别处）；
     // 普通件从没被索引过 → updatePage 只做一次无害 DELETE。
@@ -1149,12 +1251,228 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
     return 'filed';
   }
 
+  // 确定性 doctor 失败 → held_class: blocked。同一失败指纹只落一次盘、只提交一次；之后每次重试
+  // 若结果相同就只在内存里记下尝试时的 HEAD，不再写 Git（否则每次提交都触发其他 blocked 件重试，形成循环）。
+  async function blockEntry(entry, rel, gateResult) {
+    const newErrors = gateResult?.newErrors ?? [];
+    const existing = gateResult?.blockingExisting ?? [];
+    const category = !newErrors.length && existing.length ? 'system'
+      : newErrors.length && newErrors.every((line) => parseBrokenLink(line)) ? 'links' : 'content';
+    const lines = category === 'system' ? existing : newErrors;
+    const fp = createHash('sha256').update(`${category}\n${[...lines].sort().join('\n')}`).digest('hex').slice(0, 16);
+    const reason = describeDoctorFailure(gateResult ?? {});
+    blockedInfo.set(entry.id, { category, newErrors, reason });
+    const unchanged = fmGet(entry.raw, 'status') === 'held' && fmGet(entry.raw, 'held_class') === 'blocked'
+      && fmGet(entry.raw, 'blocked_fp') === fp;
+    let triedAt = entry.__attempt_head ?? null;
+    if (!unchanged) {
+      await writer.transact(async (commit) => {
+        assertEntryCurrent(entry, rel);
+        rewriteEntry(entry, 'held', `暂时存不进去（确定性校验失败，库有新提交时自动重试，不再重判）：${reason}`,
+          { holdClass: 'blocked', blocked: { category, fp } });
+        await commitDurably(commit, { paths: [rel], message: `keeper: blocked ${entry.id}（${category}）` });
+        // 仍在单写者队列里：此刻的 HEAD 就是自己这笔状态提交，之后任何新提交都会触发重试。
+        triedAt = await headNow();
+      });
+      emit(entry, 'held', rel, `blocked:${category}`);
+    }
+    blockedTriedAt.set(entry.id, triedAt);
+    if (category === 'system' && !systemAlerted.has(fp)) {
+      systemAlerted.add(fp);
+      pendingAlerts.push({ type: 'system', id: entry.id, lines: existing });
+    }
+    return { changed: !unchanged, category };
+  }
+
+  function listBlocked() {
+    const dir = path.join(instanceDir, 'inbox');
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((f) => f.startsWith('_') && f.endsWith('.md'))
+      .sort()
+      .map((f) => ({ rel: `inbox/${f}`, raw: readFileSync(path.join(instanceDir, 'inbox', f), 'utf8') }))
+      .filter(({ raw }) => fmGet(raw, 'status') === 'held' && fmGet(raw, 'held_class') === 'blocked');
+  }
+
+  // 互相链接的一组页面（每页都链到同组还没落库的页）单件永远过不了 doctor，整组一起写、
+  // 跑一次 doctor、一次提交，失败整组回滚。2026-10-18 的 18 页就是这种情况，当时只能人工恢复。
+  // 只收最简单的成员：亲生未篡改、无主人批准/裁定、单步 new_page/merge_into、计划已缓存。
+  async function tryLinkGroup() {
+    const candidates = [];
+    for (const { rel, raw } of listBlocked()) {
+      if (fmGet(raw, 'blocked_category') !== 'links') continue;
+      const entry = parseEntry(rel);
+      const info = blockedInfo.get(entry.id);
+      const plan = planCache.get(entry.id);
+      if (!info || !plan || plan.key !== planKey(entry)) continue;
+      if (SKIP_LLM_KINDS.has(entry.kind) || entry.owner_ruling || entry.approved_decision || approvals.has(entry.id)) continue;
+      if (Array.isArray(plan.decision.operations) || !GROUP_ACTIONS.has(plan.decision.action)) continue;
+      const proof = nativeReg.get(entry.id);
+      if (!proof || proof !== nativeToken({ id: entry.id, rel: entry.rel, kind: entry.kind, client: entry.client, raw: entry.raw })) continue;
+      entry.__native = true;
+      entry.__admission_enforced = true;
+      entry.__capabilities = [...(entry.admission?.capabilities ?? [])];
+      candidates.push({
+        entry, rel, proof, model: plan.model, decision: structuredClone(plan.decision),
+        creates: plan.decision.action === 'new_page' ? stemOf(plan.decision.target) : null,
+        missing: info.newErrors.map(parseBrokenLink).filter(Boolean).map((b) => stemOf(b.target)),
+      });
+      if (candidates.length >= MAX_GROUP_SIZE) break;
+    }
+    // 剔除缺的页不在本组里的成员，直到稳定：剩下的每一处断链都由组内另一件补上。
+    let members = candidates;
+    for (;;) {
+      const provided = new Set(members.map((m) => m.creates).filter(Boolean));
+      const kept = members.filter((m) => m.missing.every((stem) => provided.has(stem) && stem !== m.creates));
+      if (kept.length === members.length) break;
+      members = kept;
+    }
+    if (members.length < 2) return 0;
+    const head = await headNow();
+    const signature = `${head}\n${members.map((m) => m.entry.id).sort().join(',')}`;
+    if (signature === lastGroupSignature) return 0; // 同一组在同一状态下已试过
+    lastGroupSignature = signature;
+
+    const t0 = Date.now();
+    const consumed = [];
+    let changed = [];
+    let syncPending = false;
+    try {
+      await writer.transact(async (commit) => {
+        await assertCleanWorktree(instanceDir);
+        for (const m of members) assertEntryCurrent(m.entry, m.rel);
+        const doctorBase = await gate.baseline();
+        try {
+          const paths = [];
+          for (const m of members) {
+            const fresh = validateDecisionPlan({ instanceDir, decision: m.decision, entry: m.entry });
+            if (!fresh.ok || fresh.verdict !== 'file') {
+              throw new Error(`${m.entry.id} 执行前 preflight 失败：${fresh.reason ?? fresh.verdict}`);
+            }
+            if (typeof nativeReg.consume === 'function') {
+              const c = nativeReg.consume(m.entry.id, m.proof, null);
+              if (!c) throw new Error(`${m.entry.id} 的 native proof 已不存在`);
+              consumed.push({ id: m.entry.id, token: c.token, approval: c.approval });
+            } else {
+              if (nativeReg.get(m.entry.id) !== m.proof || !nativeReg.delete(m.entry.id)) throw new Error(`${m.entry.id} 的 native proof 已不存在`);
+              consumed.push({ id: m.entry.id, token: m.proof, approval: null });
+            }
+            m.applied = await applyDecisionPlan({ instanceDir, entry: m.entry, decision: m.decision, validation: fresh });
+            if (m.applied.rollbackToken || m.applied.rollbackCoreToken || m.applied.rollbackSkillToken) {
+              throw new Error(`${m.entry.id} 的动作带专用回滚协议，不适合整组落库`);
+            }
+            rmSync(path.join(instanceDir, m.rel));
+            paths.push(...m.applied.changedPaths, m.rel);
+          }
+          const gateResult = await gate.check(doctorBase);
+          if (!gateResult.ok) throw new Error(`整组写入后 ${describeDoctorFailure(gateResult)}`);
+          changed = [...new Set(paths)];
+          const committed = await commitDurably(commit, {
+            paths: changed, message: `keeper: 整组落库 ${members.length} 件互相链接的收件（${members.map((m) => m.entry.id).join(', ')}）`,
+          });
+          if (committed.ok === false) syncPending = true;
+        } catch (e) {
+          let recoveryError = null;
+          try { await rollbackUncommitted(instanceDir); } catch (r) { recoveryError = r; }
+          for (const m of members) {
+            try { if (!existsSync(path.join(instanceDir, m.rel))) writeFileSync(path.join(instanceDir, m.rel), m.entry.raw); }
+            catch (r) { recoveryError = recoveryError ?? r; }
+          }
+          for (const c of consumed.splice(0)) {
+            try {
+              if (typeof nativeReg.restore === 'function') nativeReg.restore(c.id, c.token, c.approval);
+              else nativeReg.set(c.id, c.token);
+            } catch (r) { recoveryError = recoveryError ?? r; }
+          }
+          throw recoveryError ? new Error(`${e.message}；整组回滚失败：${recoveryError.message}`) : e;
+        }
+      });
+    } catch (e) {
+      console.error(`整组落库未成功（成员保持 blocked）：${e.message}`);
+      audit({ tool: 'keeper', event: 'group_apply', ok: false, entries: members.map((m) => m.entry.id), error: e.message, ms: Date.now() - t0 });
+      return 0;
+    }
+    refreshIndex('group_apply', changed);
+    for (const m of members) {
+      forgetEntry(m.entry.id);
+      emit(m.entry, 'filed', m.applied.detail, m.decision.summary);
+      audit({ tool: 'keeper', entry: m.entry.id, kind: m.entry.kind, decision: m.decision, verdict: 'filed', disposition: m.decision.tier === 'candidate' ? 'candidate' : 'accepted', tier: m.decision.tier ?? 'canonical', detail: m.applied.detail, model: `${m.model}+group`, sync_pending: syncPending, ms: Date.now() - t0 });
+    }
+    if (notifyLevel !== 'quiet') {
+      const listed = members.slice(0, 20).map((m) => `- ${m.applied.detail}`);
+      await notifier.notify([
+        `✅ 已整组存入 ${members.length} 件（页面互相链接，单件无法单独通过校验，已一次性落库）${syncPending ? '；本地已提交，远端同步待重试' : ''}`,
+        ...listed, ...(members.length > 20 ? [`- …另有 ${members.length - 20} 件`] : []),
+      ].join('\n'));
+    }
+    return members.length;
+  }
+
+  // blocked 超过 blockedAlertMs 才提醒主人，且每件同一失败原因只提醒一次（blocked_alerted 落盘，重启不重复）。
+  async function raiseBlockedAlerts() {
+    const due = listBlocked().filter(({ raw }) => {
+      if (fmGet(raw, 'blocked_alerted') === 'true' || fmGet(raw, 'blocked_category') === 'system') return false;
+      const since = Date.parse(fmGet(raw, 'blocked_since') ?? '');
+      return !Number.isFinite(since) || Date.now() - since >= blockedAlertMs;
+    });
+    if (!due.length) return;
+    const alerted = [];
+    await writer.transact(async (commit) => {
+      for (const d of due) {
+        const abs = path.join(instanceDir, d.rel);
+        if (!existsSync(abs) || readFileSync(abs, 'utf8') !== d.raw) continue;
+        writeFileSync(abs, editFrontmatter(d.raw, (fm) => fmSet(fm, 'blocked_alerted', 'true')));
+        alerted.push(d);
+      }
+      if (alerted.length) await commitDurably(commit, { paths: alerted.map((d) => d.rel), message: `keeper: 提醒 ${alerted.length} 件 blocked 收件` });
+    });
+    for (const d of alerted) {
+      const id = fmGet(d.raw, 'id');
+      const notes = [...d.raw.matchAll(/\*\*keeper held\*\*（[^）]*）：(.*)$/gm)];
+      pendingAlerts.push({ type: 'blocked', id, reason: blockedInfo.get(id)?.reason ?? notes.at(-1)?.[1] ?? '确定性校验失败' });
+    }
+  }
+
+  async function flushAlerts() {
+    if (!pendingAlerts.length) return;
+    const items = pendingAlerts.splice(0);
+    const clip = (text) => (String(text).length > 160 ? `${String(text).slice(0, 160)}…` : String(text));
+    const listed = (arr, fn) => [...arr.slice(0, 10).map(fn), ...(arr.length > 10 ? [`- …另有 ${arr.length - 10} 件`] : [])];
+    const sections = [];
+    const system = items.filter((a) => a.type === 'system');
+    const blocked = items.filter((a) => a.type === 'blocked');
+    const exhausted = items.filter((a) => a.type === 'exhausted');
+    if (system.length) {
+      const lines = [...new Set(system.flatMap((a) => a.lines))];
+      sections.push([
+        '🚧 知识库里有必须人工处理的问题，keeper 暂停写入（不是归档选择题）：',
+        ...listed(lines, (line) => `- ${clip(line)}`),
+        '修好后 keeper 会自动继续，卡住的收件不需要重新提交。',
+      ].join('\n'));
+    }
+    if (blocked.length) {
+      sections.push([
+        `⚠️ ${blocked.length} 件收件卡住超过 ${Math.round(blockedAlertMs / 60_000)} 分钟（确定性校验失败，模型不会反复重判）：`,
+        ...listed(blocked, (a) => `- ${a.id}：${clip(a.reason)}`),
+        '库里补上缺的页或修好问题后会自动重试；要放弃某件，对任一接入 agent 说「放弃收件 <id>」。',
+      ].join('\n'));
+    }
+    if (exhausted.length) {
+      sections.push([
+        `⚠️ ${exhausted.length} 件收件自动重试已停止（连续失败 ${MAX_AUTO_RETRIES} 次，多为模型或 Git 故障；不是归档决策题）：`,
+        ...listed(exhausted, (a) => `- ${a.id}：${clip(a.reason)}`),
+      ].join('\n'));
+    }
+    try { await notifier.notify(sections.join('\n\n')); }
+    catch (e) { console.error(`keeper 合并告警发送失败：${e.message}`); }
+  }
+
   async function processPending() {
     if (running) return { skipped: true };
     running = true;
-    const result = { processed: 0, filed: 0, rejected: 0, held: 0, superseded: 0, errors: 0 };
+    const result = { processed: 0, filed: 0, rejected: 0, held: 0, superseded: 0, errors: 0, grouped: 0 };
     try {
-      for (const rel of listPending()) {
+      for (const rel of listPending(await headNow())) {
         try {
           const verdict = await processEntry(rel);
           result.processed++;
@@ -1167,8 +1485,13 @@ export function createKeeper({ instanceDir, writer, provider, notifier, audit = 
           audit({ tool: 'keeper', entry: rel, verdict: 'engine_error', disposition: 'retryable', error: e.message });
         }
       }
+      try { result.grouped = await tryLinkGroup(); }
+      catch (e) { console.error(`整组落库检查异常（不影响本轮）：${e.message}`); }
+      try { await raiseBlockedAlerts(); }
+      catch (e) { console.error(`blocked 提醒异常（下轮再试）：${e.message}`); }
     } finally {
       running = false; // F4：先释放归档锁，再跑夜班——长扫描/慢 push 不再阻塞下一次 pending 受理
+      await flushAlerts();
     }
     // about-owner 核心校准是独立 worker：分类页 hash 变化才调模型并生成 held 提案；不占 keeper 归档锁，
     // 真写仍走同一个 writer 队列。与 nightly 分旗，避免慢模型/慢 push 让下一 tick 重入同一校准。

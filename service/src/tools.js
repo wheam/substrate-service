@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { parseZones, canRead, canReadZone, zoneFor, SERVICE_ZONE_IDS } from './acl.js';
 import { readTier, normalizeInclude, isQuarantineRejected } from './tier.js';
+import { viaSymlink, walkRegularFiles } from './safe-fs.js';
 
 // SEC-6：直读结果面路径单行化——删控制字符（\r\n\t 等 Cc）+ Unicode 格式字符（零宽/BOM 等 Cf）+
 // 行/段分隔符（U+2028/U+2029，Zl/Zp）。search 返回的 path、recall 的 citations path 都是裸文件名、未过任何
@@ -41,21 +42,8 @@ export function createTools({ instanceDir }) {
     return { abs, rel: rel.split(path.sep).join('/') };
   }
 
-  function walkFiles() {
-    const out = [];
-    const stack = [''];
-    while (stack.length) {
-      const dir = stack.pop();
-      for (const name of readdirSync(path.join(instanceDir, dir))) {
-        if (name === '.git' || name === 'node_modules') continue;
-        const rel = dir ? `${dir}/${name}` : name;
-        const st = statSync(path.join(instanceDir, rel));
-        if (st.isDirectory()) stack.push(rel);
-        else if (SEARCH_EXTS.has(path.extname(name))) out.push(rel);
-      }
-    }
-    return out;
-  }
+  // 符号链接整个跳过：search 按逻辑路径做 zone/trust 校验，别名会把敏感页或实例外文件带进结果。
+  const walkFiles = () => walkRegularFiles(instanceDir, { exts: SEARCH_EXTS });
 
   async function search({ query, zone, trust = 'low', include }) {
     if (!query?.trim()) return { results: [] };
@@ -124,6 +112,8 @@ export function createTools({ instanceDir }) {
     if (rel.startsWith('skills/_incoming/') && trust !== 'high') {
       throw new Error(`拒绝：${rel} 是尚未晋升的 staging Skill，仅高信任审核通路可读`);
     }
+    // zone/trust 按逻辑路径判；经过符号链接的路径真实目标可能在敏感区或实例外，一律拒读。
+    if (viaSymlink(instanceDir, rel)) throw new Error(`拒绝：${rel} 经过符号链接，不按别名读取`);
     if (!existsSync(abs) || !statSync(abs).isFile()) throw new Error(`没有这个文件：${rel}`);
     return { path: rel, content: readFileSync(abs, 'utf8') };
   }
@@ -179,6 +169,7 @@ export function createTools({ instanceDir }) {
     if (!stem || !available.includes(stem)) {
       throw new Error(`没有叫 ${wanted} 的待办清单，可用：${available.join('、')}`);
     }
+    if (viaSymlink(instanceDir, `todo/${stem}.md`)) throw new Error(`拒绝：todo/${stem}.md 经过符号链接，不按别名读取`);
     return {
       list: stem,
       content: readFileSync(path.join(dir, `${stem}.md`), 'utf8'),
@@ -197,6 +188,9 @@ export function createTools({ instanceDir }) {
             existsSync(path.join(instanceDir, 'collections', d, 'data.csv')))
         : [];
       throw new Error(`没有叫 ${name} 的收藏，可用：${available.join('、') || '（无）'}`);
+    }
+    if (viaSymlink(instanceDir, `collections/${name}/data.csv`)) {
+      throw new Error(`拒绝：collections/${name}/data.csv 经过符号链接，不按别名读取`);
     }
     const records = parseCsv(readFileSync(csvPath, 'utf8'));
     const [header, ...dataRows] = records;
