@@ -107,12 +107,15 @@
 | `DEEPSEEK_API_KEY` | | —（缺=降级） | keeper 与 `recall` 的 LLM key。缺 → keeper 不归档、`recall` 不注册；默认写入停在 inbox。显式授权的可信直写不依赖它。 |
 | `DEEPSEEK_MODEL` | | `deepseek-v4-flash` | keeper/recall 主判模型。 |
 | `DEEPSEEK_ESCALATION_MODEL` | | `deepseek-v4-pro` | keeper 拿不准时升档用的模型。 |
+| `DEEPSEEK_TIMEOUT_MS` | | `120000`（2 分钟） | 主判模型单次请求的总时限；超时按可重试故障处理，不拖住 keeper 整轮。 |
+| `DEEPSEEK_ESCALATION_TIMEOUT_MS` | | `300000`（5 分钟） | 升档模型（开 thinking）单次请求的总时限。 |
 | `PULL_INTERVAL_MS` | | `300000`（5 分钟） | 服务端 `git pull` 跟随 GitHub 的间隔。 |
 | `KEEPER_INTERVAL_MS` | | `60000`（60 秒） | keeper 扫 inbox 的轮询间隔。 |
 | `KEEPER_MIN_CONFIDENCE` | | `0.75` | keeper 自动归档的置信阈值；低于此则转 `held` 待主人裁定。 |
 | `KEEPER_NOTIFY_LEVEL` | | `all` | 通知档：`all` 全播报；`quiet` 静音「✅ 已存」成功播报（doctor 报错仍必达）。 |
 | `NUDGE_TTL_MS` | | `259200000`（72 小时） | 主频道待裁提示的防重复 TTL：同一批 `held` 件在此窗口内，工具响应尾部只提醒一次；状态持久化在 volume（git 外），重新部署不会重置。新提案令集合变化，会立即提醒。 |
-| `NIGHTLY_INTERVAL_MS` | | `604800000`（7 天） | 夜班养护（去重/合并薄页/断链）确定性扫描间隔，产出走 inbox 的预批提案；`0`=禁用。仅在 provider 在场（`DEEPSEEK_API_KEY` 有值）时才挂。 |
+| `NIGHTLY_INTERVAL_MS` | | `604800000`（7 天） | 夜班养护（近似重复/薄页/断链）确定性扫描间隔；断链写维护日志，薄页与近似重复默认只进 digest 建议；`0`=禁用。仅在 provider 在场（`DEEPSEEK_API_KEY` 有值）时才挂。 |
+| `NIGHTLY_AUTO_DEMOTE` | | `0` | `1` = 夜班把薄页/近似重复页自动降为 candidate（旧行为，默认检索随之不含）。默认关闭：长度与相似度不是知识价值的判断。 |
 | `CORE_CALIBRATION_RETRY_MS` | | `3600000`（1 小时） | about-owner 核心摘要蒸馏失败后，对同一批分类页的最短重试间隔；成功时仍只生成主频道可审阅的 held 提案，不自动改 `_core.md`。 |
 | `CORE_CALIBRATION_QUIET_MS` | | `1800000`（30 分钟） | canonical 分类页停止变化多久后才合批判断，避免连续整理时一页一提。 |
 | `CORE_CALIBRATION_MAX_DIRTY_MS` | | `86400000`（24 小时） | 来源持续变化时的最长等待；达到上限即判断，防止一直没有 quiet window。 |

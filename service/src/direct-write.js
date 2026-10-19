@@ -8,8 +8,9 @@ import { parseZones, SERVICE_ZONE_IDS, zoneFor } from './acl.js';
 import { readContentId } from './content-id.js';
 import { containsCredential } from './secrets.js';
 import {
-  applyDecisionPlan, assertCleanWorktree, rollbackUncommitted, runDoctor, validateDecisionPlan,
+  applyDecisionPlan, assertCleanWorktree, rollbackUncommitted, validateDecisionPlan,
 } from './executor.js';
+import { createDoctorGate, describeDoctorFailure } from './doctor-gate.js';
 
 const MAX_CONTENT_BYTES = 1024 * 1024;
 const DENIED_ZONE_IDS = new Set([...SERVICE_ZONE_IDS, 'skills', 'todo', 'collections']);
@@ -85,7 +86,7 @@ export function validateDirectPageTarget({ instanceDir, page, mode, expectedCont
 
 export async function directPageWrite({
   instanceDir, writer, indexStore = null, client, page, content, mode,
-  expectedContentId = null, doctor = true,
+  expectedContentId = null, doctor = true, doctorGate = null,
 }) {
   const sourceClient = String(client ?? '');
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(sourceClient)) {
@@ -101,6 +102,7 @@ export async function directPageWrite({
     throw directError('DIRECT_CREDENTIAL', '拒收：内容含疑似密钥/凭据（红线：密钥原文绝不进库）。请脱敏后重试。');
   }
 
+  const gate = doctorGate ?? createDoctorGate({ instanceDir, enabled: doctor });
   let result;
   await writer.transact(async (commit) => {
     await assertCleanWorktree(instanceDir);
@@ -133,14 +135,20 @@ export async function directPageWrite({
       throw directError('DIRECT_POLICY_DENIED', validation.reason || '可信直写未通过 effect policy');
     }
 
+    // 基线在任何写入之前取：库里既有的内容质量问题不挡这次无关写入，只拦本次新增的错误。
+    const doctorBase = await gate.baseline();
     let applied = null;
     let writeStarted = false;
     try {
       writeStarted = true;
       applied = await applyDecisionPlan({ instanceDir, entry, decision, validation });
-      const errors = await runDoctor(instanceDir, { enabled: doctor });
-      if (doctor && errors === null) throw directError('DIRECT_DOCTOR_UNAVAILABLE', 'doctor 未返回可解析结果');
-      if (doctor && errors > 0) throw directError('DIRECT_DOCTOR_FAILED', `doctor 报 ${errors} error`);
+      const gateResult = await gate.check(doctorBase);
+      if (gateResult.unavailable) throw directError('DIRECT_DOCTOR_UNAVAILABLE', 'doctor 未返回可解析结果');
+      if (!gateResult.ok) {
+        const error = directError('DIRECT_DOCTOR_FAILED', describeDoctorFailure(gateResult));
+        error.doctor = { new_errors: gateResult.newErrors, blocking_existing: gateResult.blockingExisting };
+        throw error;
+      }
       const changedPaths = [...new Set(applied.changedPaths ?? [])];
       const sync = await commit({
         paths: changedPaths.length ? changedPaths : [target.rel],

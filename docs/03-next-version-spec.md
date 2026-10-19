@@ -165,7 +165,7 @@
 ### 6.2 inbox 状态机（扩展）
 - 现状：`pending → filed / rejected / held`。
 - 新增：`filed` 细分为落 `tier: candidate` 或 `tier: canonical`；`rejected` 不再删件，改为**隔离可检索 + 旗标**（`tier: rejected`）。
-- `held` 内部分型：`owner`（真需主人语义/结构选择）、`retryable`（模型/provider/doctor/git 等引擎故障，指数退避）、`security`（proof 缺失/篡改隔离）。只有 `owner` 写 `keeper_held_at`、生成候选、通知/nudge、出现在 App 待定夺列表；另外两类不冒充主人任务。`retryable` 最多自动尝试 6 次，耗尽后写 `retry_exhausted: true`、停止自动调用模型并发一次运维告警，但仍不伪装成主人归档选择题。
+- `held` 内部分型：`owner`（真需主人语义/结构选择）、`retryable`（模型/provider/doctor/git 等引擎故障，指数退避）、`security`（proof 缺失/篡改隔离）。只有 `owner` 写 `keeper_held_at`、生成候选、通知/nudge、出现在 App 待定夺列表；另外两类不冒充主人任务。`retryable` 最多自动尝试 6 次，耗尽后写 `retry_exhausted: true`、停止自动调用模型并发一次运维告警，但仍不伪装成主人归档选择题。（M4.12 起：`retryable` 只留给模型/Git/doctor 不可用等瞬时故障，重试复用已过 effect policy 的同一计划、不再重判；耗尽告警按轮合并。doctor 判定的确定性失败改为第四类 `blocked`，见 M4.12。）
 - **红线不变**：命中凭据 / 密钥 = `forbidden` **真拒、不落盘**（不进 lossless 分层），见 §7。
 
 ### 6.3 MCP 工具面增量
@@ -209,6 +209,7 @@
 
 - **M4.10 keeper effect policy + 去伪人工 gate**（2026-08-06）：准入能力信封、git 外持久 native/approval proof、终态 consumed tombstone、模型受约束 repair、candidate 安全回退、owner/retryable/security 分型，以及同区两步有界复合归档。实现完全按入口/副作用/可逆性判定，不含 health、体重、日期或文件命名特例。**验收**：普通与 sensitive zone 的新页规则一致；新页不存在自动创建；精确重复幂等；低置信无害件不 owner-held，低置信 forbidden 仍留 rejected 隔离、绝不被翻成 candidate；越权模型输出只 repair/retry，repair 不能绕过低置信破坏性 gate；retry 6 次耗尽后停机告警而非无限烧模型或转嫁主人；本地 commit 后的 rebase/push 故障记持久 `sync_pending`，由后台周期补推提交链而不复活收件/重跑业务；真实 target 冲突/治理结构动作仍问主人；复合第二步失败或目标 hash 改变零部分写入。
 - **M4.11 Skill 完整目录晋升闭环**（2026-08-29）：修复 `_incoming` 只能落根文件、supporting file 被误当 SKILL.md、无批准后晋升动作、staging 冒充 canonical、人工 gate 被当 retryable 六次重试等断链。新增确定性 `stage_skill_file`、`skill_inspect` 与审批式 `promote_skill`；owner 批准绑定根 content_id + 整树 revision，目录 rename + doctor + commit + audit 失败回滚，同版本待审/成功均幂等；普通 save 仍不能新建正式 Skill。详细契约见 [06-skill-promotion.md](06-skill-promotion.md)。
+- **M4.12 keeper 止放大**（2026-10-18，源于 18 页互链航旅记录逐件提交→19 件 × 6 次重判 + 19 条告警的事故，及 Codex/Claude 联合审查）：① doctor 门禁改增量——事务前按 HEAD 缓存基线，写后按错误行多重集差只拦本次新增；断链/孤儿/frontmatter/索引漂移/计数漂移的既有错误不再挡无关写入，凭据与 zones/registry/fleet 契约等仍全局拦截；doctor 输出无法逐行解析时退回旧口径 fail closed（`src/doctor-gate.js`）。② doctor 拦下的失败转 `held_class: blocked`：不按时间退避、不重判，实例 HEAD 变化才重试，同一失败指纹只落盘一次；互相链接、单件都过不了门禁的一组普通新页/追加由 keeper 整组写入、一次 doctor、一次提交、失败整组回滚；卡住超过 30 分钟才提醒、同一原因只提醒一次，所有运维告警按 tick 合并成一条。③ 入口凭据规则覆盖实例 doctor 的 ERROR 档全集（真实 doctor 契约测试）。④ read_page/search/索引/夜班不跟随符号链接。⑤ 工作树干净检查与回滚同口径排除 inbox/，并发收件不再误拒排队中的写入。⑥ 模型请求加应用级总时限，区分 429/5xx。⑦ 夜班薄页/近似重复默认只建议不降级（`NIGHTLY_AUTO_DEMOTE=1` 恢复）。测试引入真实 doctor/curator fixture（`test/fixture/real-doctor/`）。
 
 ## 9. 决策记录与开放问题
 

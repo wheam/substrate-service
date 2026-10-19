@@ -8,7 +8,8 @@
 // 山牛 牛排」；ASCII 词原样小写）。实测「牛排」「旧金山」「wagyu」全命中。单字 CJK 查询 bigram 索引
 // 里无对应 token → 降级走 raw 列子串扫描（见 query()）。
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { viaSymlink, walkRegularFiles } from './safe-fs.js';
 import path from 'node:path';
 import { parseZones, canRead, canReadZone, zoneFor, SERVICE_ZONE_IDS } from './acl.js';
 import { readContentId } from './content-id.js';
@@ -116,20 +117,8 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
     if (!hasIndex()) rebuild();
   }
 
-  function walkFiles() {
-    const out = [];
-    const stack = [''];
-    while (stack.length) {
-      const dir = stack.pop();
-      for (const name of readdirSync(path.join(instanceDir, dir))) {
-        if (name === '.git' || name === 'node_modules') continue;
-        const rel = dir ? `${dir}/${name}` : name;
-        if (statSync(path.join(instanceDir, rel)).isDirectory()) stack.push(rel);
-        else if (SEARCH_EXTS.has(path.extname(name))) out.push(rel);
-      }
-    }
-    return out;
-  }
+  // 符号链接整个跳过（见 safe-fs.js）：索引按逻辑路径判 zone，别名会把敏感页或实例外文件写进索引。
+  const walkFiles = () => walkRegularFiles(instanceDir, { exts: SEARCH_EXTS });
 
   // 一个文件 → 逐行行（跳过空行/纯符号行）：raw 存原行供 snippet，body 存 bigram 预处理供 FTS。
   // 可索引性也在此判定（返回 [] = 不入索引）：
@@ -138,6 +127,7 @@ export function createIndexStore({ instanceDir, indexPath } = {}) {
   //     pending/held 无此标记、手写 status:pending + tier:rejected 残留亦不满足 → 不入）。
   //   - 其余未注册路径（governance/skills/keeper-feedback/inbox 的 pending·held）→ 返回 []，永不入索引。
   function rowsForFile(rel, zones) {
+    if (viaSymlink(instanceDir, rel)) return [];
     const text = readFileSync(path.join(instanceDir, rel), 'utf8');
     const isMd = rel.endsWith('.md');
     // _incoming 是 staging 对象，不因 SKILL.md 没写 tier 就冒充 canonical；路径状态优先于自报 frontmatter。

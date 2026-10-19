@@ -62,3 +62,21 @@ test('judge：HTTP 错误与坏 JSON 都抛可读错误', async () => {
   const p2 = createDeepSeekProvider({ apiKey: 'k', fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'not json' } }] }) }) });
   await assert.rejects(() => p2.judge({ system: 's', user: 'u' }), /JSON/i);
 });
+
+test('provider 有应用级总时限：挂起的请求按时失败并标 retryable，不拖住 keeper 整轮', async () => {
+  const fetchImpl = (_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+  });
+  const p = createDeepSeekProvider({ apiKey: 'k', fetchImpl, timeoutMs: 30, escalationTimeoutMs: 60 });
+  const t0 = Date.now();
+  await assert.rejects(p.judge({ system: 's', user: 'u' }), (e) => e.code === 'PROVIDER_TIMEOUT' && e.retryable === true && /超时/.test(e.message));
+  await assert.rejects(p.judge({ system: 's', user: 'u', escalate: true }), (e) => e.code === 'PROVIDER_TIMEOUT');
+  assert.ok(Date.now() - t0 < 2_000);
+});
+
+test('provider 区分可重试的 429/5xx 与不可重试的 4xx', async () => {
+  const status = (code) => createDeepSeekProvider({ apiKey: 'k', fetchImpl: async () => ({ ok: false, status: code, text: async () => 'x' }) });
+  await assert.rejects(status(429).judge({ system: 's', user: 'u' }), (e) => e.status === 429 && e.retryable === true);
+  await assert.rejects(status(503).judge({ system: 's', user: 'u' }), (e) => e.status === 503 && e.retryable === true);
+  await assert.rejects(status(401).judge({ system: 's', user: 'u' }), (e) => e.status === 401 && e.retryable === false);
+});

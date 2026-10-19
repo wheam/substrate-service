@@ -472,7 +472,7 @@ function nightlySetup(work, { intervalMs = 604_800_000, statePath, indexStore } 
     instanceDir: work, inbox, writer, ...(indexStore ? { indexStore } : {}), // M4.6：降级写入走 writer
     notifier: { notify: async (t) => { messages.push(t); return { ok: true }; } },
     audit: (e) => audits.push(e),
-    intervalMs, ...(statePath ? { statePath } : {}),
+    autoDemote: true, intervalMs, ...(statePath ? { statePath } : {}),
   });
   return { writer, inbox, nightly, messages, audits };
 }
@@ -638,7 +638,7 @@ test('3e maybeRun 容错：某页降级失败（writer 抛错）→ 吞掉记日
     instanceDir: work, inbox: createInbox({ instanceDir: work, writer: createWriter({ instanceDir: work }) }),
     writer: boomWriter,
     notifier: { notify: async () => ({ ok: true }) },
-    audit: () => {}, intervalMs: 604_800_000, statePath,
+    audit: () => {}, autoDemote: true, intervalMs: 604_800_000, statePath,
   });
   const r = await nightly.maybeRun(); // 不得向外抛
   assert.equal(r.ran, true);
@@ -724,7 +724,7 @@ test('3f(G4) 夜班降级写入进 writer.transact（写与 commit 同队列，�
   const nightly = createNightly({
     instanceDir: work, inbox, writer,
     notifier: { notify: async () => ({ ok: true }) }, audit: () => {},
-    intervalMs: 604_800_000, statePath: path.join(work, '..', 'ns-3f.json'),
+    autoDemote: true, intervalMs: 604_800_000, statePath: path.join(work, '..', 'ns-3f.json'),
   });
   const r = await nightly.maybeRun();
   assert.equal(r.demoted, 1, '一张孤例薄页 → 一页降级');
@@ -765,9 +765,11 @@ test('4b(F4) 夜班移出归档锁：nightly 在途时 processPending 仍受理�
     instanceDir: work, writer, nativeReg, provider: filingProvider,
     notifier: { notify: async () => ({ ok: true }) }, doctor: false, nightly,
   });
-  // tick1：空 pending → processPending 同步跑到 maybeRun 并卡在 barrier。F4 下此时归档锁 running 应已释放。
+  // tick1：空 pending → processPending 跑到 maybeRun 并卡在 barrier。F4 下此时归档锁 running 应已释放。
+  // （tick 开头要异步取一次实例 HEAD 给 blocked 件判重试，所以等它进入，而不是假定同步到达。）
   const tick1 = keeper.processPending();
-  assert.equal(entered, true, 'nightly.maybeRun 已进入（processPending 同步跑到这里）');
+  for (let i = 0; i < 200 && !entered; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(entered, true, 'nightly.maybeRun 已进入（processPending 跑到这里并卡在 barrier）');
   // 夜班在途时投入新 pending
   const r = inbox.addEntry({ kind: 'todo', content: '夜班在途时进来的待办', client: 'cc-test' });
   await r.synced;
