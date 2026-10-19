@@ -250,3 +250,20 @@ test('并发收件不再让排队中的可信直写被“工作树不干净”�
   assert.ok(existsSync(path.join(x.work, receipt.path)), '收件保留');
   assert.equal(git(x.work, 'status', '--porcelain').trim(), '');
 });
+
+test('可信直写批量：互相链接的新页逐页写会被 doctor 拒，整批写一次通过', async () => {
+  const x = await realInstance();
+  const { directPagesWrite } = await import('../src/direct-write.js');
+  await assert.rejects(directPageWrite({
+    instanceDir: x.work, writer: x.writer, client: 'cc-test', page: 'knowledge/pair-a.md', content: '见 [[pair-b]]', mode: 'create',
+  }), /DIRECT_DOCTOR_FAILED/);
+  const r = await directPagesWrite({
+    instanceDir: x.work, writer: x.writer, client: 'cc-test',
+    pages: [
+      { path: 'knowledge/pair-a.md', content: '见 [[pair-b]]', mode: 'create' },
+      { path: 'knowledge/pair-b.md', content: '见 [[pair-a]]', mode: 'create' },
+    ],
+  });
+  assert.deepEqual(r.pages.map((p) => p.path), ['knowledge/pair-a.md', 'knowledge/pair-b.md']);
+  assert.equal((await runDoctorReport(x.work)).errors, 0);
+});

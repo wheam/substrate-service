@@ -60,7 +60,8 @@ export const DIRECT_WRITE_RULES = `
 【轻治理可信直写】本连接由 owner 显式授权为 trusted-direct。普通知识/记忆 Markdown 页若能明确一个已注册内容 zone 中的安全目标，优先调用 save 并同时传 path + mode=create|append，结果会在确定性校验、doctor 与 Git 提交成功后直接入库，不再等待 Keeper；只有回执明确写“已可信直写”才可告诉主人已经存好。
 - 不确定应该放哪、可能重复/冲突、或需要语义判断时，省略 path/mode，退回 inbox 让 Keeper 处理。
 - 可信直写只做新建或追加，不做整页覆盖；Skill、governance、结构页、todo/collections typed zone、删除和 schema 仍走专用受治理流程。
-- append 前先 search/read_page 核对目标；目标有 content_id 时把它作为 expected_content_id 传回，避免写错对象。`;
+- append 前先 search/read_page 核对目标；目标有 content_id 时把它作为 expected_content_id 传回，避免写错对象。
+- 一组需要一起出现、尤其是互相 [[链接]] 的页面（总索引 + 分页）用 save_batch 一次提交；逐页 save 会因链到尚未存在的页被 doctor 拒绝。`;
 
 // 常驻宿主自装（M4 路 B）：只对高信任下发——/digest 本就 high-gated，低信任照做也只会 403。
 // 目的：常驻网关（进程长跑、MCP 断线时本 instructions 会随连接消失）第一次连上时，

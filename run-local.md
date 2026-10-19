@@ -4,7 +4,7 @@
 
 > **诚实标注 —— 跨不了设备。** 本地形态里知识库只活在**这台机器 + 它的 git 远端**。手机捕获、远程 fleet（多台 CC / Hermes）要「够得着」，需要**云形态**（见 [README 顶部的 Deploy on Railway](README.md) / [INSTALL_FOR_AGENTS.md §4](INSTALL_FOR_AGENTS.md)）。本地形态的定位是「约 60 秒跑起来、看懂它怎么工作」的入门与单机自用（跑起来就是完整服务，没有时限），只是不是跨设备的终态。
 >
-> **keeper 需要 DEEPSEEK key。** 不填 `DEEPSEEK_API_KEY` 也能起——但会**只读降级**：读工具（search / read_page / …）照常，写入（save / todo_add / …）会停在 `inbox/` 隔离区不前进（keeper 不归档、`recall` 工具不注册）。想看到「keeper 自动归档」，填一把 DeepSeek key 再起。
+> **keeper 的语义归档需要 DEEPSEEK key。** 不填 `DEEPSEEK_API_KEY` 也能起：读工具（search / read_page / …）照常，keeper 照常执行新增/完成待办、删除等确定性任务；需要模型判断去向的 save 等收件停在 `inbox/` 等待，`recall` 不注册。
 
 两条本地路径，任选其一：
 
@@ -63,7 +63,7 @@ node src/server.js
 # 可选：在上面任意行加 DEEPSEEK_API_KEY=sk-... 让 keeper 归档 + recall 上线
 ```
 
-起来会打印：`instance cloned → …/data/instance`、`recall index ready → …`、`keeper enabled`（填了 key）或 `keeper disabled（缺 DEEPSEEK_API_KEY）`、`substrate-kb listening on :3000`。
+起来会打印：`instance cloned → …/data/instance`、`recall index ready → …`、`keeper enabled（…）`（不填 key 时显示「无模型：只执行确定性任务」）、`substrate-kb listening on :3000`。
 
 ### 5) 自验（跑通判据）
 

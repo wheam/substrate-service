@@ -79,5 +79,6 @@ Keeper 仍处理：
 - 直写要求 agent 能明确选择路径；不确定时仍需要 Keeper。它消除的是“目标已知却还要等待 LLM”的成本，不是免费解决语义分类。
 - 轻治理主动缩小了 inbox 隔离面：如果一个获授权 high agent 自己被提示注入、并违反“只有主人授权才保存”的房规调用了 `save{path,mode}`，攻击最多可直接污染普通内容页，而不再先停在 inbox。Skill、治理、删除、覆盖和结构动作仍被代码拦住，Git 可恢复，但这并非与严格模式等价；只应授权实际主用、行为可靠且可单独吊销的 Hermes/Codex token，外部 capture 永不授权。
 - `append` 是追加，不是结构化合并；长期可能形成较长的时间块，交给夜班或人工后续整理。
-- 无 `DEEPSEEK_API_KEY` 时，可信直写仍可用，但 inbox 件不会自动归档、`recall` 也不注册。
+- 无 `DEEPSEEK_API_KEY` 时，可信直写（含 `save_batch`）仍可用；keeper 照常执行确定性任务（新增/完成待办、删除、整组落库），需要模型判断去向的 inbox 件留着等待，`recall` 不注册。
+- 一组需要一起出现、尤其互相 `[[链接]]` 的页面用 `save_batch`：整批校验、一次 doctor、一次提交，任一页失败整批不写。
 - 建议先只授权 Hermes 与 Codex 两周，观察 `direct_write` 数、inbox 回退数、owner-held 数、doctor 拒绝和实际写错次数，再决定是否进一步缩减 Keeper。

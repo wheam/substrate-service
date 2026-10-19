@@ -558,8 +558,8 @@ test('new_page 带 links：真实页写成 [[wikilink]]，不存在的丢弃', a
 
 test('notifyLevel=quiet：已存不播报，held/rejected 照常', async () => {
   const { work, writer, approvals, nativeReg, inbox, provider, notifier } = setup({
+    // 新增待办不调模型；脚本里唯一一步留给后面那条会被拒的 save。
     providerScript: [
-      { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '进待办', confidence: 0.95 },
       { disposition: 'forbidden', zone: 'todo', action: 'todo_add', target: 'owner', summary: 'x', confidence: 0.95, reject_reason: '闲聊无留存价值' },
     ],
   });
@@ -740,7 +740,8 @@ test('主判异常 → 自动升级档重试成功 → filed 不打扰主人', a
       { disposition: 'canonical', zone: 'todo', action: 'todo_add', target: 'owner', summary: '重试成功', confidence: 0.95 },
     ],
   });
-  const receipt = inbox.addEntry({ kind: 'todo', content: '升级档兜住这条', client: 'cc-test' });
+  // capture 仍经模型判断（新增待办 kind=todo 已是确定性执行，测不到升级档）。
+  const receipt = inbox.addEntry({ kind: 'capture', content: '升级档兜住这条', client: 'cc-test' });
   await receipt.synced;
   const result = await keeper.processPending();
   assert.equal(result.filed, 1, '升级档成功就该归档');
@@ -748,4 +749,36 @@ test('主判异常 → 自动升级档重试成功 → filed 不打扰主人', a
   assert.equal(provider.calls[1].escalate, true);
   assert.match(readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /升级档兜住这条/);
   assert.match(notifier.messages[0], /✅/);
+});
+
+test('新增待办不调模型：直接写进清单；相同的未完成条目按重复拒收；多行折成一行', async () => {
+  const { work, inbox, keeper, provider, notifier } = setup({ providerScript: [new Error('不该调用模型')] });
+  const a = inbox.addEntry({ kind: 'todo', content: '周五前\n提交季度报告', client: 'cc-test' });
+  await a.synced;
+  const r1 = await keeper.processPending();
+  assert.equal(r1.filed, 1, JSON.stringify(r1));
+  assert.match(readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /^\d+\. 周五前 提交季度报告$/m);
+  const b = inbox.addEntry({ kind: 'todo', content: '周五前 提交季度报告', client: 'cc-test' });
+  await b.synced;
+  const r2 = await keeper.processPending();
+  assert.equal(r2.rejected, 1, JSON.stringify(r2));
+  assert.equal(provider.calls.length, 0);
+  assert.match(notifier.messages.at(-1), /已有相同的未完成条目/);
+});
+
+test('没有模型时 keeper 照样跑：确定性任务照常执行，需要模型判断的件原样留在收件箱、不告警不计重试', async () => {
+  const { work, writer, approvals, nativeReg, inbox, notifier } = setup({ providerScript: [] });
+  const keeper = createKeeper({ instanceDir: work, writer, provider: null, notifier, doctor: false, approvals, nativeReg });
+  const todo = inbox.addEntry({ kind: 'todo', content: '无模型也能加的待办', client: 'cc-test' });
+  const save = inbox.addEntry({ kind: 'save', content: '需要判断去向的一段话。', client: 'cc-test' });
+  await todo.synced;
+  await save.synced;
+  const before = readFileSync(path.join(work, save.path), 'utf8');
+  for (let i = 0; i < 3; i++) await keeper.processPending();
+  assert.match(readFileSync(path.join(work, 'todo', 'owner.md'), 'utf8'), /无模型也能加的待办/);
+  assert.ok(!existsSync(path.join(work, todo.path)), '待办件已归档清场');
+  assert.equal(readFileSync(path.join(work, save.path), 'utf8'), before, '需要模型的件一字未动');
+  assert.equal(notifier.messages.filter((m) => !/✅/.test(m)).length, 0, '不发任何告警');
+  const r = await keeper.processPending();
+  assert.equal(r.waiting, 1);
 });

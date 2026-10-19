@@ -968,7 +968,8 @@ function todoAdd(instanceDir, entry) {
   const numbers = [...section.matchAll(/^(\d+)\./gm)].map((x) => Number(x[1]));
   const next = numbers.length ? Math.max(...numbers) + 1 : 1;
   const insertAt = m.index + m[0].length;
-  const line = `${next}. ${entry.body.trim()}\n`;
+  // 清单一条一行：多行原文折成一行，免得续行被当成别的条目或破坏编号。
+  const line = `${next}. ${entry.body.trim().replace(/\s*\n\s*/g, ' ')}\n`;
   const glue = m[0].endsWith('\n\n') ? '' : '\n';
   writeFileSync(abs, text.slice(0, insertAt) + (m[0].endsWith('\n') ? '' : '\n') + line + glue + text.slice(insertAt));
   return { changedPaths: [rel], detail: `todo/owner.md 第 ${next} 条` };
